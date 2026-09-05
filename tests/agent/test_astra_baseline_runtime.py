@@ -36,7 +36,7 @@ def test_explicit_astra_resolves_and_uses_official_responses(monkeypatch, tmp_pa
         reasoning_config={"enabled": False, "effort": "none"},
     )
     assert kwargs["reasoning"]["effort"] == "low"
-    assert kwargs["prompt_cache_options"] == {"ttl": "30m"}
+    assert kwargs["extra_body"]["prompt_cache_options"] == {"ttl": "30m"}
 
 
 def test_astra_codex_oauth_fallback_uses_backend_context_limit():

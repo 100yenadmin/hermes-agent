@@ -290,27 +290,46 @@ def _codex_efforts_for_route(model: Any, base_url: Any, *, is_codex_backend: boo
 
 
 def _sanitize_astra_request_kwargs(kwargs: dict[str, Any], model: Any, base_url: Any) -> None:
-    """Apply Astra's model-specific restrictions after all request overrides are merged."""
+    """Normalize the effective Astra body, with SDK extra_body precedence, on official routes."""
     if not _is_astra_model(model):
         return
-    if not _is_official_openai_responses_route(model, base_url):
+    from agent.codex_headers import is_official_codex_base_url
+
+    is_direct = _is_official_openai_responses_route(model, base_url)
+    if not (is_direct or is_official_codex_base_url(str(base_url or ""))):
         kwargs.pop("prompt_cache_options", None)
         return
+
+    # The SDK merges extra_body last (shallowly). Pull only the fields we
+    # normalize into kwargs; leave vendor extensions in extra_body, and never
+    # mutate a caller-owned override dict.
+    extra_body = dict(kwargs.get("extra_body") or {})
+    for key in ("reasoning", "include"):
+        if key in extra_body:
+            kwargs[key] = extra_body.pop(key)
     reasoning = kwargs.get("reasoning")
-    requested = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
+    requested = reasoning.get("effort") if reasoning.pop("enabled", True) is not False else None
     normalized = str(requested or "").strip().lower()
     effort = "low" if normalized in {"", "none", "minimal", "disabled", "off"} else clamp_effort(
         requested, CODEX_ASTRA_EFFORTS
     )
-    kwargs["reasoning"] = {**(reasoning if isinstance(reasoning, dict) else {}), "effort": effort}
+    kwargs["reasoning"] = {**reasoning, "effort": effort}
     kwargs["reasoning"].setdefault("summary", "auto")
-    for key in ("temperature", "top_p", "top_logprobs", "logprobs"):
+    for key in ("temperature", "top_p", "top_logprobs", "logprobs", "prompt_cache_retention", "prompt_cache_options"):
         kwargs.pop(key, None)
+        extra_body.pop(key, None)
     include = kwargs.get("include")
     if isinstance(include, list):
         kwargs["include"] = [item for item in include if "logprob" not in str(item).lower()]
-    kwargs["prompt_cache_options"] = {"ttl": "30m"}
-    kwargs.pop("prompt_cache_retention", None)
+    if is_direct:
+        # openai==2.24.0 has no typed prompt_cache_options keyword. OAuth does
+        # not accept this direct-API cache contract at all.
+        extra_body["prompt_cache_options"] = {"ttl": "30m"}
+    if extra_body:
+        kwargs["extra_body"] = extra_body
+    else:
+        kwargs.pop("extra_body", None)
 
 
 def _content_cache_key(instructions: str, tools: Optional[list[dict[str, Any]]], scope_id: str = "") -> Optional[str]:
