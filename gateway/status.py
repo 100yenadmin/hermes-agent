@@ -388,16 +388,22 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     command_lc = command.lower().replace("\\", "/")
     profile_name = _profile_name_for_home(profile_home)
     home_lc = str(profile_home).lower().replace("\\", "/")
+    # Match complete selector values, not prefixes (worker != worker_alpha).
+    # Keep quoted/space-containing homes and normalized Windows separators.
+    home_matches = re.search(
+        r"(?:^|\s)hermes_home=[\"']?" + re.escape(home_lc) + r"[\"']?(?=\s|$)", command_lc
+    ) is not None
     if profile_name is not None and profile_name != "default":
         profile_lc = profile_name.lower()
-        return any(needle in command_lc for needle in (
-            f"--profile {profile_lc}", f"-p {profile_lc}", f"hermes_home={home_lc}"
-        ))
+        return home_matches or re.search(
+            r"(?:^|\s)(?:--profile|-p)(?:\s+|=)[\"']?"
+            + re.escape(profile_lc) + r"[\"']?(?=\s|$)", command_lc
+        ) is not None
     # Default profile: accept unless argv names another profile or a conflicting explicit
     # HERMES_HOME= (its absence is not disqualifying -- HERMES_HOME usually arrives via the env).
-    if "--profile " in command_lc or " -p " in command_lc:
+    if re.search(r"(?:^|\s)(?:--profile|-p)(?:\s|=|$)", command_lc):
         return False
-    return not ("hermes_home=" in command_lc and f"hermes_home={home_lc}" not in command_lc)
+    return not ("hermes_home=" in command_lc and not home_matches)
 
 
 def _record_matches_live_gateway_pid(

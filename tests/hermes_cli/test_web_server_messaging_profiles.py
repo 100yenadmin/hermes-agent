@@ -69,6 +69,43 @@ def _env_field(platform, key):
 
 class TestProfileScopedMessagingReads:
     @pytest.mark.parametrize(
+        "selector,configured",
+        [
+            ("--profile worker_alpha", True),
+            ("--profile=worker_alpha", True),
+            ("--profile worker_alpha_other", False),
+            ("-p worker_alpha_other", False),
+        ],
+    )
+    def test_connected_status_uses_exact_live_profile_selector(
+        self, client, isolated_profiles, monkeypatch, selector, configured,
+    ):
+        """A recycled PID for a prefix-sharing profile is not this gateway."""
+        worker_home = isolated_profiles["worker_alpha"]
+        (worker_home / "config.yaml").write_text(
+            yaml.safe_dump({"platforms": {"telegram": {"enabled": True}}}),
+            encoding="utf-8",
+        )
+        runtime = {
+            "pid": 123, "kind": "hermes-gateway", "gateway_state": "running",
+            "argv": ["hermes", "gateway", "run"],
+            "platforms": {"telegram": {"state": "connected"}},
+        }
+        monkeypatch.setattr(_gw_status, "read_runtime_status", lambda **kwargs: runtime)
+        monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda *args: 123)
+        monkeypatch.setattr(_gw_status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(_gw_status, "_get_process_start_time", lambda pid: None)
+        monkeypatch.setattr(
+            _gw_status, "_read_process_cmdline", lambda pid: f"hermes {selector} gateway run"
+        )
+        response = client.get("/api/messaging/platforms", params={"profile": "worker_alpha"})
+        assert response.status_code == 200
+        telegram = _telegram(response.json())
+        assert telegram["configured"] is configured
+        assert telegram["state"] == ("connected" if configured else "not_configured")
+        assert _env_field(telegram, "TELEGRAM_BOT_TOKEN")["is_set"] is False
+
+    @pytest.mark.parametrize(
         "live_pid,runtime_pid,state,enabled,configured",
         [
             (123, 123, "connected", True, True),
