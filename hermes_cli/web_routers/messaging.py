@@ -25,7 +25,7 @@ from gateway.status import resolve_gateway_liveness
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import OPTIONAL_ENV_VARS, get_env_path, redact_key
 from hermes_cli.web_deps import LateState, late
-from hermes_cli.web_server_gateway import _restart_gateway_after
+from hermes_cli.web_server_gateway import _owned_profile_platforms, _profile_gateway_writer_identity, _restart_gateway_after
 from hermes_cli.web_server_messaging import (
     _TelegramOnboardingPairing, _WhatsAppOnboardingSession, _messaging_platform_catalog, _telegram_onboarding_error_message, _telegram_onboarding_lock, _telegram_onboarding_pairings, _whatsapp_onboarding_payload, _whatsapp_onboarding_sessions,
 )
@@ -230,12 +230,11 @@ def _messaging_platform_payload(
     state = runtime_platform.get("state")
     if scoped and profile_home is not None and enabled and not configured and gateway_running and state == "connected":
         # A profile gateway may receive credentials from its service manager,
-        # not .env. Trust only a connected record bound to that same live PID;
+        # not .env. Trust only a connected entry written by that same live PID;
         # never infer credential fields from the dashboard process environment.
-        with contextlib.suppress(Exception):
-            runtime_pid = get_runtime_status_running_pid(rt, expected_home=profile_home)
-            if runtime_pid is not None and runtime_pid == liveness.pid:
-                configured = True
+        writer = _profile_gateway_writer_identity(profile_home, rt)
+        if writer is not None and writer[0] == liveness.pid:
+            configured = platform_id in _owned_profile_platforms(writer, {platform_id: runtime_platform})
     if not enabled:
         state = "disabled"
     elif not configured:

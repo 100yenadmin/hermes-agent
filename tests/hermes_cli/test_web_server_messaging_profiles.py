@@ -89,12 +89,12 @@ class TestProfileScopedMessagingReads:
         runtime = {
             "pid": 123, "kind": "hermes-gateway", "gateway_state": "running",
             "argv": ["hermes", "gateway", "run"],
-            "platforms": {"telegram": {"state": "connected"}},
+            "platforms": {"telegram": {"state": "connected", "writer_pid": 123, "writer_start_time": 1000}},
         }
         monkeypatch.setattr(_gw_status, "read_runtime_status", lambda **kwargs: runtime)
         monkeypatch.setattr(_gw_status, "get_running_pid_cached", lambda *args: 123)
         monkeypatch.setattr(_gw_status, "_pid_exists", lambda pid: True)
-        monkeypatch.setattr(_gw_status, "_get_process_start_time", lambda pid: None)
+        monkeypatch.setattr(_gw_status, "_get_process_start_time", lambda pid: 1000)
         monkeypatch.setattr(
             _gw_status, "_read_process_cmdline", lambda pid: f"hermes {selector} gateway run"
         )
@@ -106,19 +106,22 @@ class TestProfileScopedMessagingReads:
         assert _env_field(telegram, "TELEGRAM_BOT_TOKEN")["is_set"] is False
 
     @pytest.mark.parametrize(
-        "live_pid,runtime_pid,state,enabled,configured",
+        "live_pid,runtime_pid,writer_pid,writer_start,state,enabled,configured",
         [
-            (123, 123, "connected", True, True),
-            (None, None, "connected", True, False),
-            (123, None, "connected", True, False),
-            (123, 456, "connected", True, False),
-            (123, 123, "unknown", True, False),
-            (123, 123, "connected", False, False),
+            (123, 123, 123, 1000, "connected", True, True),
+            (None, None, 123, 1000, "connected", True, False),
+            (123, None, 123, 1000, "connected", True, False),
+            (123, 456, 123, 1000, "connected", True, False),
+            (123, 123, 456, 1000, "connected", True, False),
+            (123, 123, 123, 999, "connected", True, False),
+            (123, 123, None, None, "connected", True, False),
+            (123, 123, 123, 1000, "unknown", True, False),
+            (123, 123, 123, 1000, "connected", False, False),
         ],
     )
     def test_live_profile_connection_without_local_token(
         self, client, isolated_profiles, monkeypatch,
-        live_pid, runtime_pid, state, enabled, configured,
+        live_pid, runtime_pid, writer_pid, writer_start, state, enabled, configured,
     ):
         """External service credentials need not be copied into a profile file.
 
@@ -131,7 +134,9 @@ class TestProfileScopedMessagingReads:
             encoding="utf-8",
         )
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "root-only-credential")
-        runtime = {"gateway_state": "running", "platforms": {"telegram": {"state": state}}}
+        runtime = {"gateway_state": "running", "platforms": {"telegram": {
+            "state": state, "writer_pid": writer_pid, "writer_start_time": writer_start,
+        }}}
 
         def read_runtime(*, path):
             assert path == worker_home / "gateway_state.json"
@@ -149,6 +154,7 @@ class TestProfileScopedMessagingReads:
         monkeypatch.setattr(_gw_status, "read_runtime_status", read_runtime)
         monkeypatch.setattr(_gw_status, "get_running_pid_cached", running_pid)
         monkeypatch.setattr(_gw_status, "get_runtime_status_running_pid", runtime_running_pid)
+        monkeypatch.setattr(_gw_status, "_get_process_start_time", lambda pid: 1000)
 
         response = client.get("/api/messaging/platforms", params={"profile": "worker_alpha"})
         assert response.status_code == 200
