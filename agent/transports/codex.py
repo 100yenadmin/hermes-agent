@@ -303,7 +303,10 @@ def _sanitize_astra_request_kwargs(kwargs: dict[str, Any], model: Any, base_url:
     # The SDK merges extra_body last (shallowly). Pull only the fields we
     # normalize into kwargs; leave vendor extensions in extra_body, and never
     # mutate a caller-owned override dict.
-    extra_body = dict(kwargs.get("extra_body") or {})
+    extra_body = kwargs.get("extra_body")
+    if extra_body is not None and not isinstance(extra_body, dict):
+        raise ValueError("Codex Responses request 'extra_body' must be an object.")
+    extra_body = dict(extra_body or {})
     for key in ("reasoning", "include"):
         if key in extra_body:
             kwargs[key] = extra_body.pop(key)

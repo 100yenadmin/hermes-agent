@@ -149,3 +149,45 @@ def test_foreign_routes_keep_their_wire_override_semantics(base_url):
     )
     body = _send(kwargs, base_url)
     assert all(body[key] == value for key, value in extra.items())
+
+
+INVALID_EXTRA_BODIES = [False, 0, "", [], [["vendor_option", "value"]], "bad", 1, True]
+
+
+@pytest.mark.parametrize("entry", ["main", "shared_sanitizer"])
+@pytest.mark.parametrize("route", ["direct", "oauth"])
+@pytest.mark.parametrize("extra_body", INVALID_EXTRA_BODIES)
+def test_invalid_outer_extra_body_preserves_object_validation(entry, route, extra_body):
+    from agent.transports.codex import _sanitize_astra_request_kwargs
+
+    kwargs = {"extra_body": extra_body, "reasoning": {"effort": "max"}}
+    original = copy.deepcopy(kwargs)
+    with pytest.raises(ValueError) as exc:
+        if entry == "main":
+            ResponsesApiTransport().build_kwargs(
+                model="gpt-6-astra", messages=MESSAGES,
+                request_overrides=kwargs, **ROUTES[route],
+            )
+        else:
+            _sanitize_astra_request_kwargs(kwargs, "gpt-6-astra", ROUTES[route]["base_url"])
+    assert str(exc.value) == "Codex Responses request 'extra_body' must be an object."
+    assert kwargs == original
+
+
+@pytest.mark.parametrize("path", ["main", "aux"])
+@pytest.mark.parametrize("route", ["direct", "oauth"])
+@pytest.mark.parametrize("extra_body", [None, {}])
+def test_empty_outer_extra_body_keeps_official_wire_contract(path, route, extra_body):
+    from agent.transports.codex import _sanitize_astra_request_kwargs
+
+    kwargs = _build(path, route, {"effort": "max"})
+    kwargs["extra_body"] = extra_body
+    original = copy.deepcopy(extra_body)
+    _sanitize_astra_request_kwargs(kwargs, "gpt-6-astra", ROUTES[route]["base_url"])
+    body = _send(ResponsesApiTransport().preflight_kwargs(kwargs), ROUTES[route]["base_url"])
+    assert body["reasoning"]["effort"] == "max"
+    if route == "direct":
+        assert body["prompt_cache_options"] == {"ttl": "30m"}
+    else:
+        assert "prompt_cache_options" not in body
+    assert extra_body == original
