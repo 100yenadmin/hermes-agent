@@ -391,7 +391,7 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     # Match complete selector values, not prefixes (worker != worker_alpha).
     # Keep quoted/space-containing homes and normalized Windows separators.
     home_matches = re.search(
-        r"(?:^|\s)hermes_home=[\"']?" + re.escape(home_lc) + r"[\"']?(?=\s|$)", command_lc
+        r"(?:^|\s)hermes_home=[\"']?" + re.escape(home_lc) + r"/*[\"']?(?=\s|$)", command_lc
     ) is not None
     if profile_name is not None and profile_name != "default":
         profile_lc = profile_name.lower()

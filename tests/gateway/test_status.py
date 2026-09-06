@@ -360,6 +360,24 @@ class TestGatewayRuntimeStatus:
             f'HERMES_HOME="{home}_other" hermes gateway run', home
         )
 
+    @pytest.mark.parametrize("home, selector", [
+        ("/opt/data/profiles/coder", "HERMES_HOME=/opt/data/profiles/coder/"),
+        ("/opt/data space/profiles/coder", 'HERMES_HOME="/opt/data space/profiles/coder/"'),
+        ("c:/opt/data/profiles/coder", "HERMES_HOME=c:\\opt\\data\\profiles\\coder\\"),
+        ("/opt/data/profiles/coder", "HERMES_HOME=/opt/data/profiles/coder///"),
+    ])
+    def test_profile_home_accepts_equivalent_trailing_separators(self, home, selector):
+        assert status._command_line_belongs_to_profile(
+            f"{selector} hermes gateway run", Path(home)
+        )
+
+    @pytest.mark.parametrize("suffix", ["/child", "/../coder_other"])
+    def test_profile_home_rejects_paths_beyond_trailing_separators(self, suffix):
+        assert not status._command_line_belongs_to_profile(
+            f"HERMES_HOME=/opt/data/profiles/coder{suffix} hermes gateway run",
+            Path("/opt/data/profiles/coder"),
+        )
+
 
     def test_write_runtime_status_explicit_none_clears_stale_fields(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
