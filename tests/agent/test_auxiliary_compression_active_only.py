@@ -1,6 +1,8 @@
 """Compression ``fallback_policy=none`` stays on the active Codex identity."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -157,6 +159,177 @@ def test_none_async_compression_call_stays_on_active_codex_route(tmp_path, monke
     assert result.choices[0].message.content == "async active summary"
     assert responses.calls[0]["model"] == "gpt-5.6-sol"
     assert all(mock.call_count == 0 for mock in fallback_mocks)
+
+
+@pytest.mark.parametrize("active_model", ["gpt-6-astra", "gpt-5.6-sol"])
+def test_none_lcm_worker_inherits_active_runtime_without_explicit_main_runtime(
+    tmp_path, monkeypatch, active_model
+):
+    """The real compression worker boundary must carry the live identity.
+
+    ``conversation_compression`` submits work through ``propagate_context_to_thread``;
+    the worker's LCM-style call has no ``main_runtime`` keyword to pass through.  This
+    catches the cold-worker regression where the worker silently falls back to persisted
+    config or a different provider.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(tmp_path, model="")
+    from agent import auxiliary_client as ac
+    from tools.thread_context import propagate_context_to_thread
+
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="worker summary")],
+            )
+        ]
+    )
+    responses = _FakeResponses(response=response)
+    fake = _FakeOpenAI(responses, "synthetic-codex-token")
+    token = ac.set_runtime_main(
+        "openai-codex", active_model,
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="synthetic-codex-token", api_mode="codex_responses",
+    )
+    try:
+        with patch.object(ac, "_create_openai_client", return_value=fake):
+            with _fallback_patches(ac) as fallback_mocks:
+                def worker_call():
+                    return ac.call_llm(
+                        task="compression",
+                        messages=[{"role": "user", "content": "summarize this"}],
+                    )
+
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="synthetic-lcm") as pool:
+                    result = pool.submit(propagate_context_to_thread(worker_call)).result(timeout=5)
+    finally:
+        ac.reset_runtime_main(token)
+
+    assert result.choices[0].message.content == "worker summary"
+    assert responses.calls[0]["model"] == active_model
+    assert all(mock.call_count == 0 for mock in fallback_mocks)
+
+
+@pytest.mark.parametrize("active_model", ["gpt-6-astra", "gpt-5.6-sol"])
+def test_none_cold_hygiene_worker_inherits_active_runtime_without_explicit_main_runtime(
+    tmp_path, monkeypatch, active_model
+):
+    """The gateway cold-hygiene ``copy_context().run`` boundary keeps Astra/Sol identity."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(tmp_path, model="")
+    from agent import auxiliary_client as ac
+
+    response = SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(type="output_text", text="hygiene summary")],
+            )
+        ]
+    )
+    responses = _FakeResponses(response=response)
+    fake = _FakeOpenAI(responses, "synthetic-codex-token")
+    token = ac.set_runtime_main(
+        "openai-codex", active_model,
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="synthetic-codex-token", api_mode="codex_responses",
+    )
+    try:
+        with patch.object(ac, "_create_openai_client", return_value=fake):
+            with _fallback_patches(ac) as fallback_mocks:
+                def hygiene_call():
+                    return ac.call_llm(
+                        task="compression",
+                        messages=[{"role": "user", "content": "summarize this"}],
+                    )
+
+                worker_context = copy_context()
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="synthetic-hygiene") as pool:
+                    result = pool.submit(worker_context.run, hygiene_call).result(timeout=5)
+    finally:
+        ac.reset_runtime_main(token)
+
+    assert result.choices[0].message.content == "hygiene summary"
+    assert responses.calls[0]["model"] == active_model
+    assert all(mock.call_count == 0 for mock in fallback_mocks)
+
+
+def test_none_cold_worker_missing_active_credentials_fails_before_transport_or_fallback(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(tmp_path, model="")
+    from agent import auxiliary_client as ac
+
+    token = ac.set_runtime_main(
+        "openai-codex", "gpt-6-astra",
+        base_url="https://chatgpt.com/backend-api/codex", api_key="", api_mode="codex_responses",
+    )
+    try:
+        with patch.object(ac, "_create_openai_client") as build:
+            with _fallback_patches(ac) as fallback_mocks:
+                def hygiene_call():
+                    return ac.call_llm(
+                        task="compression",
+                        messages=[{"role": "user", "content": "summarize this"}],
+                    )
+
+                worker_context = copy_context()
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="synthetic-hygiene") as pool:
+                    with pytest.raises(RuntimeError, match="active Codex credentials"):
+                        pool.submit(worker_context.run, hygiene_call).result(timeout=5)
+    finally:
+        ac.reset_runtime_main(token)
+
+    build.assert_not_called()
+    assert all(mock.call_count == 0 for mock in fallback_mocks)
+
+
+def test_none_cold_worker_malformed_response_fails_closed_without_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(tmp_path, model="")
+    from agent import auxiliary_client as ac
+
+    # Codex responses are consumed as an event iterable; an empty stream is the
+    # malformed no-choice response that reaches the centralized validator.
+    responses = _FakeResponses(response=[])
+    fake = _FakeOpenAI(responses, "synthetic-codex-token")
+    token = ac.set_runtime_main(
+        "openai-codex", "gpt-6-astra",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="synthetic-codex-token", api_mode="codex_responses",
+    )
+    try:
+        with patch.object(ac, "_create_openai_client", return_value=fake):
+            with _fallback_patches(ac) as fallback_mocks:
+                def hygiene_call():
+                    return ac.call_llm(
+                        task="compression",
+                        messages=[{"role": "user", "content": "summarize this"}],
+                    )
+
+                worker_context = copy_context()
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="synthetic-hygiene") as pool:
+                    with pytest.raises(RuntimeError, match="terminal response"):
+                        pool.submit(worker_context.run, hygiene_call).result(timeout=5)
+    finally:
+        ac.reset_runtime_main(token)
+
+    assert len(responses.calls) == 1
+    assert all(mock.call_count == 0 for mock in fallback_mocks)
+
+
+def test_compression_timeout_profile_120_is_raised_to_existing_300_floor(tmp_path, monkeypatch):
+    """Record the current deadline contract while the hygiene profile is tuned separately."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(tmp_path, model="")
+    from agent import auxiliary_client as ac
+
+    assert ac._get_task_timeout("compression") == pytest.approx(120.0)
+    assert ac._effective_aux_timeout("compression", None) == pytest.approx(300.0)
+    assert ac._effective_aux_timeout("compression", 120.0) == pytest.approx(120.0)
+    assert ac._aux_stream_total_ceiling(300.0) == pytest.approx(1200.0)
 
 
 @pytest.mark.parametrize(
