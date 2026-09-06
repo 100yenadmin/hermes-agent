@@ -697,7 +697,13 @@ DEFAULT_CONFIG = {
         # web_extract and session_search no longer use an aux LLM; leftover blocks in user config
         # are ignored. Compression: raise timeout for local models. max_output_tokens is only
         # honored with a concrete provider/model AND ``reasoning_effort: none``; 0 = uncapped.
-        "compression": _aux(120, max_output_tokens=0),
+        "compression": _aux(
+            120,
+            max_output_tokens=0,
+            # "default" preserves the normal task/main/discovery fallback chain. "none" pins
+            # summaries to the active Codex runtime and fails closed when that identity is absent.
+            fallback_policy="default",
+        ),
         "skills_hub": _aux(30),
         "approval": _aux(30),   # classifier — a fast/cheap model is recommended
         # /review reviewer: a full subagent on the async delegation rail, credentials resolved like

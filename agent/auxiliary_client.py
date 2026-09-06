@@ -2873,6 +2873,91 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
     return normalized
 
 
+def _active_codex_runtime(
+    main_runtime: Optional[Dict[str, Any]], *, requested_provider: Optional[str] = None,
+    requested_model: Optional[str] = None,
+) -> Tuple[Dict[str, Any], str]:
+    """Validate and return the live Codex identity for compression ``fallback_policy: none``.
+
+    This gate deliberately consumes only the runtime snapshot supplied by the active session.  It
+    never reads the persisted Codex token, provider pools, or another configured route: a missing or
+    mismatched runtime therefore fails before any provider client or transport is constructed.
+    """
+    runtime = _normalize_main_runtime(main_runtime)
+    active_provider = _normalize_aux_provider(runtime.get("provider"))
+    active_model = str(runtime.get("model") or "").strip()
+    if active_provider != "openai-codex":
+        raise RuntimeError(
+            "auxiliary.compression.fallback_policy=none requires the active main provider to be openai-codex"
+        )
+    if not active_model:
+        raise RuntimeError(
+            "auxiliary.compression.fallback_policy=none requires the active Codex model identity"
+        )
+    compression_config = _get_auxiliary_task_config("compression")
+    declared_providers = [
+        compression_config.get("provider"),
+        requested_provider,
+    ]
+    for declared in declared_providers:
+        declared_provider = _normalize_aux_provider(str(declared or "")) if declared else ""
+        if declared_provider and declared_provider not in {"auto", "openai-codex"}:
+            raise RuntimeError(
+                "auxiliary.compression.fallback_policy=none refuses a non-Codex compression provider"
+            )
+    declared_models = [compression_config.get("model"), requested_model]
+    for declared in declared_models:
+        declared_model = str(declared or "").strip()
+        if declared_model.lower() == "auto":
+            continue
+        if declared_model and declared_model.lower() != active_model.lower():
+            raise RuntimeError(
+                "auxiliary.compression.fallback_policy=none refuses a compression model that differs from the active Codex model"
+            )
+    runtime_base = str(runtime.get("base_url") or _CODEX_AUX_BASE_URL).strip().rstrip("/")
+    if not _is_official_codex_base_url(runtime_base):
+        raise RuntimeError(
+            "auxiliary.compression.fallback_policy=none requires the active Codex endpoint"
+        )
+    runtime_key = runtime.get("api_key")
+    if not ((isinstance(runtime_key, str) and runtime_key.strip()) or callable(runtime_key)):
+        raise RuntimeError(
+            "auxiliary.compression.fallback_policy=none requires active Codex credentials"
+        )
+    runtime_mode = str(runtime.get("api_mode") or "").strip().lower()
+    if runtime_mode and runtime_mode != "codex_responses":
+        raise RuntimeError(
+            "auxiliary.compression.fallback_policy=none requires the active Codex Responses API mode"
+        )
+    validated = dict(runtime)
+    validated["provider"] = "openai-codex"
+    validated["model"] = active_model
+    validated["base_url"] = runtime_base
+    validated["api_mode"] = "codex_responses"
+    return validated, active_model
+
+
+def _build_active_codex_client(
+    runtime: Dict[str, Any], model: str, *, async_mode: bool = False,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Build a Codex client from the already-validated active runtime only."""
+    token = runtime.get("api_key")
+    base_url = str(runtime.get("base_url") or _CODEX_AUX_BASE_URL).strip().rstrip("/")
+    try:
+        real_client = _create_openai_client(
+            api_key=token,
+            base_url=base_url,
+            default_headers=_codex_cloudflare_headers(token if isinstance(token, str) else "", base_url=base_url),
+        )
+        sync_client = CodexAuxiliaryClient(real_client, model)
+        if async_mode:
+            return _to_async_client(sync_client, model)
+        return sync_client, model
+    except Exception as exc:
+        logger.debug("Active Codex auxiliary client construction failed: %s", exc)
+        return None, None
+
+
 def _get_provider_chain() -> List[tuple]:
     """Ordered provider detection chain, built at call time so ``_try_*`` patches are picked up.
 
@@ -4141,6 +4226,14 @@ def _resolve_auto_route(
     per-task overrides still win); (2) configured fallback policy — task chain, then the main agent's
     top-level chain; (3) OpenRouter → Nous → custom → Codex → API-key providers, only with no policy
     and no working main client."""
+    if _compression_fallback_policy(task) == "none":
+        runtime, active_model = _active_codex_runtime(main_runtime)
+        client, resolved_model = _build_active_codex_client(runtime, active_model)
+        if client is None:
+            raise RuntimeError(
+                "auxiliary.compression.fallback_policy=none could not construct the active Codex client"
+            )
+        return client, resolved_model, "openai-codex"
     global auxiliary_is_nous
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
     runtime = _normalize_main_runtime(main_runtime)
@@ -4782,6 +4875,16 @@ def resolve_provider_client(
     (full auto-detection chain). ``model=None`` → provider's default aux model. ``raw_codex`` → bare OpenAI
     client for ``responses.stream()`` callers. ``api_mode`` forces "codex_responses"/"chat_completions"/
     "anthropic_messages" instead of auto-detect. Returns (client, resolved_model) or (None, None)."""
+    if _compression_fallback_policy(task) == "none":
+        runtime, active_model = _active_codex_runtime(
+            main_runtime, requested_provider=provider, requested_model=model,
+        )
+        client, resolved_model = _build_active_codex_client(runtime, active_model, async_mode=async_mode)
+        if client is None:
+            raise RuntimeError(
+                "auxiliary.compression.fallback_policy=none could not construct the active Codex client"
+            )
+        return client, resolved_model
     _validate_proxy_env_urls()
     # Keep the pre-alias name so a custom_providers entry named like a built-in alias
     # (e.g. "kimi" → "kimi-coding") is still reachable via the named-custom branch.
@@ -4851,6 +4954,14 @@ def resolve_provider_client(
 
 def get_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Return (client, default_model_slug) for text-only aux tasks; ``task`` selects auxiliary.<task> overrides."""
+    if _compression_fallback_policy(task or None) == "none":
+        runtime, active_model = _active_codex_runtime(main_runtime)
+        client, resolved_model = _build_active_codex_client(runtime, active_model)
+        if client is None:
+            raise RuntimeError(
+                "auxiliary.compression.fallback_policy=none could not construct the active Codex client"
+            )
+        return client, resolved_model
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
     return resolve_provider_client(
         provider, model=model, explicit_base_url=base_url, explicit_api_key=api_key,
@@ -5520,6 +5631,8 @@ _DEFAULT_AUX_TIMEOUT = 30.0
 # config value is kept unchanged.
 _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
 
+_COMPRESSION_FALLBACK_POLICIES = frozenset({"default", "none"})
+
 
 def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     """Config dict for auxiliary.<task>, or {} when unavailable. Plugin-registered tasks get their
@@ -5546,6 +5659,25 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     except Exception:
         pass  # plugin discovery failure must not break aux task config reads
     return task_config
+
+
+def _compression_fallback_policy(task: Optional[str]) -> str:
+    """Return the compression fallback policy, preserving the legacy default.
+
+    ``none`` is intentionally a compression-only policy.  Other auxiliary tasks keep their
+    existing fallback behavior even when a caller passes a task name dynamically.
+    """
+    if task != "compression":
+        return "default"
+    raw = _get_auxiliary_task_config(task).get("fallback_policy", "default")
+    policy = str(raw or "default").strip().lower()
+    if policy not in _COMPRESSION_FALLBACK_POLICIES:
+        logger.warning(
+            "auxiliary.compression.fallback_policy %r is invalid; using 'default' (valid values: default, none)",
+            raw,
+        )
+        return "default"
+    return policy
 
 
 class CompressionFastLane(NamedTuple):
@@ -6458,6 +6590,18 @@ def _resolve_call_client(
 ) -> _ResolvedAuxRoute:
     """Resolve the client for one aux call: vision chain, or cached text client with the
     explicit-provider fallback_chain / auto-chain rescue; RuntimeError when nothing is configured."""
+    if _compression_fallback_policy(task) == "none":
+        runtime, active_model = _active_codex_runtime(
+            main_runtime,
+            requested_provider=resolved_provider or provider,
+            requested_model=resolved_model or model,
+        )
+        client, final_model = _build_active_codex_client(runtime, active_model, async_mode=async_mode)
+        if client is None:
+            raise RuntimeError(
+                "auxiliary.compression.fallback_policy=none could not construct the active Codex client"
+            )
+        return _ResolvedAuxRoute(client, final_model, "openai-codex", "openai-codex")
     effective_provider = resolved_provider
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -6861,6 +7005,12 @@ def _aux_recovery_ladder(
     Each rung returns a response, narrows ``first_err`` and falls through, or re-raises.
     Returns ``_RERAISE_ORIGINAL`` when exhausted (after evicting a connection-poisoned client)."""
     tag = " (async)" if async_mode else ""
+    if _compression_fallback_policy(task) == "none":
+        logger.info(
+            "Auxiliary compression%s: active Codex route failed; fallback_policy=none keeps the error on the active route",
+            tag,
+        )
+        return _RERAISE_ORIGINAL
     route = _LadderRoute(
         client, task, tag, async_mode, base_info, resolved_provider, resolved_model,
         resolved_base_url, resolved_api_key, resolved_api_mode, final_model, main_runtime, route_info)
@@ -7010,6 +7160,19 @@ def _plan_aux_call(
     runtime snapshot for keying/resolution/retries/fallbacks, so a concurrent /model switch
     can't mix key and client from different runtimes."""
     main_runtime = _normalize_main_runtime(main_runtime)
+    if _compression_fallback_policy(task) == "none":
+        # Resolve the live identity before the generic task resolver can fill an empty model from
+        # persisted ``model.default``. An Astra -> Sol switch must carry the new model through the
+        # cold compression worker instead of being rejected as a stale configured model.
+        active_runtime, active_model = _active_codex_runtime(
+            main_runtime, requested_provider=provider, requested_model=model,
+        )
+        main_runtime = active_runtime
+        provider = "openai-codex"
+        model = active_model
+        base_url = active_runtime["base_url"]
+        api_key = active_runtime.get("api_key")
+        api_mode = active_runtime["api_mode"]
     req = _prepare_aux_request(
         task, provider=provider, model=model, base_url=base_url, api_key=api_key,
         main_runtime=main_runtime, messages=messages, temperature=temperature,
@@ -7337,6 +7500,14 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     (AsyncCodexAuxiliaryClient, model) which wraps the Responses API.
     Returns (None, None) when no provider is available.
     """
+    if _compression_fallback_policy(task or None) == "none":
+        runtime, active_model = _active_codex_runtime(main_runtime)
+        client, resolved_model = _build_active_codex_client(runtime, active_model, async_mode=True)
+        if client is None:
+            raise RuntimeError(
+                "auxiliary.compression.fallback_policy=none could not construct the active Codex client"
+            )
+        return client, resolved_model
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
     return resolve_provider_client(
         provider,

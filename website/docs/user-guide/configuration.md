@@ -979,6 +979,17 @@ compression:
 ```
 Uses your main provider and main model. Override per-task (e.g. `auxiliary.compression.provider: openrouter` + `model: google/gemini-2.5-flash`) if you want compression on a cheaper model than your main chat model.
 
+**Pin compression to the active Codex runtime:**
+```yaml
+auxiliary:
+  compression:
+    provider: openai-codex
+    model: ""                 # follow the active main model
+    fallback_policy: none     # default | none
+```
+With `none`, compression refuses to start unless the live main runtime is OpenAI Codex with a matching
+model, endpoint, and credential. It does not try configured, main-agent, or discovered fallback routes.
+
 **Force a specific provider** (OAuth or API-key based):
 ```yaml
 auxiliary:

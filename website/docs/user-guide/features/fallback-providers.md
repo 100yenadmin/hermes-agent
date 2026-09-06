@@ -373,6 +373,7 @@ auxiliary:
   compression:
     provider: "auto"                              # auto | openrouter | nous | main
     model: "google/gemini-3-flash-preview"
+    fallback_policy: "default"                    # default | none
 ```
 
 :::info Legacy migration
@@ -380,6 +381,11 @@ Older configs with `compression.summary_model` / `compression.summary_provider` 
 :::
 
 If no provider is available for compression, Hermes drops middle conversation turns without generating a summary rather than failing the session.
+
+Set `fallback_policy: none` only when the active main runtime is OpenAI Codex. Hermes then uses that
+runtime's provider, model, endpoint, and credentials for compression, ignores configured and discovered
+fallback routes, and fails closed when the live Codex identity is missing or differs from the compression
+configuration. The default `default` policy keeps the normal fallback chain.
 
 ---
 
