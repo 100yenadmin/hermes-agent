@@ -204,12 +204,13 @@ def _messaging_platform_payload(
     # scoped to a named profile: gateway/status readers resolve process-level paths
     # and do NOT follow the HERMES_HOME contextvar override, so without it messaging
     # silently reports another profile's gateway.
-    gateway_running = resolve_gateway_liveness(
+    liveness = resolve_gateway_liveness(
         profile_dir=profile_home, runtime=runtime,
         health_probe=_probe_gateway_health if _GATEWAY_HEALTH_URL else None,
         pid_probe=get_running_pid_cached, runtime_reader=read_runtime_status,
         runtime_pid_probe=get_runtime_status_running_pid,
-    ).running
+    )
+    gateway_running = liveness.running
 
     def env_value(key: str) -> str:
         # Profile-scoped: judge only the profile's own .env — the dashboard process's
@@ -227,6 +228,14 @@ def _messaging_platform_payload(
     enabled, configured, home_channel = _platform_enablement(platform_id, entry, env_on_disk, scoped)
 
     state = runtime_platform.get("state")
+    if scoped and profile_home is not None and enabled and not configured and gateway_running and state == "connected":
+        # A profile gateway may receive credentials from its service manager,
+        # not .env. Trust only a connected record bound to that same live PID;
+        # never infer credential fields from the dashboard process environment.
+        with contextlib.suppress(Exception):
+            runtime_pid = get_runtime_status_running_pid(rt, expected_home=profile_home)
+            if runtime_pid is not None and runtime_pid == liveness.pid:
+                configured = True
     if not enabled:
         state = "disabled"
     elif not configured:
