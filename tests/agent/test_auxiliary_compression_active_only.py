@@ -320,16 +320,23 @@ def test_none_cold_worker_malformed_response_fails_closed_without_fallback(tmp_p
     assert all(mock.call_count == 0 for mock in fallback_mocks)
 
 
-def test_compression_timeout_profile_120_is_raised_to_existing_300_floor(tmp_path, monkeypatch):
-    """Record the current deadline contract while the hygiene profile is tuned separately."""
+@pytest.mark.parametrize(
+    ("fallback_policy", "expected_timeout", "expected_ceiling"),
+    [("none", 120.0, 600.0), ("default", 300.0, 1200.0)],
+)
+def test_compression_timeout_profile_and_stream_ceiling(
+    tmp_path, monkeypatch, fallback_policy, expected_timeout, expected_ceiling
+):
+    """The active-only route uses its configured budget; legacy fallback keeps its floor."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _write_config(tmp_path, model="")
+    _write_config(tmp_path, model="", fallback_policy=fallback_policy)
     from agent import auxiliary_client as ac
 
     assert ac._get_task_timeout("compression") == pytest.approx(120.0)
-    assert ac._effective_aux_timeout("compression", None) == pytest.approx(300.0)
+    assert ac._effective_aux_timeout("compression", None) == pytest.approx(expected_timeout)
     assert ac._effective_aux_timeout("compression", 120.0) == pytest.approx(120.0)
-    assert ac._aux_stream_total_ceiling(300.0) == pytest.approx(1200.0)
+    assert ac._effective_aux_timeout("compression", 45.0) == pytest.approx(45.0)
+    assert ac._aux_stream_total_ceiling(expected_timeout) == pytest.approx(expected_ceiling)
 
 
 @pytest.mark.parametrize(

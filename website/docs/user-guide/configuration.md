@@ -989,6 +989,10 @@ auxiliary:
 ```
 With `none`, compression refuses to start unless the live main runtime is OpenAI Codex with a matching
 model, endpoint, and credential. It does not try configured, main-agent, or discovered fallback routes.
+Its configured `auxiliary.compression.timeout` is used as the active-route budget, so the default
+120-second value also bounds its streamed request and its 600-second total stream ceiling. The legacy
+`default` policy retains the 300-second minimum for config-derived compression calls; an explicit
+per-call timeout always wins.
 
 **Force a specific provider** (OAuth or API-key based):
 ```yaml

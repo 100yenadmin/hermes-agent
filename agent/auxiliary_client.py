@@ -5622,8 +5622,8 @@ def _resolve_task_provider_model(
 _DEFAULT_AUX_TIMEOUT = 30.0
 
 # Reasoning compression models can exceed the default 120 s config timeout, falling back to the
-# deterministic marker. Bounded *floor* for config-derived compression timeouts only; never
-# overrides an explicit per-call timeout.
+# deterministic marker. Bounded *floor* for config-derived compression timeouts under the legacy
+# fallback policy only; fallback_policy=none keeps the configured timeout as the active-route budget.
 # Compression summarises large conversation histories; a reasoning auxiliary model (e.g. Codex / GPT-5.5)
 # can legitimately take longer than the default ``auxiliary.compression.timeout`` (120 s), causing the
 # stream to time out and the compressor to fall back to the deterministic context marker (#54915). A floor
@@ -5765,12 +5765,18 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
 
 
 def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
-    """Explicit ``timeout`` wins, else config; compression gets a floor so a reasoning model
-    summarising a large context isn't cut off."""
+    """Explicit ``timeout`` wins, else config; legacy compression gets a floor.
+
+    ``fallback_policy=none`` has one active Codex route, so its configured timeout is also the
+    total budget that bounds the stream.  Preserve the historical 300-second floor only for the
+    default fallback policy; explicit per-call deadlines always win for either policy.
+    """
     if timeout is not None:
         return timeout
     effective = _get_task_timeout(task)
-    return max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS) if task == "compression" else effective
+    if task == "compression" and _compression_fallback_policy(task) != "none":
+        return max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS)
+    return effective
 
 
 def _get_task_extra_body(task: str) -> Dict[str, Any]:
