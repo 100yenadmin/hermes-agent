@@ -257,11 +257,15 @@ def _compressor_attempt_is_current(compressor: Any, generation: int) -> bool:
         return int(getattr(compressor, "_compression_attempt_generation", 0) or 0) == generation
 
 
-def _install_compression_cancelled_check(compressor: Any, check: Any, generation: int) -> None:
-    """Install the F4 cancellation consult, stamped with its owner attempt."""
+def _install_compression_cancelled_check(
+    compressor: Any, check: Any, generation: int, *,
+    publication_fence: Optional[CompressionCommitFence] = None,
+) -> None:
+    """Install cancellation and private publication admission for one owner attempt."""
     with _COMPRESSOR_ATTEMPT_LOCK:
         with contextlib.suppress(Exception):
             compressor._compression_cancelled_check = check
+            compressor._compression_publication_fence = publication_fence
             compressor._compression_cancelled_check_owner = generation
 
 
@@ -274,6 +278,7 @@ def _clear_compression_cancelled_check_if_owner(compressor: Any, generation: int
             return False
         with contextlib.suppress(Exception):
             compressor._compression_cancelled_check = None
+            compressor._compression_publication_fence = None
             compressor._compression_cancelled_check_owner = None
         return True
 
@@ -801,7 +806,11 @@ def resolve_compression_fallback_route() -> Optional[dict]:
     pins the route onto one bounded retry instead. Only the first complete entry: if it errors, the aux
     client's own exception path walks the rest. ``None`` when none is usable (skip compression)."""
     try:
-        from agent.auxiliary_client import _fallback_entry_api_key, _get_auxiliary_task_config
+        from agent.auxiliary_client import (
+            _compression_fallback_policy, _fallback_entry_api_key, _get_auxiliary_task_config,
+        )
+        if _compression_fallback_policy("compression") == "none":
+            return None
         chain = _get_auxiliary_task_config("compression").get("fallback_chain")
     except Exception:
         logger.debug("compression fallback_chain lookup failed", exc_info=True)
@@ -2693,8 +2702,12 @@ def _run_summary_dispatch(
         # in the finally below so it cannot leak into later attempts (e.g. a manual /compress force-clear).
         # See #76354.
         _install_compression_cancelled_check(
-            agent.context_compressor, lambda: commit_fence.is_cancelled, attempt_generation
+            agent.context_compressor, lambda: commit_fence.is_cancelled, attempt_generation,
+            publication_fence=commit_fence,
         )
+        # Engines capture this fence once at compress() entry. Each short DAG transaction may use
+        # begin_lock_setup/finish_lock_setup, never hold it across provider work or use sticky begin_commit.
+        # The shared attempt owner prevents a detached worker's finally from clearing its successor's fence.
 
     def _compression_cancel_requested() -> bool:
         return bool(

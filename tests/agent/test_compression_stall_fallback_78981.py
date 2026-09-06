@@ -20,9 +20,12 @@ These tests pin the contract:
 
 from __future__ import annotations
 
+import json
 import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import pytest
 
 from agent.context_compressor import (
     ContextCompressor,
@@ -266,6 +269,35 @@ def test_incomplete_chain_entries_are_skipped():
 def test_no_chain_resolves_to_no_route():
     with _patch_chain([]):
         assert resolve_compression_fallback_route() is None
+
+
+@pytest.mark.parametrize("policy", ["none", "default"])
+def test_stall_policy_controls_discovery_before_retry(tmp_path, monkeypatch, policy):
+    from agent import auxiliary_client, conversation_compression
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    entry = {"provider": "custom", "model": "synthetic-backup",
+             "base_url": "https://fallback.invalid/v1"}
+    (tmp_path / "config.yaml").write_text(json.dumps({"auxiliary": {"compression": {
+        "fallback_policy": policy, "fallback_chain": [entry],
+    }}}))
+    credentials = Mock(return_value=None)
+    retry = Mock(return_value=([{"role": "assistant", "content": "summary"}], "prompt"))
+    monkeypatch.setattr(auxiliary_client, "_fallback_entry_api_key", credentials)
+    monkeypatch.setattr(conversation_compression, "run_compress_context_with_progress_timeout", retry)
+    result = conversation_compression._retry_compression_on_fallback_chain(
+        worker=Mock(), messages=[], system_prompt_fallback="original",
+        idle_timeout_seconds=10, total_ceiling_seconds=20,
+        new_fence=CompressionCommitFence,
+    )
+    if policy == "none":
+        assert result is None
+        credentials.assert_not_called()
+        retry.assert_not_called()
+    else:
+        credentials.assert_called_once_with(entry)
+        retry.assert_called_once()
+        assert result == retry.return_value
 
 
 # ---------------------------------------------------------------------------
