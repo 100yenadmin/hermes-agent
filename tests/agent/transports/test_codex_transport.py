@@ -59,12 +59,12 @@ class TestCodexBuildKwargs:
         )
 
         assert kw["reasoning"]["effort"] == "low"
-        assert kw["prompt_cache_options"] == {"ttl": "30m"}
+        assert kw["extra_body"]["prompt_cache_options"] == {"ttl": "30m"}
         assert "prompt_cache_retention" not in kw
         assert kw["include"] == ["reasoning.encrypted_content"]
         for unsupported in ("temperature", "top_p", "top_logprobs", "logprobs"):
             assert unsupported not in kw
-        assert transport.preflight_kwargs(kw)["prompt_cache_options"] == {"ttl": "30m"}
+        assert transport.preflight_kwargs(kw)["extra_body"]["prompt_cache_options"] == {"ttl": "30m"}
 
     @pytest.mark.parametrize("effort", ["none", "minimal"])
     def test_astra_normalizes_unsupported_low_efforts_after_overrides(self, transport, effort):
