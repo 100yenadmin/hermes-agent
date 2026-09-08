@@ -92,6 +92,13 @@ checkpoint that includes it. Completions remain available until acknowledged.
 Reconciliation clears the worker's resume barrier while retaining the interrupted
 run's historical uncertainty record.
 
+Messages from a top-level worker to the main parent use the same profile-scoped
+store. Their states distinguish `QUEUED`, `PUBLISHED`, and `ACKNOWLEDGED`.
+Publishing a message makes it durably available to the parent; worker completion
+alone is not proof that the parent consumed it. Unacknowledged messages remain
+available after restart. Nested child-to-parent and policy-enabled sibling
+messages retain their lineage and ownership checks.
+
 The reconciliation annotation records an explicit disposition, nonempty decision
 note, affected tool-call IDs, prior statuses, and time. The top-level uncertainty
 flag indicates a currently unresolved barrier; historical uncertainty remains in
