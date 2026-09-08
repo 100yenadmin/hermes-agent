@@ -333,14 +333,14 @@ def _profile_policy_snapshot(
             "execution_limits": dataclasses.asdict(spec.execution_limits),
             "enabled_routes": [dataclasses.asdict(item) for item in spec.enabled_routes],
         }
-    effective_tools = sorted(
-        name for name in (
-            getattr(child, "_worker_effective_tool_names", None)
-            or getattr(child, "_executable_tool_names", None)
-            or getattr(child, "valid_tool_names", None)
-            or ()
-        ) if isinstance(name, str)
-    )
+    # Empty authority is an explicit denial, not missing metadata. Only an
+    # absent execution catalog may fall back to legacy visible schemas.
+    tool_names = getattr(child, "_worker_effective_tool_names", None)
+    if tool_names is None:
+        tool_names = getattr(child, "_executable_tool_names", None)
+    if tool_names is None:
+        tool_names = getattr(child, "valid_tool_names", None)
+    effective_tools = sorted(name for name in (tool_names or ()) if isinstance(name, str))
     policy = {
         "profile_contract": selected,
         "effective_tools": effective_tools,
