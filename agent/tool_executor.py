@@ -352,6 +352,9 @@ def _tool_search_scoped_names(agent) -> frozenset:
         names = _ts.scoped_deferrable_names(model_tools.get_tool_definitions(
             enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True, skip_tool_search_assembly=True,
         ) or [])
+        exact = getattr(agent, "valid_tool_names", None)
+        if isinstance(exact, (set, frozenset, list, tuple)):
+            names = frozenset(names).intersection(exact)
     except Exception:
         names = frozenset()
     with contextlib.suppress(Exception):
@@ -906,7 +909,7 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
     # callback can run. This call intentionally raises: swallowing it would permit an
     # external side effect without a recoverable execution record.
     from agent.subagent_lifecycle import before_worker_tool
-    before_worker_tool(agent)
+    before_worker_tool(agent, ref.call_id)
     function_name, function_args, effective_task_id, tool_call_id = ref.name, ref.args, ref.task_id, ref.call_id
     display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
     if _tool_progress_enabled(agent):
@@ -1037,7 +1040,13 @@ def _commit_tool_result(
     # stores the resulting conversation. A UI completion callback is too early and
     # exceptions there are intentionally swallowed.
     from agent.subagent_lifecycle import checkpoint_worker_tool_result
-    checkpoint_worker_tool_result(agent, messages, settled=effect_disposition != "unknown")
+    checkpoint_worker_tool_result(
+        agent,
+        messages,
+        tool_call_id=tool_call_id,
+        admitted=False if blocked else None,
+        settled=effect_disposition != "unknown",
+    )
 
     if not blocked:
         # ``tool.completed`` projects AFTER the canonical append + flush so resume can
@@ -1359,11 +1368,11 @@ def _unfinished_tool_result(agent, ref: _ToolCallRef, *, timed_out: bool, timeou
     elif agent._interrupt_requested:
         function_result = f"[Tool execution cancelled — {ref.name} was skipped due to user interrupt]"
         outcome = dict(status="cancelled", error_type="keyboard_interrupt", error_message="Tool execution cancelled by user interrupt")
-        tool_duration, effect_disposition = 0.0, None
+        tool_duration, effect_disposition = 0.0, "unknown"
     else:
         function_result = f"Error executing tool '{ref.name}': thread did not return a result"
         outcome = dict(status="error", error_type="thread_missing_result", error_message=function_result)
-        tool_duration, effect_disposition = 0.0, None
+        tool_duration, effect_disposition = 0.0, "unknown"
     ref.emit_post(agent, function_result, **outcome)
     return function_result, tool_duration, effect_disposition
 

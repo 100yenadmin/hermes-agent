@@ -25,6 +25,7 @@ _SCHEMA = (
         worker_id TEXT NOT NULL REFERENCES orchestration_workers(worker_id),
         request_id TEXT NOT NULL, previous_run_id TEXT,
         goal TEXT NOT NULL, context TEXT NOT NULL, status TEXT NOT NULL,
+        capability_digest TEXT NOT NULL DEFAULT '',
         lease_token TEXT, lease_expires_at REAL, tool_inflight INTEGER NOT NULL DEFAULT 0,
         tool_inflight_count INTEGER NOT NULL DEFAULT 0,
         uncertain_side_effect INTEGER NOT NULL DEFAULT 0, result TEXT,
@@ -38,9 +39,15 @@ _SCHEMA = (
         worker_id TEXT NOT NULL REFERENCES orchestration_workers(worker_id),
         sender_id TEXT, content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
         delivered_run_id TEXT, created_at REAL NOT NULL, delivered_at REAL)""",
+    """CREATE TABLE IF NOT EXISTS orchestration_tool_effects (
+        run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id),
+        tool_call_id TEXT NOT NULL, status TEXT NOT NULL,
+        admitted_at REAL NOT NULL, settled_at REAL,
+        PRIMARY KEY(run_id, tool_call_id))""",
     "CREATE INDEX IF NOT EXISTS orchestration_owner ON orchestration_workers(owner_session_id)",
     "CREATE INDEX IF NOT EXISTS orchestration_queue ON orchestration_runs(worker_id, status, sequence)",
     "CREATE INDEX IF NOT EXISTS orchestration_mailbox ON orchestration_messages(worker_id, status, sequence)",
+    "CREATE INDEX IF NOT EXISTS orchestration_tool_effect_state ON orchestration_tool_effects(run_id, status)",
 )
 _JSON_FIELDS = {"policy", "history", "result"}
 _SECRET_KEYS = {"api_key", "access_token", "refresh_token", "token", "password", "authorization", "cookie", "credentials"}
@@ -90,6 +97,19 @@ class WorkerStore:
             if "tool_inflight_count" not in run_columns:
                 conn.execute(
                     "ALTER TABLE orchestration_runs ADD COLUMN tool_inflight_count INTEGER NOT NULL DEFAULT 0")
+            if "capability_digest" not in run_columns:
+                conn.execute(
+                    "ALTER TABLE orchestration_runs ADD COLUMN capability_digest TEXT NOT NULL DEFAULT ''")
+            # Older boolean/count checkpoints have no call identity. Preserve
+            # them as explicit unknown effects so recovery stays fail-closed.
+            legacy = conn.execute("""SELECT run_id,tool_inflight_count FROM orchestration_runs r
+                WHERE tool_inflight_count>0 AND NOT EXISTS (
+                    SELECT 1 FROM orchestration_tool_effects e WHERE e.run_id=r.run_id)""").fetchall()
+            for row in legacy:
+                for index in range(int(row[1])):
+                    conn.execute("""INSERT INTO orchestration_tool_effects
+                        (run_id,tool_call_id,status,admitted_at) VALUES (?,?,?,?)""",
+                        (row[0], f"legacy-unknown-{index}", "UNKNOWN", time.time()))
         self.db._execute_write(migrate)
 
     @staticmethod
@@ -165,9 +185,24 @@ class WorkerStore:
                 (worker_id,),
             )]
 
-    def enqueue_run(self, worker_id, owner_session_id, *, goal, context="", request_id=None, previous_run_id=None):
+    def pending_runs(self, owner_session_id):
+        """Owner-scoped durable FIFO queue, including runs with no process record."""
+        with self.db._read_ctx() as conn:
+            return [_row(row) for row in conn.execute("""SELECT r.* FROM orchestration_runs r
+                JOIN orchestration_workers w ON r.worker_id=w.worker_id
+                LEFT JOIN orchestration_runs previous ON previous.run_id=r.previous_run_id
+                WHERE w.owner_session_id=? AND r.status='PENDING'
+                AND (r.previous_run_id IS NULL OR previous.status IN ('SUCCEEDED','FAILED','INTERRUPTED','CANCELLED'))
+                ORDER BY r.sequence""", (owner_session_id,))]
+
+    def enqueue_run(
+        self, worker_id, owner_session_id, *, goal, context="", request_id=None,
+        previous_run_id=None, capability_digest="",
+    ):
         if not isinstance(goal, str) or not goal.strip() or not isinstance(context, str):
             raise ValueError("A run needs a nonempty goal and text context")
+        if not isinstance(capability_digest, str):
+            raise ValueError("capability_digest must be text")
         run_id, request_id = "run-" + uuid.uuid4().hex, request_id or uuid.uuid4().hex
         def enqueue(conn):
             worker = self._worker(conn, worker_id, owner_session_id)
@@ -189,9 +224,11 @@ class WorkerStore:
                     raise ValueError("Followup must link to this worker's latest run")
             now = time.time()
             conn.execute("""INSERT INTO orchestration_runs
-                (run_id,worker_id,request_id,previous_run_id,goal,context,status,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,'PENDING',?,?)""",
-                (run_id, worker_id, request_id, previous_run_id, goal, context, now, now))
+                (run_id,worker_id,request_id,previous_run_id,goal,context,status,
+                 capability_digest,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,'PENDING',?,?,?)""",
+                (run_id, worker_id, request_id, previous_run_id, goal, context,
+                 capability_digest, now, now))
             return self._run(conn, run_id, owner_session_id)
         return self.db._execute_write(enqueue)
 
@@ -224,6 +261,37 @@ class WorkerStore:
             return self._run(conn, run[0], owner_session_id)
         return self.db._execute_write(claim)
 
+    def claim_run(self, run_id, owner_session_id, *, lease_seconds=60, max_concurrent=10):
+        """Claim this exact FIFO-eligible run or return None without leasing a peer."""
+        _positive(lease_seconds, "lease_seconds")
+        if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int) or max_concurrent < 1:
+            raise ValueError("max_concurrent must be a positive integer")
+        token = uuid.uuid4().hex
+        def claim(conn):
+            run = self._run(conn, run_id, owner_session_id)
+            worker = self._worker(conn, run["worker_id"], owner_session_id)
+            if run["status"] != "PENDING" or worker["uncertain_side_effect"]:
+                return None
+            active = conn.execute(
+                "SELECT 1 FROM orchestration_runs WHERE worker_id=? AND status='RUNNING'",
+                (run["worker_id"],),
+            ).fetchone()
+            count = conn.execute("""SELECT count(*) FROM orchestration_runs r
+                JOIN orchestration_workers w ON r.worker_id=w.worker_id
+                WHERE w.owner_session_id=? AND r.status='RUNNING'""", (owner_session_id,)).fetchone()[0]
+            eligible = conn.execute("""SELECT pending.run_id FROM orchestration_runs pending
+                LEFT JOIN orchestration_runs previous ON previous.run_id=pending.previous_run_id
+                WHERE pending.worker_id=? AND pending.status='PENDING'
+                AND (pending.previous_run_id IS NULL OR previous.status IN ('SUCCEEDED','FAILED','INTERRUPTED','CANCELLED'))
+                ORDER BY pending.sequence LIMIT 1""", (run["worker_id"],)).fetchone()
+            if active or count >= max_concurrent or not eligible or eligible[0] != run_id:
+                return None
+            now = time.time()
+            conn.execute("""UPDATE orchestration_runs SET status='RUNNING',lease_token=?,lease_expires_at=?,updated_at=?
+                WHERE run_id=? AND status='PENDING'""", (token, now + lease_seconds, now, run_id))
+            return self._run(conn, run_id, owner_session_id)
+        return self.db._execute_write(claim)
+
     def heartbeat_run(self, run_id, owner_session_id, lease_token, *, lease_seconds=60):
         _positive(lease_seconds, "lease_seconds")
         def heartbeat(conn):
@@ -232,72 +300,102 @@ class WorkerStore:
             conn.execute("UPDATE orchestration_runs SET lease_expires_at=?,updated_at=? WHERE run_id=?", (now + lease_seconds, now, run_id))
         self.db._execute_write(heartbeat)
 
-    def checkpoint_run(self, run_id, owner_session_id, lease_token, *, history, tool_inflight=False, delivered_message_ids=()):
+    def checkpoint_run(self, run_id, owner_session_id, lease_token, *, history, tool_inflight=None, delivered_message_ids=()):
         history_json = json.dumps(history, allow_nan=False)
         def checkpoint(conn):
             run = self._lease(conn, run_id, owner_session_id, lease_token)
             now = time.time()
-            count = max(1, int(run.get("tool_inflight_count") or 0)) if tool_inflight else 0
             conn.execute("UPDATE orchestration_workers SET history=?,updated_at=? WHERE worker_id=?", (history_json, now, run["worker_id"]))
-            conn.execute(
-                "UPDATE orchestration_runs SET tool_inflight=?,tool_inflight_count=?,updated_at=? WHERE run_id=?",
-                (int(tool_inflight), count, now, run_id),
-            )
+            if tool_inflight is True:
+                call_id = "legacy-checkpoint-" + uuid.uuid4().hex
+                conn.execute("""INSERT INTO orchestration_tool_effects
+                    (run_id,tool_call_id,status,admitted_at) VALUES (?,?,'UNKNOWN',?)""",
+                    (run_id, call_id, now))
+            count = conn.execute("""SELECT count(*) FROM orchestration_tool_effects
+                WHERE run_id=? AND status IN ('INFLIGHT','UNKNOWN')""", (run_id,)).fetchone()[0]
+            conn.execute("""UPDATE orchestration_runs SET tool_inflight=?,tool_inflight_count=?,updated_at=?
+                WHERE run_id=?""", (int(count > 0), count, now, run_id))
             for message_id in delivered_message_ids:
                 self._ack_message(conn, run, message_id)
         self.db._execute_write(checkpoint)
 
-    def mark_tool_boundary(self, run_id, owner_session_id, lease_token, *, tool_inflight):
-        """Fence the uncertain-send window without rewriting the conversation checkpoint."""
-        if not isinstance(tool_inflight, bool):
-            raise ValueError("tool_inflight must be a boolean")
+    def mark_tool_boundary(self, run_id, owner_session_id, lease_token, *, tool_call_id=None, tool_inflight=True):
+        """Admit one identified effect before dispatch; anonymous clearing is forbidden."""
+        if tool_inflight is not True:
+            raise ValueError("Tool effects clear only through their matching result checkpoint")
+        tool_call_id = tool_call_id or "legacy-tool-" + uuid.uuid4().hex
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            raise ValueError("tool_call_id must be nonempty text")
         def mark(conn):
-            run = self._lease(conn, run_id, owner_session_id, lease_token)
-            count = int(run.get("tool_inflight_count") or 0) + 1 if tool_inflight else 0
-            conn.execute(
-                "UPDATE orchestration_runs SET tool_inflight=?,tool_inflight_count=?,updated_at=? WHERE run_id=?",
-                (int(count > 0), count, time.time(), run_id),
-            )
-        self.db._execute_write(mark)
+            self._lease(conn, run_id, owner_session_id, lease_token)
+            existing = conn.execute("""SELECT status FROM orchestration_tool_effects
+                WHERE run_id=? AND tool_call_id=?""", (run_id, tool_call_id)).fetchone()
+            if existing is not None:
+                raise ValueError("Tool call was already admitted; refusing duplicate execution")
+            now = time.time()
+            conn.execute("""INSERT INTO orchestration_tool_effects
+                (run_id,tool_call_id,status,admitted_at) VALUES (?,?,'INFLIGHT',?)""",
+                (run_id, tool_call_id, now))
+            count = conn.execute("""SELECT count(*) FROM orchestration_tool_effects
+                WHERE run_id=? AND status IN ('INFLIGHT','UNKNOWN')""", (run_id,)).fetchone()[0]
+            conn.execute("""UPDATE orchestration_runs SET tool_inflight=?,tool_inflight_count=?,updated_at=?
+                WHERE run_id=?""", (int(count > 0), count, now, run_id))
+            return tool_call_id
+        return self.db._execute_write(mark)
 
     def checkpoint_tool_result(
         self, run_id, owner_session_id, lease_token, *, history,
-        settled=True, delivered_message_ids=(),
+        tool_call_id=None, admitted=None, settled=True, delivered_message_ids=(),
     ):
-        """Persist one canonical tool outcome and clear one inflight slot only when its effect is known."""
+        """Persist one outcome and settle only its matching admitted effect."""
         history_json = json.dumps(history, allow_nan=False)
         def checkpoint(conn):
             run = self._lease(conn, run_id, owner_session_id, lease_token)
-            count = int(run.get("tool_inflight_count") or 0)
-            if settled and count:
-                count -= 1
             now = time.time()
+            effect = None
+            if isinstance(tool_call_id, str) and tool_call_id:
+                effect = conn.execute("""SELECT status FROM orchestration_tool_effects
+                    WHERE run_id=? AND tool_call_id=?""", (run_id, tool_call_id)).fetchone()
+            admitted_here = effect is not None if admitted is None else bool(admitted)
+            if admitted_here:
+                if not isinstance(tool_call_id, str) or not tool_call_id:
+                    raise ValueError("An admitted tool result requires tool_call_id")
+                if effect is None or effect[0] != "INFLIGHT":
+                    raise ValueError("Tool result does not match an inflight admitted call")
+                conn.execute("""UPDATE orchestration_tool_effects SET status=?,settled_at=?
+                    WHERE run_id=? AND tool_call_id=?""",
+                    ("SETTLED" if settled else "UNKNOWN", now, run_id, tool_call_id))
             conn.execute(
                 "UPDATE orchestration_workers SET history=?,updated_at=? WHERE worker_id=?",
                 (history_json, now, run["worker_id"]),
             )
-            conn.execute(
-                "UPDATE orchestration_runs SET tool_inflight=?,tool_inflight_count=?,updated_at=? WHERE run_id=?",
-                (int(count > 0), count, now, run_id),
-            )
+            count = conn.execute("""SELECT count(*) FROM orchestration_tool_effects
+                WHERE run_id=? AND status IN ('INFLIGHT','UNKNOWN')""", (run_id,)).fetchone()[0]
+            conn.execute("""UPDATE orchestration_runs SET tool_inflight=?,tool_inflight_count=?,updated_at=?
+                WHERE run_id=?""", (int(count > 0), count, now, run_id))
             for message_id in delivered_message_ids:
                 self._ack_message(conn, run, message_id)
         self.db._execute_write(checkpoint)
 
-    def finish_run(self, run_id, owner_session_id, lease_token, *, status, result, history=None):
+    def finish_run(
+        self, run_id, owner_session_id, lease_token, *, status, result, history=None,
+        delivered_message_ids=(),
+    ):
         if status not in _TERMINAL:
             raise ValueError("Invalid terminal run status")
         result_json = _policy_json(result)
         def finish(conn):
             run = self._lease(conn, run_id, owner_session_id, lease_token)
             now = time.time()
-            uncertain = bool(run["tool_inflight"]) and status != "SUCCEEDED"
+            uncertain = bool(run["tool_inflight"])
             conn.execute("""UPDATE orchestration_runs SET status=?,result=?,uncertain_side_effect=?,
                 lease_token=NULL,lease_expires_at=NULL,updated_at=? WHERE run_id=?""",
                 (status, result_json, int(uncertain), now, run_id))
             conn.execute("UPDATE orchestration_workers SET uncertain_side_effect=?,updated_at=? WHERE worker_id=?", (int(uncertain), now, run["worker_id"]))
             if history is not None:
                 conn.execute("UPDATE orchestration_workers SET history=? WHERE worker_id=?", (json.dumps(history, allow_nan=False), run["worker_id"]))
+            for message_id in delivered_message_ids:
+                self._ack_message(conn, run, message_id)
             return self._run(conn, run_id, owner_session_id)
         return self.db._execute_write(finish)
 
@@ -380,7 +478,12 @@ class WorkerStore:
             return [self._run(conn, row[0], owner_session_id) for row in rows]
         return self.db._execute_write(cancel)
 
-    def reconcile_run(self, run_id, owner_session_id):
+    def reconcile_run(self, run_id, owner_session_id, *, disposition, note):
+        allowed = {"confirmed_applied", "confirmed_not_applied", "accepted_unknown_no_replay"}
+        if disposition not in allowed:
+            raise ValueError(f"Invalid reconciliation disposition; choose one of {sorted(allowed)}")
+        if not isinstance(note, str) or not note.strip():
+            raise ValueError("Reconciliation requires a nonempty decision note")
         def reconcile(conn):
             run = self._run(conn, run_id, owner_session_id)
             if run["status"] not in _TERMINAL:
@@ -388,7 +491,25 @@ class WorkerStore:
             latest = conn.execute("SELECT run_id FROM orchestration_runs WHERE worker_id=? AND status IN ('INTERRUPTED','FAILED','CANCELLED','SUCCEEDED') ORDER BY sequence DESC LIMIT 1", (run["worker_id"],)).fetchone()
             if not latest or latest[0] != run_id:
                 raise ValueError("Reconcile the latest terminal run")
-            conn.execute("UPDATE orchestration_workers SET uncertain_side_effect=0,updated_at=? WHERE worker_id=?", (time.time(), run["worker_id"]))
+            now = time.time()
+            result = dict(run.get("result") or {})
+            effects = [
+                {"tool_call_id": row[0], "prior_status": row[1]}
+                for row in conn.execute("""SELECT tool_call_id,status FROM orchestration_tool_effects
+                    WHERE run_id=? AND status IN ('INFLIGHT','UNKNOWN') ORDER BY tool_call_id""", (run_id,))
+            ]
+            result["reconciliation"] = {
+                "disposition": disposition,
+                "note": note.strip(),
+                "affected_tool_calls": effects,
+                "reconciled_at": now,
+            }
+            conn.execute("""UPDATE orchestration_tool_effects SET status='RECONCILED',settled_at=?
+                WHERE run_id=? AND status IN ('INFLIGHT','UNKNOWN')""", (now, run_id))
+            conn.execute("""UPDATE orchestration_runs SET uncertain_side_effect=0,tool_inflight=0,
+                tool_inflight_count=0,result=?,updated_at=? WHERE run_id=?""",
+                (_policy_json(result), now, run_id))
+            conn.execute("UPDATE orchestration_workers SET uncertain_side_effect=0,updated_at=? WHERE worker_id=?", (now, run["worker_id"]))
         self.db._execute_write(reconcile)
 
     def pending_completions(self, owner_session_id):

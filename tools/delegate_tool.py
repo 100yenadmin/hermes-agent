@@ -82,6 +82,50 @@ def check_delegate_requirements() -> bool:
     return True
 
 
+def _validate_spawn_admission(parent_agent, requested_children: int = 0) -> int:
+    """Shared parent/plugin tree admission; returns the effective child batch cap."""
+    if is_spawn_paused():
+        raise ValueError(
+            "Delegation spawning is paused. Clear the pause via the TUI (`p` in /agents) "
+            "or the delegation.pause RPC before retrying.")
+    if getattr(parent_agent, "_delegate_spawn_allowed", True) is False:
+        raise ValueError("This worker may use delegate_task controls but its profile/depth does not permit spawning.")
+    depth = int(getattr(parent_agent, "_delegate_depth", 0) or 0)
+    max_spawn = _get_max_spawn_depth()
+    parent_profile_spawn = getattr(parent_agent, "_delegate_profile_max_spawn_depth", None)
+    if isinstance(parent_profile_spawn, int):
+        if parent_profile_spawn <= 0:
+            raise ValueError("This worker profile does not permit spawning descendants.")
+        max_spawn = min(max_spawn, depth + parent_profile_spawn)
+    if depth >= max_spawn:
+        raise ValueError(
+            f"Delegation depth limit reached (depth={depth}, max_spawn_depth={max_spawn}). Raise "
+            "delegation.max_spawn_depth in config.yaml if deeper nesting is required.")
+
+    max_children = _get_max_concurrent_children()
+    parent_profile_concurrency = getattr(parent_agent, "_delegate_profile_max_concurrent_children", None)
+    if isinstance(parent_profile_concurrency, int):
+        if parent_profile_concurrency <= 0:
+            raise ValueError("This worker profile does not permit spawning children.")
+        max_children = min(max_children, parent_profile_concurrency)
+    if requested_children > max_children:
+        raise ValueError(
+            f"Requested {requested_children} children exceeds this worker's concurrency limit {max_children}.")
+    if requested_children:
+        from agent.subagent_lifecycle import _owner_session_id_of, _persistent_store
+        store = _persistent_store(parent_agent)
+        owner = _owner_session_id_of(parent_agent)
+        if store is not None and owner:
+            store.recover_expired_runs(owner)
+            active = store.active_run_count(owner)
+            global_cap = _get_max_concurrent_children()
+            if active + requested_children > global_cap:
+                raise ValueError(
+                    f"Durable worker concurrency limit would be exceeded: {active} active + "
+                    f"{requested_children} requested > {global_cap}. Wait for a worker to finish before retrying.")
+    return max_children
+
+
 def _open_child_session_db(parent_agent) -> Any:
     """DEDICATED SessionDB handle for the child, or None: the parent's handle can be closed by its own lifecycle while
     a background child still flushes (transcript silently dropped). It MUST open the same db FILE as the parent's
@@ -181,6 +225,7 @@ def _build_child_agent(
     profile_workspace_context: Any = None,
     profile_route_receipt: Optional[Dict[str, Any]] = None,
     profile_execution_limits: Any = None,
+    request_blocked_tools: Optional[List[str]] = None,
     frozen_system_prompt: Optional[str] = None,
     retained_child_depth: Optional[int] = None,
     retained_parent_worker_id: Optional[str] = None,
@@ -222,7 +267,8 @@ def _build_child_agent(
     # as auxiliary.review.
     delegation_cfg = _load_config()
     profile_allowed_toolsets = getattr(profile_tool_policy, "allowed_toolsets", None)
-    requested_toolsets = list(profile_allowed_toolsets) if profile_allowed_toolsets is not None else toolsets
+    requested_toolsets = toolsets if toolsets is not None else (
+        list(profile_allowed_toolsets) if profile_allowed_toolsets is not None else None)
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, requested_toolsets, effective_role)
     if override_supports_tools is False and child_toolsets:
         raise ValueError(
@@ -304,7 +350,14 @@ def _build_child_agent(
                     from hermes_state_registry import release_or_close
                     release_or_close(child_session_db)
             raise
-    _apply_exact_tool_policy(child, profile_tool_policy)
+    parent_exact_tools = getattr(parent_agent, "valid_tool_names", None)
+    _apply_exact_tool_policy(
+        child,
+        profile_tool_policy,
+        request_toolsets=toolsets,
+        request_blocked_tools=request_blocked_tools,
+        ancestor_allowed_tools=parent_exact_tools,
+    )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     _apply_child_cache_ttl(child)
     if child_session_db is not None:
@@ -593,6 +646,7 @@ def delegate_task(
     profile: Optional[str] = None, model_profile: Optional[str] = None,
     provider: Optional[str] = None, model: Optional[str] = None, reasoning_effort: Optional[str] = None,
     worker_id: Optional[str] = None, run_id: Optional[str] = None, timeout_seconds: Optional[float] = None,
+    reconciliation_disposition: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -625,7 +679,9 @@ def delegate_task(
                 ],
             }
         return json.dumps({"success": True, **catalog}, ensure_ascii=False)
-    if normalized_action in {"status", "inspect", "completions", "message", "wait", "cancel", "resume", "ack"}:
+    if normalized_action in {
+        "status", "inspect", "completions", "message", "wait", "cancel", "reconcile", "resume", "ack",
+    }:
         from agent.subagent_lifecycle import SubagentLifecycleError, SubagentLifecycleService
         if normalized_action == "message" and not worker_id:
             worker_id = getattr(parent_agent, "_delegate_parent_worker_id", None)
@@ -649,6 +705,7 @@ def delegate_task(
                 run_id=run_id,
                 message=message,
                 timeout_seconds=timeout_seconds,
+                reconciliation_disposition=reconciliation_disposition,
             )
         except (SubagentLifecycleError, PermissionError, ValueError) as exc:
             return tool_error(str(exc))
@@ -658,36 +715,17 @@ def delegate_task(
     if normalized_action and normalized_action != "spawn":
         return tool_error(
             f"Unknown action '{action}'. Use spawn, discover, status, inspect, completions, message, wait, cancel, "
-            "resume, ack, list, steer, or stop.")
-
-    # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
-    if is_spawn_paused():
-        return tool_error(
-            "Delegation spawning is paused. Clear the pause via the TUI "
-            "(`p` in /agents) or the `delegation.pause` RPC before retrying."
-        )
-
-    if getattr(parent_agent, "_delegate_spawn_allowed", True) is False:
-        return tool_error("This worker may use delegate_task controls but its profile/depth does not permit spawning.")
+            "reconcile, resume, ack, list, steer, or stop.")
 
     top_role = _normalize_role(role)
     # background applies to single tasks AND batches: a batch is ONE async unit
     # that joins on every child and re-enters as a single consolidated message.
     background = is_truthy_value(background, default=False) if background is not None else False
 
-    depth = getattr(parent_agent, "_delegate_depth", 0)
-    max_spawn = _get_max_spawn_depth()
-    parent_profile_spawn = getattr(parent_agent, "_delegate_profile_max_spawn_depth", None)
-    if isinstance(parent_profile_spawn, int):
-        if parent_profile_spawn <= 0:
-            return tool_error("This worker profile does not permit spawning descendants.")
-        max_spawn = min(max_spawn, depth + parent_profile_spawn)
-    if depth >= max_spawn:
-        return tool_error(
-            f"Delegation depth limit reached (depth={depth}, max_spawn_depth={max_spawn}). Raise "
-            f"delegation.max_spawn_depth in config.yaml if deeper nesting is required (no hard ceiling, but each level "
-            f"multiplies API cost)."
-        )
+    try:
+        max_children = _validate_spawn_admission(parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
@@ -714,12 +752,6 @@ def delegate_task(
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
         # spawn loudly (#80450).
         return tool_error(str(exc))
-    max_children = _get_max_concurrent_children()
-    parent_profile_concurrency = getattr(parent_agent, "_delegate_profile_max_concurrent_children", None)
-    if isinstance(parent_profile_concurrency, int):
-        if parent_profile_concurrency <= 0:
-            return tool_error("This worker profile does not permit spawning children.")
-        max_children = min(max_children, parent_profile_concurrency)
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
@@ -738,20 +770,10 @@ def delegate_task(
     if err:
         return tool_error(err)
 
-    # Durable owner-wide concurrency is checked before constructing any child. A nested orchestrator's
-    # own run occupies one slot, so this prevents a later child from failing after earlier siblings launched.
-    from agent.subagent_lifecycle import _owner_session_id_of, _persistent_store
-    durable_store = _persistent_store(parent_agent)
-    durable_owner = _owner_session_id_of(parent_agent)
-    if durable_store is not None and durable_owner:
-        durable_store.recover_expired_runs(durable_owner)
-        active_runs = durable_store.active_run_count(durable_owner)
-        global_cap = _get_max_concurrent_children()
-        if active_runs + len(task_list) > global_cap:
-            return tool_error(
-                f"Durable worker concurrency limit would be exceeded: {active_runs} active + "
-                f"{len(task_list)} requested > {global_cap}. Wait for a worker to finish before retrying."
-            )
+    try:
+        _validate_spawn_admission(parent_agent, len(task_list))
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
@@ -963,7 +985,7 @@ DELEGATE_TASK_SCHEMA = {
             "action": _p(
                 "string",
                 "Default 'spawn'. 'discover' returns configured worker profiles. Durable worker actions are "
-                "'status', 'inspect', 'completions', 'message', 'wait', 'cancel', 'resume', and 'ack'. "
+                "'status', 'inspect', 'completions', 'message', 'wait', 'cancel', 'reconcile', 'resume', and 'ack'. "
                 "Legacy live controls are "
                 "'list' = ids/goals/status/transcripts; 'steer' = queue "
                 "course-correction text into one child (subagent_id + "
@@ -972,12 +994,18 @@ DELEGATE_TASK_SCHEMA = {
                 "Control actions return immediately; goal/tasks are ignored unless spawning.",
                 enum=[
                     "spawn", "discover", "status", "inspect", "completions", "message", "wait",
-                    "cancel", "resume", "ack", "list", "steer", "stop",
+                    "cancel", "reconcile", "resume", "ack", "list", "steer", "stop",
                 ],
             ),
             "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
             "worker_id": _p("string", "Stable worker target for status/inspect/message/wait/cancel/resume/ack."),
             "run_id": _p("string", "Optional exact run target for inspect/wait/cancel/resume/ack."),
+            "reconciliation_disposition": _p(
+                "string",
+                "For action='reconcile': explicit decision about the prior uncertain effect. This records evidence "
+                "and never replays the tool.",
+                enum=["confirmed_applied", "confirmed_not_applied", "accepted_unknown_no_replay"],
+            ),
             "timeout_seconds": _p("number", "For action='wait', block for at most 60 seconds; omit for a snapshot."),
             "message": _p(
                 "string",
@@ -1020,6 +1048,7 @@ registry.register(
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         worker_id=args.get("worker_id"), run_id=args.get("run_id"), timeout_seconds=args.get("timeout_seconds"),
+        reconciliation_disposition=args.get("reconciliation_disposition"),
         profile=args.get("profile"), provider=args.get("provider"), model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
         parent_agent=kw.get("parent_agent"),

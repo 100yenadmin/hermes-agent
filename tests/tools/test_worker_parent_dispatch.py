@@ -31,6 +31,7 @@ def test_parent_dispatch_forwards_worker_fields_and_keeps_safe_task_overrides():
         "provider": "provider-b",
         "model": "review-model",
         "reasoning_effort": "high",
+        "reconciliation_disposition": "accepted_unknown_no_replay",
         "tasks": [{
             "goal": "review",
             "profile": "review",
@@ -48,6 +49,7 @@ def test_parent_dispatch_forwards_worker_fields_and_keeps_safe_task_overrides():
     for field in (
         "action", "worker_id", "run_id", "message", "timeout_seconds",
         "profile", "provider", "model", "reasoning_effort",
+        "reconciliation_disposition",
     ):
         assert captured[field] == args[field]
     task = captured["tasks"][0]
@@ -107,6 +109,41 @@ def test_parent_dispatch_reaches_compact_discovery_and_durable_controls(tmp_path
     acknowledged = json.loads(run_agent.AIAgent._dispatch_delegate_task(
         parent, {"action": "ack", "worker_id": worker["worker_id"], "run_id": active["run_id"]}))
     assert acknowledged["acknowledged"] is True
+
+    uncertain_worker = store.create_worker(parent.session_id, profile="review")
+    uncertain = store.enqueue_run(uncertain_worker["worker_id"], parent.session_id, goal="external effect")
+    uncertain = store.claim_run(uncertain["run_id"], parent.session_id)
+    store.mark_tool_boundary(
+        uncertain["run_id"], parent.session_id, uncertain["lease_token"],
+        tool_call_id="external-effect")
+    store.finish_run(
+        uncertain["run_id"], parent.session_id, uncertain["lease_token"],
+        status="INTERRUPTED", result={"summary": None})
+    reconciled = json.loads(run_agent.AIAgent._dispatch_delegate_task(
+        parent,
+        {
+            "action": "reconcile",
+            "worker_id": uncertain_worker["worker_id"],
+            "run_id": uncertain["run_id"],
+            "reconciliation_disposition": "accepted_unknown_no_replay",
+            "message": "Operator accepts the unknown outcome without replay.",
+        },
+    ))
+    assert reconciled["reconciled"] is True
+    audit = store.get_run(uncertain["run_id"], parent.session_id)["result"]["reconciliation"]
+    assert audit["affected_tool_calls"] == [
+        {"tool_call_id": "external-effect", "prior_status": "INFLIGHT"}
+    ]
+    inspected_reconciliation = json.loads(run_agent.AIAgent._dispatch_delegate_task(
+        parent,
+        {
+            "action": "inspect",
+            "worker_id": uncertain_worker["worker_id"],
+            "run_id": uncertain["run_id"],
+        },
+    ))
+    assert inspected_reconciliation["run"]["result"]["reconciliation"]["note"].startswith(
+        "Operator accepts")
     db.close()
 
 

@@ -87,7 +87,7 @@ def _resolve_child_toolsets(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    if toolsets is not None:
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
         if _get_inherit_mcp_toolsets():
@@ -122,19 +122,63 @@ def _resolve_child_toolsets(
     return child_toolsets, child_disabled_toolsets
 
 
-def _apply_exact_tool_policy(child: Any, policy: Any) -> None:
+def _tool_names_for_toolsets(toolsets: Optional[List[str]]) -> Optional[set[str]]:
+    if toolsets is None:
+        return None
+    if not toolsets:
+        return set()
+    import model_tools
+    definitions = model_tools.get_tool_definitions(
+        enabled_toolsets=list(toolsets), disabled_toolsets=[], quiet_mode=True,
+        skip_tool_search_assembly=True,
+    ) or []
+    return {
+        item.get("function", {}).get("name")
+        for item in definitions
+        if isinstance(item, dict) and isinstance(item.get("function", {}).get("name"), str)
+    }
+
+
+def _apply_exact_tool_policy(
+    child: Any,
+    policy: Any,
+    *,
+    request_toolsets: Optional[List[str]] = None,
+    request_blocked_tools: Optional[List[str]] = None,
+    ancestor_allowed_tools: Any = None,
+) -> None:
     """Apply profile tool-name ceilings to schemas and every execution validation path.
 
     ``AIAgent`` validates direct, inline, and deferred tool-search calls against
     ``valid_tool_names``. Keeping ``tools`` and that set aligned means a tool hidden from the
     schema also cannot be reached by naming it directly or through the generic bridge.
     """
-    if policy is None:
-        return
-    allowed = getattr(policy, "allowed_tools", None)
-    allowed_mcp = getattr(policy, "allowed_mcp_tools", None)
-    blocked = set(getattr(policy, "blocked_tools", ()) or ())
     current = set(getattr(child, "valid_tool_names", set()) or set())
+    # ``delegate_task`` is a worker control plane as well as a spawn tool.
+    # Descendants retain it only when the ancestor had it; action admission
+    # separately denies spawn for leaves/profile depth zero.
+    retain_worker_control = "delegate_task" in current and (
+        ancestor_allowed_tools is None or "delegate_task" in set(ancestor_allowed_tools or ())
+    )
+    ancestor = (
+        set(ancestor_allowed_tools)
+        if isinstance(ancestor_allowed_tools, (set, frozenset, list, tuple))
+        else None
+    )
+    if ancestor is not None:
+        current.intersection_update(ancestor)
+    request_names = _tool_names_for_toolsets(request_toolsets)
+    if request_names is not None:
+        current.intersection_update(request_names)
+    allowed_toolsets = getattr(policy, "allowed_toolsets", None) if policy is not None else None
+    profile_names = _tool_names_for_toolsets(
+        list(allowed_toolsets) if allowed_toolsets is not None else None)
+    if profile_names is not None:
+        current.intersection_update(profile_names)
+    allowed = getattr(policy, "allowed_tools", None) if policy is not None else None
+    allowed_mcp = getattr(policy, "allowed_mcp_tools", None) if policy is not None else None
+    blocked = set(getattr(policy, "blocked_tools", ()) or ()) if policy is not None else set()
+    blocked.update(request_blocked_tools or ())
     if allowed is not None:
         current.intersection_update(allowed)
     if allowed_mcp is not None:
@@ -148,8 +192,11 @@ def _apply_exact_tool_policy(child: Any, policy: Any) -> None:
             if _is_mcp_toolset_name(str(toolset or "")) and name not in allowed_mcp_names:
                 current.discard(name)
     current.difference_update(blocked)
+    if retain_worker_control:
+        current.add("delegate_task")
     child.tools = [
         item for item in (getattr(child, "tools", None) or [])
         if item.get("function", {}).get("name") in current
     ]
     child.valid_tool_names = current
+    child._worker_effective_tool_names = frozenset(current)

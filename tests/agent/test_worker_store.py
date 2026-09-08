@@ -110,7 +110,11 @@ def test_restart_fences_old_executor_and_preserves_conversation_and_completions(
         if tool_inflight:
             with pytest.raises(ValueError):
                 recovered.enqueue_run(wid, "owner", goal="resume", previous_run_id=run["run_id"])
-            recovered.reconcile_run(run["run_id"], "owner")
+            recovered.reconcile_run(
+                run["run_id"], "owner",
+                disposition="accepted_unknown_no_replay",
+                note="Operator accepted the unknown outcome without replay.",
+            )
         next_run = recovered.enqueue_run(wid, "owner", goal="resume", previous_run_id=run["run_id"])
         active = recovered.claim_next_run(wid, "owner")
         assert active["run_id"] == next_run["run_id"] != run["run_id"]
@@ -138,10 +142,18 @@ def test_tool_boundary_is_fenced_without_rewriting_history(store):
     wid = worker(store, frozen_prompt="fixed")
     store.enqueue_run(wid, "owner", goal="work")
     run = store.claim_next_run(wid, "owner")
-    store.mark_tool_boundary(run["run_id"], "owner", run["lease_token"], tool_inflight=True)
+    store.mark_tool_boundary(
+        run["run_id"], "owner", run["lease_token"],
+        tool_call_id="write-one", tool_inflight=True)
     assert store.get_run(run["run_id"], "owner")["tool_inflight"] is True
     assert store.get_worker(wid, "owner")["history"] == []
-    store.mark_tool_boundary(run["run_id"], "owner", run["lease_token"], tool_inflight=False)
+    with pytest.raises(ValueError, match="matching result checkpoint"):
+        store.mark_tool_boundary(
+            run["run_id"], "owner", run["lease_token"],
+            tool_call_id="write-one", tool_inflight=False)
+    store.checkpoint_tool_result(
+        run["run_id"], "owner", run["lease_token"], history=[],
+        tool_call_id="write-one", admitted=True, settled=True)
     assert store.get_run(run["run_id"], "owner")["tool_inflight"] is False
 
 
@@ -157,11 +169,17 @@ def test_parallel_tool_checkpoint_keeps_other_inflight_effect_uncertain(tmp_path
     wid = worker(first)
     first.enqueue_run(wid, "owner", goal="parallel")
     run = first.claim_next_run(wid, "owner", lease_seconds=10)
-    first.mark_tool_boundary(run["run_id"], "owner", run["lease_token"], tool_inflight=True)
-    first.mark_tool_boundary(run["run_id"], "owner", run["lease_token"], tool_inflight=True)
+    first.mark_tool_boundary(
+        run["run_id"], "owner", run["lease_token"], tool_call_id="a")
+    first.mark_tool_boundary(
+        run["run_id"], "owner", run["lease_token"], tool_call_id="b")
     history = [{"role": "tool", "tool_call_id": "a", "content": "done"}]
     first.checkpoint_tool_result(
-        run["run_id"], "owner", run["lease_token"], history=history, settled=True)
+        run["run_id"], "owner", run["lease_token"], history=history,
+        tool_call_id="a", admitted=True, settled=True)
+    first.checkpoint_tool_result(
+        run["run_id"], "owner", run["lease_token"], history=history,
+        tool_call_id="blocked", admitted=False, settled=True)
     snapshot = first.get_run(run["run_id"], "owner")
     assert snapshot["tool_inflight_count"] == 1
     assert snapshot["tool_inflight"] is True
@@ -178,3 +196,50 @@ def test_parallel_tool_checkpoint_keeps_other_inflight_effect_uncertain(tmp_path
         assert recovered.get_worker(wid, "owner")["history"] == history
     finally:
         reopened.close()
+
+
+def test_success_cannot_clear_unknown_effect_and_reconciliation_is_audited(store):
+    wid = worker(store)
+    queued = store.enqueue_run(wid, "owner", goal="effect")
+    run = store.claim_run(queued["run_id"], "owner")
+    store.mark_tool_boundary(
+        run["run_id"], "owner", run["lease_token"], tool_call_id="external-write")
+    history = [{"role": "assistant", "content": "tool dispatched"}]
+    finished = store.finish_run(
+        run["run_id"], "owner", run["lease_token"], status="SUCCEEDED",
+        result={"summary": "model returned"}, history=history)
+    assert finished["uncertain_side_effect"] is True
+    assert store.get_worker(wid, "owner")["uncertain_side_effect"] is True
+    with pytest.raises(ValueError, match="Reconcile"):
+        store.enqueue_run(wid, "owner", goal="blind replay", previous_run_id=run["run_id"])
+
+    store.reconcile_run(
+        run["run_id"], "owner",
+        disposition="accepted_unknown_no_replay",
+        note="The caller accepts uncertainty and will not replay the external write.",
+    )
+    reconciled = store.get_run(run["run_id"], "owner")
+    decision = reconciled["result"]["reconciliation"]
+    assert decision["disposition"] == "accepted_unknown_no_replay"
+    assert decision["affected_tool_calls"] == [
+        {"tool_call_id": "external-write", "prior_status": "INFLIGHT"}
+    ]
+    resumed = store.enqueue_run(
+        wid, "owner", goal="safe new turn", previous_run_id=run["run_id"])
+    assert resumed["run_id"] != run["run_id"]
+
+
+def test_exact_claim_preserves_fifo_and_run_capability_binding(store):
+    wid = worker(store)
+    first = store.enqueue_run(
+        wid, "owner", goal="first", capability_digest="digest-first")
+    second = store.enqueue_run(
+        wid, "owner", goal="second", capability_digest="digest-second")
+    assert store.claim_run(second["run_id"], "owner") is None
+    claimed = store.claim_run(first["run_id"], "owner")
+    assert claimed["capability_digest"] == "digest-first"
+    store.finish_run(
+        first["run_id"], "owner", claimed["lease_token"],
+        status="SUCCEEDED", result={})
+    claimed_second = store.claim_run(second["run_id"], "owner")
+    assert claimed_second["capability_digest"] == "digest-second"
