@@ -97,6 +97,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/cron',
             'reference/automation-blueprints-catalog',
             'user-guide/features/delegation',
+            'user-guide/features/worker-profiles',
             'user-guide/features/kanban',
             'user-guide/features/codex-app-server-runtime',
             'user-guide/features/kanban-tutorial',
@@ -792,6 +793,7 @@ const sidebars: SidebarsConfig = {
               items: [
                 'developer-guide/plugin-llm-access',
                 'developer-guide/subagent-lifecycle-api',
+                'developer-guide/worker-orchestration',
                 'developer-guide/desktop-plugin-sdk',
                 'developer-guide/memory-provider-plugin',
                 'developer-guide/context-engine-plugin',
