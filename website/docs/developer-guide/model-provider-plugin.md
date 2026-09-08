@@ -171,6 +171,8 @@ For interruptible non-HTTP requests, implement a class-declared `cancel(self)` m
 
 Explicit external-process delegation retains the selected provider and its protocol when resolving the child command; an executable override alone does not change an external-process provider into ACP.
 
+Native clients may persist private assistant replay in `reasoning_details` with a namespaced `<provider>.native_assistant` type. Declare the identical string in `ProviderProfile.native_reasoning_details_type` (default `None`). Chat Completions request sanitization forwards that carrier only to its declaring profile, including after fallback or model switching; it removes other private carriers even if their source plugin is no longer installed. Standard reasoning details such as OpenRouter's `reasoning.encrypted` remain unchanged. Claude OAuth DirectSDK uses `claude-oauth-directsdk.native_assistant`. Filtering is request-only: durable history remains intact for returning to the original provider.
+
 ## Hook reference examples
 
 Look at these bundled plugins for idioms:
@@ -329,4 +331,3 @@ See [Building a Hermes Plugin](/developer-guide/plugins#distribute-via-pip) for 
 - [Memory Provider Plugins](/developer-guide/memory-provider-plugin)
 - [Context Engine Plugins](/developer-guide/context-engine-plugin)
 - [Building a Hermes Plugin](/developer-guide/plugins) — general plugin authoring
-
