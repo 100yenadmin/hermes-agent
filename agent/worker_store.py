@@ -146,6 +146,14 @@ class WorkerStore:
         with self.db._read_ctx() as conn:
             return self._run(conn, run_id, owner_session_id)
 
+    def list_runs(self, worker_id, owner_session_id):
+        with self.db._read_ctx() as conn:
+            self._worker(conn, worker_id, owner_session_id)
+            return [_row(row) for row in conn.execute(
+                "SELECT * FROM orchestration_runs WHERE worker_id=? ORDER BY sequence",
+                (worker_id,),
+            )]
+
     def enqueue_run(self, worker_id, owner_session_id, *, goal, context="", request_id=None, previous_run_id=None):
         if not isinstance(goal, str) or not goal.strip() or not isinstance(context, str):
             raise ValueError("A run needs a nonempty goal and text context")
@@ -215,6 +223,18 @@ class WorkerStore:
             for message_id in delivered_message_ids:
                 self._ack_message(conn, run, message_id)
         self.db._execute_write(checkpoint)
+
+    def mark_tool_boundary(self, run_id, owner_session_id, lease_token, *, tool_inflight):
+        """Fence the uncertain-send window without rewriting the conversation checkpoint."""
+        if not isinstance(tool_inflight, bool):
+            raise ValueError("tool_inflight must be a boolean")
+        def mark(conn):
+            self._lease(conn, run_id, owner_session_id, lease_token)
+            conn.execute(
+                "UPDATE orchestration_runs SET tool_inflight=?,updated_at=? WHERE run_id=?",
+                (int(tool_inflight), time.time(), run_id),
+            )
+        self.db._execute_write(mark)
 
     def finish_run(self, run_id, owner_session_id, lease_token, *, status, result, history=None):
         if status not in _TERMINAL:

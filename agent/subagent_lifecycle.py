@@ -15,6 +15,7 @@ import threading
 import time
 import contextlib
 import weakref
+import uuid
 from contextlib import contextmanager
 from concurrent.futures import Future, TimeoutError
 from typing import Any, Callable, Mapping, Optional
@@ -58,6 +59,9 @@ class SubagentLaunchRequest:
     correlation_id: Optional[str] = None
     metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     timeout_seconds: Optional[float] = None
+    profile: Optional[str] = None
+    provider: Optional[str] = None
+    reasoning_effort: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,6 +76,8 @@ class SubagentHandle:
     role: str
     depth: int
     capability: str
+    worker_id: Optional[str] = None
+    run_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -143,6 +149,15 @@ class _Record:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     result: Optional[SubagentResult] = None
+    store: Any = None
+    owner_session_id: Optional[str] = None
+    worker_id: Optional[str] = None
+    run_id: Optional[str] = None
+    lease_token: Optional[str] = None
+    conversation_history: list = dataclasses.field(default_factory=list)
+    lease_stop: Any = None
+    lease_thread: Any = None
+    delivered_message_ids: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -212,6 +227,8 @@ _HANDLE_FIELD_CHECKS: tuple[tuple[str, Callable[[Any], bool]], ...] = (
     ("role", lambda v: isinstance(v, str)),
     ("depth", lambda v: type(v) is int),
     ("capability", lambda v: isinstance(v, str)),
+    ("worker_id", _opt_str),
+    ("run_id", _opt_str),
 )
 
 # Launch-request rejections in check order: (predicate, error). The type check leads so later predicates may
@@ -227,11 +244,82 @@ _REQUEST_REJECTIONS: tuple[tuple[Callable[[Any], bool], str], ...] = (
      "working_directory is not supported because Hermes delegates use isolated task environments."),
     (lambda r: bool(r.blocked_tools),
      "Per-tool blocking is not supported; use allowed_toolsets. Hermes always blocks unsafe child tools."),
+    (lambda r: any(not _opt_str(value) for value in (r.profile, r.provider, r.model, r.reasoning_effort)),
+     "profile, provider, model, and reasoning_effort must be strings when provided."),
 )
 
 
 def _handle_is_well_formed(handle: Any) -> bool:
     return isinstance(handle, SubagentHandle) and all(check(getattr(handle, field)) for field, check in _HANDLE_FIELD_CHECKS)
+
+
+def _session_db_of(parent: Any) -> Any:
+    db = getattr(parent, "_session_db", None) or getattr(parent, "session_db", None)
+    return getattr(db, "_db", db)
+
+
+def _persistent_store(parent: Any) -> Any:
+    db = _session_db_of(parent)
+    if db is None or not hasattr(db, "_execute_write") or not hasattr(db, "_read_ctx"):
+        return None
+    from agent.worker_store import WorkerStore
+    store = WorkerStore(db)
+    store.ensure_schema()
+    return store
+
+
+def _profile_policy_snapshot(cfg: dict, profile: Optional[str], creds: Mapping[str, Any]) -> tuple[str, dict]:
+    """Allowlisted, noncredential config receipt and content identity."""
+    from agent.delegation_model_routing import discover_workers
+    catalog = discover_workers(cfg)
+    selected = next((item for item in catalog["profiles"] if item["name"] == profile), None)
+    policy = {
+        "catalog_version": catalog["version"],
+        "routing_mode": catalog["routing_mode"],
+        "profile": selected,
+        "route": {
+            key: creds.get(key) for key in (
+                "requested_profile", "requested_provider", "requested_model", "requested_reasoning_effort",
+                "resolved_provider", "resolved_model", "resolved_reasoning_effort",
+            )
+        },
+    }
+    encoded = json.dumps(policy, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode()).hexdigest(), policy
+
+
+def _terminal_status(state: SubagentState) -> str:
+    return {
+        SubagentState.SUCCEEDED: "SUCCEEDED",
+        SubagentState.CANCELLED: "CANCELLED",
+        SubagentState.INTERRUPTED: "INTERRUPTED",
+    }.get(state, "FAILED")
+
+
+def before_worker_tool(agent: Any) -> None:
+    """Fail-closed durable boundary immediately before a worker tool dispatch."""
+    record = getattr(agent, "_worker_lifecycle_record", None)
+    if not isinstance(record, _Record) or record.store is None:
+        return
+    record.store.mark_tool_boundary(
+        record.run_id, record.owner_session_id, record.lease_token, tool_inflight=True)
+
+
+def checkpoint_worker_tool_result(agent: Any, history: list) -> None:
+    """Atomically persist the tool result/history before clearing uncertainty."""
+    record = getattr(agent, "_worker_lifecycle_record", None)
+    if not isinstance(record, _Record) or record.store is None:
+        return
+    delivered = tuple(record.delivered_message_ids)
+    record.store.checkpoint_run(
+        record.run_id,
+        record.owner_session_id,
+        record.lease_token,
+        history=history,
+        tool_inflight=False,
+        delivered_message_ids=delivered,
+    )
+    record.delivered_message_ids.clear()
 
 
 class SubagentLifecycleService:
@@ -241,6 +329,114 @@ class SubagentLifecycleService:
 
     def __init__(self, parent_agent_resolver: Callable[[], Any]) -> None:
         self._parent_agent_resolver = parent_agent_resolver
+
+    def adopt_delegate_child(
+        self,
+        child: Any,
+        *,
+        goal: str,
+        context: Optional[str],
+        profile: Optional[str],
+        creds: Mapping[str, Any],
+        cfg: Mapping[str, Any],
+    ) -> Optional[SubagentHandle]:
+        """Attach the parent tool's child to the same durable lifecycle used by plugins."""
+        parent = self._parent_agent_resolver()
+        owner = _session_id_of(parent)
+        store = _persistent_store(parent) if parent is not None else None
+        if store is None or not owner:
+            return None
+        subagent_id = str(getattr(child, "_subagent_id", "") or "")
+        if not subagent_id:
+            raise SubagentLifecycleError("Hermes failed to assign a child identity.")
+        created = time.time()
+        capability = self._capability(subagent_id, owner, created)
+        config_revision, policy = _profile_policy_snapshot(dict(cfg), profile, creds)
+        policy["capability_digest"] = hashlib.sha256(capability.encode()).hexdigest()
+        parent_worker_id = getattr(parent, "_worker_id", None)
+        worker = store.create_worker(
+            owner,
+            profile=profile,
+            config_revision=config_revision,
+            policy=policy,
+            frozen_prompt=str(getattr(child, "system_prompt", "") or ""),
+            parent_worker_id=parent_worker_id,
+        )
+        queued = store.enqueue_run(worker["worker_id"], owner, goal=goal, context=context or "")
+        global_cap = int((cfg or {}).get("max_concurrent_children") or 10)
+        profile_cap = getattr(creds.get("execution_limits"), "max_concurrent_children", None)
+        max_concurrent = min(global_cap, profile_cap) if isinstance(profile_cap, int) and profile_cap > 0 else global_cap
+        active = store.claim_next_run(worker["worker_id"], owner, max_concurrent=max(1, max_concurrent))
+        if active is None or active["run_id"] != queued["run_id"]:
+            raise SubagentLifecycleError("Worker run could not acquire an execution slot.")
+        child._worker_id, child._worker_run_id = worker["worker_id"], active["run_id"]
+        handle = SubagentHandle(
+            contract_version=PUBLIC_CONTRACT_VERSION,
+            subagent_id=subagent_id,
+            parent_session_id=owner,
+            correlation_id=None,
+            created_at=created,
+            provider=getattr(child, "provider", None),
+            model=getattr(child, "model", None),
+            role=getattr(child, "_delegate_role", "leaf"),
+            depth=int(getattr(child, "_delegate_depth", 1) or 1),
+            capability=capability,
+            worker_id=worker["worker_id"],
+            run_id=active["run_id"],
+        )
+        record = _Record(
+            handle, SubagentState.RUNNING, created, agent=child, started_at=created,
+            store=store, owner_session_id=owner, worker_id=worker["worker_id"],
+            run_id=active["run_id"], lease_token=active["lease_token"],
+        )
+        self._bind_tool_boundary(record)
+        self._start_external_lease(record)
+        child._worker_lifecycle_record = record
+        with _REGISTRY.lock:
+            _REGISTRY.records[subagent_id] = record
+        return handle
+
+    @staticmethod
+    def _start_external_lease(record: _Record) -> None:
+        stop = threading.Event()
+        record.lease_stop = stop
+
+        def renew():
+            while not stop.wait(15.0):
+                try:
+                    record.store.heartbeat_run(
+                        record.run_id, record.owner_session_id, record.lease_token, lease_seconds=60)
+                except Exception:
+                    request_hard_interrupt(
+                        record.agent, "Durable worker execution lease was lost.", tool_reason="worker lease lost")
+                    return
+
+        record.lease_thread = threading.Thread(target=renew, name="hermes-worker-lease", daemon=True)
+        record.lease_thread.start()
+
+    @classmethod
+    def complete_adopted_child(cls, child: Any, entry: Mapping[str, Any]) -> None:
+        record = getattr(child, "_worker_lifecycle_record", None)
+        if not isinstance(record, _Record):
+            return
+        status = str(entry.get("status") or "error")
+        if status == "completed":
+            state = SubagentState.SUCCEEDED
+        elif status == "interrupted":
+            state = SubagentState.INTERRUPTED
+        else:
+            state = SubagentState.FAILED
+        cls._publish_result(
+            record,
+            state,
+            {
+                "summary": _clip(entry.get("summary")),
+                "error_message": _clip(entry.get("error")),
+                "error_classification": None if state is SubagentState.SUCCEEDED else status.upper(),
+                "usage_metadata": {"api_calls": entry.get("api_calls", 0)},
+                "tool_execution_summary": {"duration_seconds": entry.get("duration_seconds", 0)},
+            },
+        )
 
     def launch(self, request: SubagentLaunchRequest) -> SubagentHandle:
         parent = self._parent_agent_resolver()
@@ -256,22 +452,81 @@ class SubagentLifecycleService:
             if request.correlation_id and correlation_key in _REGISTRY.correlations:
                 raise SubagentLifecycleError("Duplicate correlation_id for this parent session.")
         # Lazy: delegate construction stays internal, plugins never import private delegation helpers.
-        from tools.delegate_tool import _build_child_preserving_parent_tools, DEFAULT_MAX_ITERATIONS
+        from tools.delegate_tool import (
+            DEFAULT_MAX_ITERATIONS, _build_child_preserving_parent_tools, _profile_task_overrides,
+        )
+        from tools.delegate_tool_config import _load_config, _resolve_delegation_credentials
+        cfg = _load_config()
+        if request.profile:
+            creds = _resolve_delegation_credentials(
+                cfg, parent, request.profile,
+                requested_provider=request.provider,
+                requested_model=request.model,
+                requested_reasoning_effort=request.reasoning_effort,
+            )
+            overrides = _profile_task_overrides(creds)
+            profile_limit = creds.get("max_iterations")
+            run_iterations = min(DEFAULT_MAX_ITERATIONS, profile_limit) if isinstance(profile_limit, int) else DEFAULT_MAX_ITERATIONS
+        else:
+            if request.provider or request.reasoning_effort:
+                raise SubagentLifecycleError("provider/reasoning_effort require a configured worker profile.")
+            creds = _resolve_delegation_credentials(cfg, parent)
+            overrides = {
+                "override_provider": creds["provider"], "override_base_url": creds["base_url"],
+                "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
+                "override_request_overrides": creds.get("request_overrides"),
+                "override_acp_command": creds.get("command"), "override_acp_args": creds.get("args"),
+                "routing_cfg": cfg,
+            }
+            run_iterations = DEFAULT_MAX_ITERATIONS
         child = _build_child_preserving_parent_tools(
             task_index=0, goal=request.goal, context=request.context,
             toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
-            model=request.model, max_iterations=DEFAULT_MAX_ITERATIONS, task_count=1, parent_agent=parent, role=request.role,
+            model=(request.model or creds.get("model")), max_iterations=run_iterations,
+            task_count=1, parent_agent=parent, role=request.role, **overrides,
         )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:
             raise SubagentLifecycleError("Hermes failed to assign a child identity.")
         created = time.time()
+        capability = self._capability(subagent_id, parent_session_id, created)
+        store = _persistent_store(parent)
+        worker_id = run_id = lease_token = None
+        if store is not None and parent_session_id:
+            config_revision, policy = _profile_policy_snapshot(cfg, request.profile, creds)
+            policy["capability_digest"] = hashlib.sha256(capability.encode()).hexdigest()
+            worker = store.create_worker(
+                parent_session_id,
+                profile=request.profile,
+                config_revision=config_revision,
+                policy=policy,
+                frozen_prompt=str(getattr(child, "system_prompt", "") or ""),
+            )
+            queued = store.enqueue_run(worker["worker_id"], parent_session_id, goal=request.goal, context=request.context or "")
+            active = store.claim_next_run(worker["worker_id"], parent_session_id)
+            if active is None or active["run_id"] != queued["run_id"]:
+                raise SubagentLifecycleError("Worker run could not acquire an execution slot.")
+            worker_id, run_id, lease_token = worker["worker_id"], active["run_id"], active["lease_token"]
+            child._worker_id, child._worker_run_id = worker_id, run_id
         handle = SubagentHandle(
-            PUBLIC_CONTRACT_VERSION, subagent_id, parent_session_id, request.correlation_id, created,
-            getattr(child, "provider", None), getattr(child, "model", None), getattr(child, "_delegate_role", request.role),
-            int(getattr(child, "_delegate_depth", 1) or 1), self._capability(subagent_id, parent_session_id, created),
+            contract_version=PUBLIC_CONTRACT_VERSION,
+            subagent_id=subagent_id,
+            parent_session_id=parent_session_id,
+            correlation_id=request.correlation_id,
+            created_at=created,
+            provider=getattr(child, "provider", None),
+            model=getattr(child, "model", None),
+            role=getattr(child, "_delegate_role", request.role),
+            depth=int(getattr(child, "_delegate_depth", 1) or 1),
+            capability=capability,
+            worker_id=worker_id,
+            run_id=run_id,
         )
-        record = _Record(handle, SubagentState.PENDING, created, agent=child)
+        record = _Record(
+            handle, SubagentState.PENDING, created, agent=child, store=store,
+            owner_session_id=parent_session_id, worker_id=worker_id, run_id=run_id, lease_token=lease_token,
+        )
+        self._bind_tool_boundary(record)
         with _REGISTRY.lock:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
@@ -282,14 +537,28 @@ class SubagentLifecycleService:
     def status(self, handle: SubagentHandle) -> SubagentStatus:
         record = self._record(handle)
         if record is None:
-            return SubagentStatus(handle, SubagentState.UNKNOWN, time.time(), "UNKNOWN_HANDLE")
+            durable = self._durable_snapshot(handle)
+            if durable is None:
+                return SubagentStatus(handle, SubagentState.UNKNOWN, time.time(), "UNKNOWN_HANDLE")
+            return SubagentStatus(handle, SubagentState(durable[2]["status"]), durable[2]["updated_at"], "DURABLE_SNAPSHOT")
         with _REGISTRY.lock:
             return SubagentStatus(record.handle, record.state, record.updated_at)
 
     def wait(self, handle: SubagentHandle, *, timeout_seconds: Optional[float] = None) -> SubagentTerminalState:
         record = self._record(handle)
         if record is None:
-            return SubagentTerminalState(handle, SubagentState.UNKNOWN, True, diagnostic="UNKNOWN_HANDLE")
+            durable = self._durable_snapshot(handle)
+            if durable is None:
+                return SubagentTerminalState(handle, SubagentState.UNKNOWN, True, diagnostic="UNKNOWN_HANDLE")
+            store, _worker, run = durable
+            if run["status"] == "RUNNING" and run.get("lease_expires_at", 0) <= time.time():
+                store.recover_expired_runs(handle.parent_session_id)
+                run = store.get_run(handle.run_id, handle.parent_session_id)
+            state = SubagentState(run["status"])
+            completed = state in {
+                SubagentState.SUCCEEDED, SubagentState.FAILED, SubagentState.INTERRUPTED, SubagentState.CANCELLED,
+            }
+            return SubagentTerminalState(handle, state, completed, diagnostic="DURABLE_SNAPSHOT")
         try:
             if record.future is not None:
                 record.future.result(timeout=timeout_seconds)
@@ -321,28 +590,277 @@ class SubagentLifecycleService:
     def result(self, handle: SubagentHandle) -> SubagentResult:
         record = self._record(handle)
         if record is None:
-            return SubagentResult(handle, SubagentState.UNKNOWN, False, error_classification="UNKNOWN_HANDLE")
+            durable = self._durable_snapshot(handle)
+            if durable is None:
+                return SubagentResult(handle, SubagentState.UNKNOWN, False, error_classification="UNKNOWN_HANDLE")
+            run = durable[2]
+            state = SubagentState(run["status"])
+            payload = run.get("result") or {}
+            ready = state in {
+                SubagentState.SUCCEEDED, SubagentState.FAILED, SubagentState.INTERRUPTED, SubagentState.CANCELLED,
+            }
+            return SubagentResult(
+                handle,
+                state,
+                ready,
+                summary=payload.get("summary"),
+                error_classification=payload.get("error_classification") or (None if state is SubagentState.SUCCEEDED else state.value),
+                error_message=payload.get("error_message"),
+                result_hash=payload.get("result_hash"),
+            )
         with _REGISTRY.lock:
             return record.result or SubagentResult(record.handle, record.state, False, error_classification="NOT_READY")
 
     def reconnect(self, handle: SubagentHandle) -> SubagentReconnectResult:
         record = self._record(handle)
         if record is None:
-            return SubagentReconnectResult(False, SubagentState.UNKNOWN, "RECONNECT_UNAVAILABLE")
+            durable = self._durable_snapshot(handle)
+            if durable is None:
+                return SubagentReconnectResult(False, SubagentState.UNKNOWN, "UNKNOWN_HANDLE")
+            _store, _worker, run = durable
+            state = SubagentState(run["status"])
+            return SubagentReconnectResult(True, state, "DURABLE_SNAPSHOT")
         with _REGISTRY.lock:
             return SubagentReconnectResult(True, record.state)
+
+    def message(self, handle: SubagentHandle, content: str, *, message_id: Optional[str] = None) -> Mapping[str, Any]:
+        """Queue one durable FIFO followup for the worker; delivery is acked with a checkpoint."""
+        record = self._record(handle)
+        parent = self._parent_agent_resolver()
+        durable = None if record is not None else self._durable_snapshot(handle)
+        store = record.store if record is not None else (durable[0] if durable else None)
+        owner = _session_id_of(parent)
+        worker_id = handle.worker_id or (record.worker_id if record is not None else None)
+        if store is None or not owner or not worker_id:
+            raise SubagentLifecycleError("Durable worker messaging is unavailable for this handle.")
+        return store.enqueue_message(worker_id, owner, content, message_id=message_id, sender_id=owner)
+
+    def control(
+        self,
+        action: str,
+        *,
+        worker_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        message: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> Mapping[str, Any]:
+        """Parent-tool control by stable IDs; authority is the bound live session, never ID knowledge."""
+        parent = self._parent_agent_resolver()
+        owner = _session_id_of(parent)
+        store = _persistent_store(parent) if parent is not None else None
+        if store is None or not owner:
+            raise SubagentLifecycleError("Durable worker state is unavailable for this session.")
+        normalized = action.strip().lower()
+        if normalized == "status":
+            if not worker_id:
+                workers = store.list_workers(owner)
+                return {"workers": [self._safe_worker_snapshot(store, item, owner) for item in workers]}
+            worker = store.get_worker(worker_id, owner)
+            return self._safe_worker_snapshot(store, worker, owner)
+        if not worker_id:
+            raise SubagentLifecycleError(f"action='{normalized}' requires worker_id.")
+        worker = store.get_worker(worker_id, owner)
+        runs = store.list_runs(worker_id, owner)
+        selected = next((item for item in runs if item["run_id"] == run_id), None) if run_id else (runs[-1] if runs else None)
+        if normalized == "message":
+            queued = store.enqueue_message(worker_id, owner, message or "", sender_id=owner)
+            return {"worker_id": worker_id, "message_id": queued["message_id"], "status": queued["status"]}
+        if selected is None:
+            raise SubagentLifecycleError("Worker has no matching run.")
+        if normalized == "wait":
+            timeout = 0.0 if timeout_seconds is None else float(timeout_seconds)
+            if timeout < 0 or timeout > 60:
+                raise SubagentLifecycleError("timeout_seconds must be between 0 and 60.")
+            deadline = time.monotonic() + timeout
+            while selected["status"] in {"PENDING", "RUNNING"} and time.monotonic() < deadline:
+                if selected["status"] == "RUNNING" and selected.get("lease_expires_at", 0) <= time.time():
+                    store.recover_expired_runs(owner)
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                selected = store.get_run(selected["run_id"], owner)
+            return self._safe_run_snapshot(selected)
+        if normalized == "cancel":
+            live = next((
+                record for record in list(_REGISTRY.records.values())
+                if record.worker_id == worker_id and record.run_id == selected["run_id"] and record.agent is not None
+            ), None)
+            if live is None:
+                if selected["status"] == "RUNNING" and selected.get("lease_expires_at", 0) <= time.time():
+                    store.recover_expired_runs(owner)
+                    selected = store.get_run(selected["run_id"], owner)
+                    return self._safe_run_snapshot(selected)
+                raise SubagentLifecycleError("The run has no live executor to cancel.")
+            accepted = request_hard_interrupt(
+                live.agent, "Worker cancellation requested by its owner.", tool_reason="worker cancellation requested")
+            return {**self._safe_run_snapshot(selected), "cancel_requested": bool(accepted)}
+        if normalized == "resume":
+            if not message or not message.strip():
+                raise SubagentLifecycleError("action='resume' requires message as the next worker turn.")
+            if selected is not runs[-1]:
+                raise SubagentLifecycleError("Resume must link from the worker's latest run.")
+            prior = SubagentHandle(
+                PUBLIC_CONTRACT_VERSION, "durable-snapshot", owner, None, worker["created_at"],
+                None, None, "leaf", int(worker["depth"]), "", worker_id, selected["run_id"],
+            )
+            handle = self._launch_existing_worker(
+                SubagentLaunchRequest(goal=message, profile=worker["profile"]), prior, worker, selected)
+            return {"worker_id": handle.worker_id, "run_id": handle.run_id, "status": "PENDING"}
+        raise SubagentLifecycleError(f"Unsupported durable worker action '{normalized}'.")
+
+    @staticmethod
+    def _safe_run_snapshot(run: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
+            key: run.get(key) for key in (
+                "run_id", "worker_id", "previous_run_id", "status", "uncertain_side_effect",
+                "created_at", "updated_at",
+            )
+        }
+
+    @classmethod
+    def _safe_worker_snapshot(cls, store: Any, worker: Mapping[str, Any], owner: str) -> Mapping[str, Any]:
+        runs = store.list_runs(worker["worker_id"], owner)
+        return {
+            "worker_id": worker["worker_id"],
+            "parent_worker_id": worker["parent_worker_id"],
+            "root_worker_id": worker["root_worker_id"],
+            "depth": worker["depth"],
+            "profile": worker["profile"],
+            "config_revision": worker["config_revision"],
+            "frozen_prompt_hash": worker["frozen_prompt_hash"],
+            "uncertain_side_effect": worker["uncertain_side_effect"],
+            "latest_run": cls._safe_run_snapshot(runs[-1]) if runs else None,
+        }
+
+    def resume(
+        self,
+        handle: SubagentHandle,
+        message: str,
+        *,
+        reconcile_uncertain: bool = False,
+    ) -> SubagentHandle:
+        """Start a linked run on the stable worker after revalidating current profile policy."""
+        parent = self._parent_agent_resolver()
+        owner = _session_id_of(parent)
+        durable = self._durable_snapshot(handle)
+        if durable is None or not owner or not handle.worker_id or not handle.run_id:
+            raise SubagentLifecycleError("Durable resume is unavailable for this handle.")
+        store, worker, previous = durable
+        runs = store.list_runs(handle.worker_id, owner)
+        if not runs or runs[-1]["run_id"] != previous["run_id"]:
+            raise SubagentLifecycleError("Resume must link from the worker's latest run.")
+        if previous["status"] not in {"SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED"}:
+            raise SubagentLifecycleError("The worker already has an active run.")
+        if worker["uncertain_side_effect"]:
+            if not reconcile_uncertain:
+                raise SubagentLifecycleError(
+                    "The prior run stopped with an uncertain tool side effect; reconcile it before resume.")
+            store.reconcile_run(handle.run_id, owner)
+        # Revalidation is fail-closed: launch resolves the current profile/model/tools again. The
+        # frozen prompt is retained as a hash boundary; changed profile/tool policy cannot silently
+        # rebuild an existing worker's execution surface.
+        from tools.delegate_tool_config import _load_config
+        from agent.delegation_model_routing import discover_workers
+        cfg = _load_config()
+        current_catalog = discover_workers(cfg)
+        current_profile = next((item for item in current_catalog["profiles"] if item["name"] == worker["profile"]), None)
+        current_policy = dict(worker["policy"])
+        if current_catalog["errors"] or current_profile != current_policy.get("profile"):
+            raise SubagentLifecycleError(
+                "Worker profile or tool policy changed since launch; start a new worker to adopt the new surface.")
+        request = SubagentLaunchRequest(
+            goal=message,
+            profile=worker["profile"],
+            parent_session_id=owner,
+            correlation_id=f"resume-{uuid.uuid4().hex}",
+        )
+        return self._launch_existing_worker(request, handle, worker, previous)
+
+    def _launch_existing_worker(
+        self, request: SubagentLaunchRequest, prior: SubagentHandle, worker: Mapping[str, Any], previous: Mapping[str, Any],
+    ) -> SubagentHandle:
+        """Resume implementation kept separate so ``launch`` remains legacy compatible."""
+        parent = self._parent_agent_resolver()
+        owner = _session_id_of(parent)
+        store = _persistent_store(parent)
+        from tools.delegate_tool import DEFAULT_MAX_ITERATIONS, _build_child_preserving_parent_tools, _profile_task_overrides
+        from tools.delegate_tool_config import _load_config, _resolve_delegation_credentials
+        cfg = _load_config()
+        creds = _resolve_delegation_credentials(cfg, parent, request.profile)
+        limits = creds.get("max_iterations")
+        max_iterations = min(DEFAULT_MAX_ITERATIONS, limits) if isinstance(limits, int) else DEFAULT_MAX_ITERATIONS
+        child = _build_child_preserving_parent_tools(
+            task_index=0, goal=request.goal, context=None, toolsets=None, model=creds.get("model"),
+            max_iterations=max_iterations, task_count=1, parent_agent=parent, role=request.role,
+            **_profile_task_overrides(creds),
+        )
+        queued = store.enqueue_run(
+            worker["worker_id"], owner, goal=request.goal, previous_run_id=previous["run_id"])
+        active = store.claim_next_run(worker["worker_id"], owner)
+        if active is None or active["run_id"] != queued["run_id"]:
+            raise SubagentLifecycleError("Worker resume could not acquire an execution slot.")
+        child._worker_id, child._worker_run_id = worker["worker_id"], active["run_id"]
+        created = time.time()
+        subagent_id = str(getattr(child, "_subagent_id", "") or "")
+        result_handle = dataclasses.replace(
+            prior,
+            subagent_id=subagent_id,
+            created_at=created,
+            provider=getattr(child, "provider", None),
+            model=getattr(child, "model", None),
+            run_id=active["run_id"],
+        )
+        record = _Record(
+            result_handle, SubagentState.PENDING, created, agent=child, store=store,
+            owner_session_id=owner, worker_id=worker["worker_id"], run_id=active["run_id"],
+            lease_token=active["lease_token"], conversation_history=list(worker.get("history") or []),
+        )
+        self._bind_tool_boundary(record)
+        with _REGISTRY.lock:
+            _REGISTRY.records[subagent_id] = record
+        record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        return result_handle
+
+    @staticmethod
+    def _bind_tool_boundary(record: _Record) -> None:
+        if record.store is None or record.agent is None or not record.run_id or not record.lease_token:
+            return
+        record.agent._worker_lifecycle_record = record
 
     def _record(self, handle: SubagentHandle) -> Optional[_Record]:
         """Registry record for a well-formed, capability-verified handle owned by the active parent."""
         if not _handle_is_well_formed(handle):
             return None
-        expected = self._capability(handle.subagent_id, handle.parent_session_id, handle.created_at)
-        if not hmac.compare_digest(handle.capability, expected):
-            return None
         if _session_id_of(self._parent_agent_resolver()) != handle.parent_session_id:
             return None
         with _REGISTRY.lock:
-            return _REGISTRY.records.get(handle.subagent_id)
+            record = _REGISTRY.records.get(handle.subagent_id)
+        if record is None:
+            return None
+        if handle.worker_id:
+            expected = record.handle.capability
+        else:
+            expected = self._capability(handle.subagent_id, handle.parent_session_id, handle.created_at)
+        return record if hmac.compare_digest(handle.capability, expected) else None
+
+    def _durable_snapshot(self, handle: SubagentHandle) -> Optional[tuple[Any, Mapping[str, Any], Mapping[str, Any]]]:
+        if not _handle_is_well_formed(handle) or not handle.worker_id or not handle.run_id:
+            return None
+        parent = self._parent_agent_resolver()
+        owner = _session_id_of(parent)
+        if not owner or owner != handle.parent_session_id:
+            return None
+        try:
+            store = _persistent_store(parent)
+            if store is None:
+                return None
+            worker = store.get_worker(handle.worker_id, owner)
+            run = store.get_run(handle.run_id, owner)
+        except (PermissionError, ValueError):
+            return None
+        stored_digest = str((worker.get("policy") or {}).get("capability_digest") or "")
+        supplied_digest = hashlib.sha256(handle.capability.encode()).hexdigest()
+        if not stored_digest or not hmac.compare_digest(stored_digest, supplied_digest):
+            return None
+        return store, worker, run
 
     @staticmethod
     def _cleanup_locked() -> None:
@@ -362,6 +880,40 @@ class SubagentLifecycleService:
             if record.state is not SubagentState.CANCEL_REQUESTED:
                 record.state = SubagentState.RUNNING
             record.started_at = record.updated_at = time.time()
+        lease_stop = threading.Event()
+        lease_thread = None
+        delivered_ids: list[str] = []
+        if record.store is not None and record.run_id and record.lease_token:
+            try:
+                pending = record.store.claim_messages(
+                    record.run_id, record.owner_session_id, record.lease_token)
+                delivered_ids = [item["message_id"] for item in pending]
+                record.delivered_message_ids = list(delivered_ids)
+                if pending:
+                    queued = "\n\n".join(item["content"] for item in pending)
+                    goal = f"{goal}\n\nQueued followups (FIFO):\n{queued}"
+                record.agent._worker_resume_history = list(record.conversation_history)
+            except Exception as exc:
+                state = SubagentState.FAILED
+                fields = dict(error_classification="PERSISTENCE_FAILURE", error_message=_clip(exc))
+                self._publish_result(record, state, fields)
+                return
+
+            def renew_lease():
+                while not lease_stop.wait(15.0):
+                    try:
+                        record.store.heartbeat_run(
+                            record.run_id, record.owner_session_id, record.lease_token, lease_seconds=60)
+                    except Exception:
+                        request_hard_interrupt(
+                            record.agent,
+                            "Durable worker execution lease was lost.",
+                            tool_reason="worker lease lost",
+                        )
+                        return
+
+            lease_thread = threading.Thread(target=renew_lease, name="hermes-worker-lease", daemon=True)
+            lease_thread.start()
         try:
             from tools.delegate_tool import _run_child_lifecycle
             raw = _run_child_lifecycle(0, goal, record.agent, parent)
@@ -381,10 +933,61 @@ class SubagentLifecycleService:
         except Exception as exc:
             state = SubagentState.FAILED
             fields = dict(error_classification=type(exc).__name__, error_message=_clip(exc))
+        finally:
+            lease_stop.set()
+            if lease_thread is not None:
+                lease_thread.join(timeout=1.0)
+        self._publish_result(record, state, fields, delivered_ids=delivered_ids)
+
+    @staticmethod
+    def _publish_result(
+        record: _Record,
+        state: SubagentState,
+        fields: Mapping[str, Any],
+        *,
+        delivered_ids: tuple[str, ...] | list[str] = (),
+    ) -> None:
+        if record.lease_stop is not None:
+            record.lease_stop.set()
+        if record.lease_thread is not None:
+            record.lease_thread.join(timeout=1.0)
         result = SubagentResult(record.handle, state, True, started_at=record.started_at, completed_at=time.time(), **fields)
         payload = dataclasses.asdict(result)
         payload.pop("result_hash", None)
         result = dataclasses.replace(result, result_hash=hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest())
+        if record.store is not None and record.run_id and record.lease_token:
+            history = list(getattr(record.agent, "_worker_last_history", None) or record.conversation_history)
+            try:
+                current_run = record.store.get_run(record.run_id, record.owner_session_id)
+                unresolved_tool = bool(current_run.get("tool_inflight")) and state is not SubagentState.SUCCEEDED
+                record.store.checkpoint_run(
+                    record.run_id,
+                    record.owner_session_id,
+                    record.lease_token,
+                    history=history,
+                    tool_inflight=unresolved_tool,
+                    delivered_message_ids=tuple(delivered_ids),
+                )
+                record.store.finish_run(
+                    record.run_id,
+                    record.owner_session_id,
+                    record.lease_token,
+                    status=_terminal_status(state),
+                    result={
+                        "summary": result.summary,
+                        "error_classification": result.error_classification,
+                        "error_message": result.error_message,
+                        "result_hash": result.result_hash,
+                    },
+                    history=history,
+                )
+            except Exception as exc:
+                result = dataclasses.replace(
+                    result,
+                    terminal_state=SubagentState.FAILED,
+                    error_classification="PERSISTENCE_FAILURE",
+                    error_message=_clip(exc),
+                )
         with _REGISTRY.lock:
             record.agent, record.result, record.state = None, result, result.terminal_state
             record.completed_at = record.updated_at = result.completed_at

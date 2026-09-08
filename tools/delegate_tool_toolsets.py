@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from toolsets import TOOLSETS
 from tools.delegate_tool_config import _get_inherit_mcp_toolsets
@@ -59,8 +59,9 @@ def _blocked_toolsets_for_role(role: str) -> List[str]:
     """One-tool deny toolsets for the role; passed as ``disabled_toolsets`` so
     blocked names inside mixed bundles are subtracted AFTER composite expansion."""
     blocked_names = set(DELEGATE_BLOCKED_TOOLS)
-    if role == "orchestrator":
-        blocked_names.discard("delegate_task")
+    # Both roles keep the control surface; delegate_task itself rejects spawn for
+    # leaves while permitting status/message/wait/cancel/resume.
+    blocked_names.discard("delegate_task")
     return sorted(
         name for name, defn in TOOLSETS.items() if defn.get("tools") and set(defn.get("tools", ())).issubset(blocked_names)
     )
@@ -99,6 +100,13 @@ def _resolve_child_toolsets(
     else:
         child_toolsets = sorted(parent_toolsets) or DEFAULT_TOOLSETS
     child_toolsets = _strip_blocked_tools(child_toolsets)
+    parent_has_delegate = any(
+        "delegate_task" in (TOOLSETS.get(name) or {}).get("tools", ()) for name in parent_toolsets
+    )
+    # Leaves retain the existing delegate_task surface for status/message/wait/cancel
+    # controls. The handler enforces spawn authority from the child's depth/profile.
+    if parent_has_delegate and "delegation" not in child_toolsets:
+        child_toolsets.append("delegation")
 
     raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
     inherited_disabled = (
@@ -112,3 +120,36 @@ def _resolve_child_toolsets(
         dict.fromkeys(inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"])
     )
     return child_toolsets, child_disabled_toolsets
+
+
+def _apply_exact_tool_policy(child: Any, policy: Any) -> None:
+    """Apply profile tool-name ceilings to schemas and every execution validation path.
+
+    ``AIAgent`` validates direct, inline, and deferred tool-search calls against
+    ``valid_tool_names``. Keeping ``tools`` and that set aligned means a tool hidden from the
+    schema also cannot be reached by naming it directly or through the generic bridge.
+    """
+    if policy is None:
+        return
+    allowed = getattr(policy, "allowed_tools", None)
+    allowed_mcp = getattr(policy, "allowed_mcp_tools", None)
+    blocked = set(getattr(policy, "blocked_tools", ()) or ())
+    current = set(getattr(child, "valid_tool_names", set()) or set())
+    if allowed is not None:
+        current.intersection_update(allowed)
+    if allowed_mcp is not None:
+        allowed_mcp_names = set(allowed_mcp)
+        for name in tuple(current):
+            try:
+                import model_tools
+                toolset = model_tools.get_toolset_for_tool(name)
+            except Exception:
+                toolset = None
+            if _is_mcp_toolset_name(str(toolset or "")) and name not in allowed_mcp_names:
+                current.discard(name)
+    current.difference_update(blocked)
+    child.tools = [
+        item for item in (getattr(child, "tools", None) or [])
+        if item.get("function", {}).get("name") in current
+    ]
+    child.valid_tool_names = current

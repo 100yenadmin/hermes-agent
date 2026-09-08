@@ -33,6 +33,7 @@ _TOOL_POLICY_KEYS = frozenset({"allowed_toolsets", "blocked_tools", "allowed_too
 _WORKSPACE_CONTEXT_KEYS = frozenset({"mode", "include_context_files", "include_memory"})
 _EXECUTION_LIMIT_KEYS = frozenset({
     "max_iterations", "timeout_seconds", "max_followups", "max_tool_calls",
+    "max_spawn_depth", "max_concurrent_children",
 })
 _ROUTING_MODES = frozenset({"profile_only", "dynamic"})
 _VALID_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
@@ -77,6 +78,8 @@ class ExecutionLimits:
     timeout_seconds: Optional[float] = None
     max_followups: Optional[int] = None
     max_tool_calls: Optional[int] = None
+    max_spawn_depth: Optional[int] = None
+    max_concurrent_children: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -235,6 +238,9 @@ def _parse_execution_limits(name: str, raw: Any, legacy_max_iterations: Any) -> 
         timeout_seconds=_positive_number(raw.get("timeout_seconds"), field=f"{field}.timeout_seconds"),
         max_followups=_positive_int(raw.get("max_followups"), field=f"{field}.max_followups", allow_zero=True),
         max_tool_calls=_positive_int(raw.get("max_tool_calls"), field=f"{field}.max_tool_calls", allow_zero=True),
+        max_spawn_depth=_positive_int(raw.get("max_spawn_depth"), field=f"{field}.max_spawn_depth", allow_zero=True),
+        max_concurrent_children=_positive_int(
+            raw.get("max_concurrent_children"), field=f"{field}.max_concurrent_children", allow_zero=True),
     )
 
 
@@ -257,6 +263,7 @@ def _parse_enabled_routes(name: str, raw: Any) -> Tuple[EnabledRoute, ...]:
         if not model:
             raise ValueError(f"{item_field}.model must be a non-empty string")
         effort, _ = _parse_effort(entry.get("reasoning_effort"), field=f"{item_field}.reasoning_effort")
+        _validate_known_effort(provider, model, effort, field=f"{item_field}.reasoning_effort")
         route = EnabledRoute(provider=provider, model=model, reasoning_effort=effort)
         if route not in routes:
             routes.append(route)
@@ -300,6 +307,16 @@ def _routing_mode(cfg: Optional[dict]) -> str:
         raise ValueError(
             f"delegation.routing_mode '{mode}' is invalid (allowed: {', '.join(sorted(_ROUTING_MODES))})")
     return mode
+
+
+def _validate_known_effort(provider: str, model: str, effort: Optional[str], *, field: str) -> None:
+    if effort is None:
+        return
+    supported, source = _supported_efforts(provider, model)
+    if supported is not None and effort not in supported:
+        raise ValueError(
+            f"{field} '{effort}' is unsupported for {provider or '(default)'}/{model} "
+            f"(supported: {', '.join(supported)}; source: {source})")
 
 
 def _parse_fallback(name: str, raw: Any) -> Tuple[FallbackTarget, ...]:
@@ -348,6 +365,8 @@ def _parse_profile(name: str, raw: Any) -> ProfileSpec:
 
     effort, reasoning_config = _parse_effort(
         raw.get("reasoning_effort"), field=f"delegation.profiles.{name}.reasoning_effort")
+    _validate_known_effort(
+        provider, model, effort, field=f"delegation.profiles.{name}.reasoning_effort")
     execution_limits = _parse_execution_limits(name, raw.get("execution_limits"), raw.get("max_iterations"))
 
     return ProfileSpec(
@@ -448,6 +467,7 @@ def _select_route(
     requested_provider: Optional[str],
     requested_model: Optional[str],
     requested_reasoning_effort: Optional[str],
+    global_enabled_models: Tuple[EnabledRoute, ...],
 ) -> EnabledRoute:
     provider = str(requested_provider or "").strip()
     model = str(requested_model or "").strip()
@@ -466,8 +486,13 @@ def _select_route(
     target_model = model or primary.model
     target_effort = effort if effort is not None else primary.reasoning_effort
     target = EnabledRoute(target_provider, target_model, target_effort)
-    enabled = (primary, *spec.enabled_routes)
-    if target not in enabled:
+    enabled = (primary, *(spec.enabled_routes or global_enabled_models))
+    matching_route = next((
+        item for item in enabled
+        if item.provider == target.provider and item.model == target.model
+        and (item.reasoning_effort is None or item.reasoning_effort == target.reasoning_effort)
+    ), None)
+    if matching_route is None:
         choices = ", ".join(
             f"{item.provider or '(default)'}/{item.model}"
             + (f"@{item.reasoning_effort}" if item.reasoning_effort else "")
@@ -477,6 +502,10 @@ def _select_route(
             f"Requested route {target.provider or '(default)'}/{target.model}"
             f"{('@' + target.reasoning_effort) if target.reasoning_effort else ''} is not enabled for profile "
             f"'{spec.name}' (enabled: {choices})")
+    _validate_known_effort(
+        target.provider, target.model, target.reasoning_effort,
+        field=f"delegation task profile '{spec.name}' reasoning_effort",
+    )
     return target
 
 
@@ -503,14 +532,15 @@ def resolve_profile_route(
             f"Unknown delegation profile '{key}'. Configured profiles: {configured}. "
             f"Add it under delegation.profiles in config.yaml or pick a configured name.")
     spec = specs[key]
+    allowed_models = _parse_enabled_models((cfg or {}).get("enabled_models"))
     selected = _select_route(
         spec,
         routing_mode=_routing_mode(cfg),
         requested_provider=requested_provider,
         requested_model=requested_model,
         requested_reasoning_effort=requested_reasoning_effort,
+        global_enabled_models=allowed_models,
     )
-    allowed_models = _parse_enabled_models((cfg or {}).get("enabled_models"))
     if not _route_allowed(selected, allowed_models):
         raise ValueError(
             f"Requested route {selected.provider or '(default)'}/{selected.model} is outside "
@@ -551,7 +581,7 @@ def resolve_profile_route(
         requested_reasoning_effort=(str(requested_reasoning_effort).strip().lower()
                                     if requested_reasoning_effort is not None else None),
         resolved_reasoning_effort=selected.reasoning_effort,
-        transmitted_model=selected.model,
+        transmitted_model=None,
         provider_reported_model=None,
         tool_policy=spec.tool_policy,
         workspace_context=spec.workspace_context,
@@ -562,12 +592,19 @@ def resolve_profile_route(
 def _supported_efforts(provider: str, model: str) -> Tuple[Optional[List[str]], str]:
     """Return only capability tables Hermes already owns; unknown stays explicit."""
     key = provider.strip().lower()
-    if key in {"openai-codex", "codex"}:
+    if key in {"openai", "openai-api", "openai-codex", "codex"}:
         from agent.reasoning_effort import codex_supported_efforts
         return list(codex_supported_efforts(model)), "agent.reasoning_effort"
     if key in {"kimi", "kimi-coding", "kimi-coding-cn", "moonshot"}:
         from agent.reasoning_effort import kimi_supported_efforts
         return list(kimi_supported_efforts(model)), "agent.reasoning_effort"
+    if key in {"zai", "zhipu", "glm"}:
+        from agent.reasoning_effort import GLM52_EFFORTS, GLM53_EFFORTS
+        normalized = model.lower()
+        if "glm-5.3" in normalized or "glm5.3" in normalized:
+            return list(GLM53_EFFORTS), "agent.reasoning_effort"
+        if "glm-5.2" in normalized or "glm5.2" in normalized:
+            return list(GLM52_EFFORTS), "agent.reasoning_effort"
     return None, "unknown"
 
 
@@ -657,6 +694,8 @@ def discover_workers(cfg: Optional[dict], parent_agent: Any = None) -> Dict[str,
                     "timeout_seconds": spec.execution_limits.timeout_seconds,
                     "max_followups": spec.execution_limits.max_followups,
                     "max_tool_calls": spec.execution_limits.max_tool_calls,
+                    "max_spawn_depth": spec.execution_limits.max_spawn_depth,
+                    "max_concurrent_children": spec.execution_limits.max_concurrent_children,
                 },
                 "enabled_routes": route_catalog,
             })

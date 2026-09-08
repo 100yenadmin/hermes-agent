@@ -132,3 +132,14 @@ def test_credentials_rejected_and_invalid_lease_cannot_change_history(store):
     with pytest.raises(PermissionError):
         store.checkpoint_run(run["run_id"], "owner", "wrong-token", history=[{"role": "user", "content": "changed"}])
     assert store.get_worker(wid, "owner")["history"] == []
+
+
+def test_tool_boundary_is_fenced_without_rewriting_history(store):
+    wid = worker(store, frozen_prompt="fixed")
+    store.enqueue_run(wid, "owner", goal="work")
+    run = store.claim_next_run(wid, "owner")
+    store.mark_tool_boundary(run["run_id"], "owner", run["lease_token"], tool_inflight=True)
+    assert store.get_run(run["run_id"], "owner")["tool_inflight"] is True
+    assert store.get_worker(wid, "owner")["history"] == []
+    store.mark_tool_boundary(run["run_id"], "owner", run["lease_token"], tool_inflight=False)
+    assert store.get_run(run["run_id"], "owner")["tool_inflight"] is False

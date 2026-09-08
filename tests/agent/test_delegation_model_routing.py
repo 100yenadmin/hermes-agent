@@ -302,6 +302,35 @@ class TestResolveProfileRoute:
         with pytest.raises(ValueError, match="not enabled"):
             resolve_profile_route("small", cfg, requested_model="other/model")
 
+    def test_global_enabled_models_is_dynamic_menu_when_profile_has_no_routes(self, fake_runtime):
+        cfg = _cfg(
+            {"small": dict(SMALL)}, routing_mode="dynamic",
+            enabled_models=[{"provider": "openrouter", "model": "approved/model"}],
+        )
+        # The global list is also a ceiling, so include the primary profile route.
+        cfg["enabled_models"].append({"provider": "anthropic", "model": "claude-haiku-current"})
+        route = resolve_profile_route(
+            "small", cfg, requested_provider="openrouter", requested_model="approved/model")
+        assert route.model == "approved/model"
+
+    def test_empty_global_menu_does_not_enable_arbitrary_models(self, fake_runtime):
+        cfg = _cfg({"small": dict(SMALL)}, routing_mode="dynamic", enabled_models=[])
+        with pytest.raises(ValueError, match="not enabled"):
+            resolve_profile_route("small", cfg, requested_model="arbitrary/model")
+
+    def test_known_unsupported_effort_fails_before_runtime_resolution(self, monkeypatch):
+        calls = []
+        import hermes_cli.runtime_provider as rp
+        monkeypatch.setattr(rp, "resolve_runtime_provider", lambda **kwargs: calls.append(kwargs))
+        cfg = _cfg({"review": {"provider": "openai-codex", "model": "gpt-6-astra", "reasoning_effort": "ultra"}})
+        with pytest.raises(ValueError, match="unsupported"):
+            resolve_profile_route("review", cfg)
+        assert calls == []
+
+    def test_transmitted_model_is_unknown_until_execution(self, fake_runtime):
+        route = resolve_profile_route("small", _cfg({"small": dict(SMALL)}))
+        assert route.transmitted_model is None
+
     def test_profile_only_rejects_task_route_override(self, fake_runtime):
         with pytest.raises(ValueError, match="profile_only"):
             resolve_profile_route("small", _cfg({"small": dict(SMALL)}), requested_model="other")

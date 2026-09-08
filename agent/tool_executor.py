@@ -902,6 +902,11 @@ def _safe_callback(callback, label: str, *args, **kwargs) -> None:
 
 def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -> None:
     """Run user-visible and checkpoint preflight on final tool arguments."""
+    # A durable worker must fence the uncertain-send window before ANY handler or UI
+    # callback can run. This call intentionally raises: swallowing it would permit an
+    # external side effect without a recoverable execution record.
+    from agent.subagent_lifecycle import before_worker_tool
+    before_worker_tool(agent)
     function_name, function_args, effective_task_id, tool_call_id = ref.name, ref.args, ref.task_id, ref.call_id
     display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
     if _tool_progress_enabled(agent):
@@ -1027,6 +1032,12 @@ def _commit_tool_result(
     messages.append(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None
+
+    # Clear the uncertain-send marker only in the same durable transaction that
+    # stores the resulting conversation. A UI completion callback is too early and
+    # exceptions there are intentionally swallowed.
+    from agent.subagent_lifecycle import checkpoint_worker_tool_result
+    checkpoint_worker_tool_result(agent, messages)
 
     if not blocked:
         # ``tool.completed`` projects AFTER the canonical append + flush so resume can
