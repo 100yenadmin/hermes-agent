@@ -392,6 +392,8 @@ def _resolve_profile_credentials(
         "resolved_provider": route.provider,
         "resolved_model": route.model,
         "resolved_reasoning_effort": route.resolved_reasoning_effort,
+        "route_provenance": f"delegation.profiles.{route.requested_profile}",
+        "normalization_events": [],
         "transmitted_model": route.transmitted_model,
         "provider_reported_model": route.provider_reported_model,
         "fallback_model": [{"provider": item.provider, "model": item.model} for item in route.fallback],

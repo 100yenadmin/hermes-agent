@@ -649,6 +649,9 @@ class _ChildRun:
         from tools.daemon_pool import DaemonThreadPoolExecutor
         child, task_index = self.child, self.task_index
         child_timeout = _get_child_timeout()
+        profile_timeout = getattr(child, "_worker_timeout_seconds", None)
+        if isinstance(profile_timeout, (int, float)) and profile_timeout > 0:
+            child_timeout = min(child_timeout, profile_timeout) if child_timeout else profile_timeout
         executor = DaemonThreadPoolExecutor(
             max_workers=1, initializer=_set_subagent_approval_cb, initargs=(_get_subagent_approval_callback(),),
         )

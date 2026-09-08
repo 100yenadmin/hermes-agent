@@ -318,6 +318,18 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
     if any(isinstance(s, str) and s for s in sids):
         payload["subagent_ids"] = sids
         payload["control_hint"] = _BACKGROUND_NOTES["control_hint"]
+    workers = [
+        {
+            "task_index": i,
+            "profile": task.get("profile"),
+            "worker_id": getattr(child, "_worker_id", None),
+            "run_id": getattr(child, "_worker_run_id", None),
+        }
+        for i, task, child in batch.children
+        if getattr(child, "_worker_id", None) and getattr(child, "_worker_run_id", None)
+    ]
+    if workers:
+        payload["workers"] = workers
     if batch.live_paths:
         payload["live_transcripts"] = list(batch.live_paths)
         payload["live_transcripts_hint"] = _BACKGROUND_NOTES["live_transcripts_hint"]

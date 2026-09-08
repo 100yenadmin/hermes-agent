@@ -143,3 +143,38 @@ def test_tool_boundary_is_fenced_without_rewriting_history(store):
     assert store.get_worker(wid, "owner")["history"] == []
     store.mark_tool_boundary(run["run_id"], "owner", run["lease_token"], tool_inflight=False)
     assert store.get_run(run["run_id"], "owner")["tool_inflight"] is False
+
+
+def test_parallel_tool_checkpoint_keeps_other_inflight_effect_uncertain(tmp_path, monkeypatch):
+    import agent.worker_store as module
+
+    now = [2000.0]
+    monkeypatch.setattr(module, "time", SimpleNamespace(time=lambda: now[0]))
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    first = WorkerStore(db)
+    first.ensure_schema()
+    wid = worker(first)
+    first.enqueue_run(wid, "owner", goal="parallel")
+    run = first.claim_next_run(wid, "owner", lease_seconds=10)
+    first.mark_tool_boundary(run["run_id"], "owner", run["lease_token"], tool_inflight=True)
+    first.mark_tool_boundary(run["run_id"], "owner", run["lease_token"], tool_inflight=True)
+    history = [{"role": "tool", "tool_call_id": "a", "content": "done"}]
+    first.checkpoint_tool_result(
+        run["run_id"], "owner", run["lease_token"], history=history, settled=True)
+    snapshot = first.get_run(run["run_id"], "owner")
+    assert snapshot["tool_inflight_count"] == 1
+    assert snapshot["tool_inflight"] is True
+    db.close()
+
+    now[0] += 11
+    reopened = SessionDB(path)
+    try:
+        recovered = WorkerStore(reopened)
+        recovered.ensure_schema()
+        interrupted = recovered.recover_expired_runs("owner")[0]
+        assert interrupted["status"] == "INTERRUPTED"
+        assert interrupted["uncertain_side_effect"] is True
+        assert recovered.get_worker(wid, "owner")["history"] == history
+    finally:
+        reopened.close()

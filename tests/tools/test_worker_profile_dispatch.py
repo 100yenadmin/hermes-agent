@@ -221,3 +221,25 @@ def test_two_worker_dispatch_receipts_match_transport_requests(monkeypatch):
     assert receipts["review-model"]["transmitted_model"] == "review-model"
     assert receipts["review-model"]["transmitted_reasoning_effort"] == "high"
     assert receipts["review-model"]["provider_reported_model"] == "reported-review-model"
+
+
+def test_execute_code_nested_tools_obey_the_worker_tool_ceiling(monkeypatch):
+    from tools import code_execution_tool
+
+    assert code_execution_tool._sandbox_tools_for(["execute_code"]) == frozenset()
+    assert code_execution_tool._sandbox_tools_for(["execute_code", "read_file"]) == frozenset({"read_file"})
+    assert code_execution_tool._sandbox_tools_for(None)  # legacy callers without a session ceiling retain behavior
+    captured = {}
+    monkeypatch.setattr(
+        code_execution_tool,
+        "execute_code",
+        lambda **kwargs: captured.update(kwargs) or "{}",
+    )
+    code_execution_tool._execute_code_handler(
+        {"code": "print('ok')"},
+        task_id="task",
+        enabled_tools=["execute_code", "read_file"],
+        worker_max_tool_calls=2,
+    )
+    assert captured["worker_max_tool_calls"] == 2
+    assert captured["enabled_tools"] == ["execute_code", "read_file"]

@@ -26,6 +26,7 @@ _SCHEMA = (
         request_id TEXT NOT NULL, previous_run_id TEXT,
         goal TEXT NOT NULL, context TEXT NOT NULL, status TEXT NOT NULL,
         lease_token TEXT, lease_expires_at REAL, tool_inflight INTEGER NOT NULL DEFAULT 0,
+        tool_inflight_count INTEGER NOT NULL DEFAULT 0,
         uncertain_side_effect INTEGER NOT NULL DEFAULT 0, result TEXT,
         completion_ack INTEGER NOT NULL DEFAULT 0,
         created_at REAL NOT NULL, updated_at REAL NOT NULL,
@@ -85,6 +86,10 @@ class WorkerStore:
         def migrate(conn):
             for statement in _SCHEMA:
                 conn.execute(statement)
+            run_columns = {row[1] for row in conn.execute("PRAGMA table_info(orchestration_runs)")}
+            if "tool_inflight_count" not in run_columns:
+                conn.execute(
+                    "ALTER TABLE orchestration_runs ADD COLUMN tool_inflight_count INTEGER NOT NULL DEFAULT 0")
         self.db._execute_write(migrate)
 
     @staticmethod
@@ -142,6 +147,12 @@ class WorkerStore:
                 "SELECT * FROM orchestration_workers WHERE owner_session_id=? ORDER BY created_at,worker_id",
                 (owner_session_id,))]
 
+    def active_run_count(self, owner_session_id):
+        with self.db._read_ctx() as conn:
+            return int(conn.execute("""SELECT count(*) FROM orchestration_runs r
+                JOIN orchestration_workers w ON r.worker_id=w.worker_id
+                WHERE w.owner_session_id=? AND r.status='RUNNING'""", (owner_session_id,)).fetchone()[0])
+
     def get_run(self, run_id, owner_session_id):
         with self.db._read_ctx() as conn:
             return self._run(conn, run_id, owner_session_id)
@@ -170,8 +181,12 @@ class WorkerStore:
                 raise ValueError("Reconcile the interrupted tool outcome before resuming this worker")
             if previous_run_id:
                 previous = self._run(conn, previous_run_id, owner_session_id)
-                if previous["worker_id"] != worker_id or previous["status"] not in _TERMINAL:
-                    raise ValueError("Resume must link to this worker's terminal run")
+                latest = conn.execute(
+                    "SELECT run_id FROM orchestration_runs WHERE worker_id=? ORDER BY sequence DESC LIMIT 1",
+                    (worker_id,),
+                ).fetchone()
+                if previous["worker_id"] != worker_id or not latest or latest[0] != previous_run_id:
+                    raise ValueError("Followup must link to this worker's latest run")
             now = time.time()
             conn.execute("""INSERT INTO orchestration_runs
                 (run_id,worker_id,request_id,previous_run_id,goal,context,status,created_at,updated_at)
@@ -196,7 +211,11 @@ class WorkerStore:
                 (owner_session_id,)).fetchone()[0]
             if active or count >= max_concurrent:
                 return None
-            run = conn.execute("SELECT run_id FROM orchestration_runs WHERE worker_id=? AND status='PENDING' ORDER BY sequence LIMIT 1", (worker_id,)).fetchone()
+            run = conn.execute("""SELECT pending.run_id FROM orchestration_runs pending
+                LEFT JOIN orchestration_runs previous ON previous.run_id=pending.previous_run_id
+                WHERE pending.worker_id=? AND pending.status='PENDING'
+                AND (pending.previous_run_id IS NULL OR previous.status IN ('SUCCEEDED','FAILED','INTERRUPTED','CANCELLED'))
+                ORDER BY pending.sequence LIMIT 1""", (worker_id,)).fetchone()
             if run is None:
                 return None
             now = time.time()
@@ -218,8 +237,12 @@ class WorkerStore:
         def checkpoint(conn):
             run = self._lease(conn, run_id, owner_session_id, lease_token)
             now = time.time()
+            count = max(1, int(run.get("tool_inflight_count") or 0)) if tool_inflight else 0
             conn.execute("UPDATE orchestration_workers SET history=?,updated_at=? WHERE worker_id=?", (history_json, now, run["worker_id"]))
-            conn.execute("UPDATE orchestration_runs SET tool_inflight=?,updated_at=? WHERE run_id=?", (int(tool_inflight), now, run_id))
+            conn.execute(
+                "UPDATE orchestration_runs SET tool_inflight=?,tool_inflight_count=?,updated_at=? WHERE run_id=?",
+                (int(tool_inflight), count, now, run_id),
+            )
             for message_id in delivered_message_ids:
                 self._ack_message(conn, run, message_id)
         self.db._execute_write(checkpoint)
@@ -229,12 +252,37 @@ class WorkerStore:
         if not isinstance(tool_inflight, bool):
             raise ValueError("tool_inflight must be a boolean")
         def mark(conn):
-            self._lease(conn, run_id, owner_session_id, lease_token)
+            run = self._lease(conn, run_id, owner_session_id, lease_token)
+            count = int(run.get("tool_inflight_count") or 0) + 1 if tool_inflight else 0
             conn.execute(
-                "UPDATE orchestration_runs SET tool_inflight=?,updated_at=? WHERE run_id=?",
-                (int(tool_inflight), time.time(), run_id),
+                "UPDATE orchestration_runs SET tool_inflight=?,tool_inflight_count=?,updated_at=? WHERE run_id=?",
+                (int(count > 0), count, time.time(), run_id),
             )
         self.db._execute_write(mark)
+
+    def checkpoint_tool_result(
+        self, run_id, owner_session_id, lease_token, *, history,
+        settled=True, delivered_message_ids=(),
+    ):
+        """Persist one canonical tool outcome and clear one inflight slot only when its effect is known."""
+        history_json = json.dumps(history, allow_nan=False)
+        def checkpoint(conn):
+            run = self._lease(conn, run_id, owner_session_id, lease_token)
+            count = int(run.get("tool_inflight_count") or 0)
+            if settled and count:
+                count -= 1
+            now = time.time()
+            conn.execute(
+                "UPDATE orchestration_workers SET history=?,updated_at=? WHERE worker_id=?",
+                (history_json, now, run["worker_id"]),
+            )
+            conn.execute(
+                "UPDATE orchestration_runs SET tool_inflight=?,tool_inflight_count=?,updated_at=? WHERE run_id=?",
+                (int(count > 0), count, now, run_id),
+            )
+            for message_id in delivered_message_ids:
+                self._ack_message(conn, run, message_id)
+        self.db._execute_write(checkpoint)
 
     def finish_run(self, run_id, owner_session_id, lease_token, *, status, result, history=None):
         if status not in _TERMINAL:
@@ -269,6 +317,13 @@ class WorkerStore:
             return _row(conn.execute("SELECT * FROM orchestration_messages WHERE message_id=?", (message_id,)).fetchone())
         return self.db._execute_write(enqueue)
 
+    def list_messages(self, worker_id, owner_session_id):
+        with self.db._read_ctx() as conn:
+            self._worker(conn, worker_id, owner_session_id)
+            return [_row(row) for row in conn.execute(
+                "SELECT * FROM orchestration_messages WHERE worker_id=? ORDER BY sequence", (worker_id,),
+            )]
+
     def claim_messages(self, run_id, owner_session_id, lease_token):
         # Delivery becomes final only alongside a persisted conversation checkpoint.
         with self.db._read_ctx() as conn:
@@ -302,6 +357,28 @@ class WorkerStore:
                 conn.execute("UPDATE orchestration_workers SET uncertain_side_effect=?,updated_at=? WHERE worker_id=?", (uncertain, time.time(), run["worker_id"]))
             return [self._run(conn, r[0], owner_session_id) for r in expired]
         return self.db._execute_write(recover)
+
+    def cancel_pending_runs(self, worker_ids, owner_session_id):
+        """Cancel queued work for an owner-verified subtree; live runs remain lease-fenced."""
+        worker_ids = tuple(dict.fromkeys(worker_ids))
+        if not worker_ids:
+            return []
+        def cancel(conn):
+            for worker_id in worker_ids:
+                self._worker(conn, worker_id, owner_session_id)
+            placeholders = ",".join("?" for _ in worker_ids)
+            now = time.time()
+            rows = conn.execute(
+                f"SELECT run_id FROM orchestration_runs WHERE worker_id IN ({placeholders}) AND status='PENDING'",
+                worker_ids,
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE orchestration_runs SET status='CANCELLED',result=?,updated_at=? WHERE run_id=?",
+                    (json.dumps({"reason": "worker_tree_cancelled"}), now, row[0]),
+                )
+            return [self._run(conn, row[0], owner_session_id) for row in rows]
+        return self.db._execute_write(cancel)
 
     def reconcile_run(self, run_id, owner_session_id):
         def reconcile(conn):

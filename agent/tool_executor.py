@@ -1037,7 +1037,7 @@ def _commit_tool_result(
     # stores the resulting conversation. A UI completion callback is too early and
     # exceptions there are intentionally swallowed.
     from agent.subagent_lifecycle import checkpoint_worker_tool_result
-    checkpoint_worker_tool_result(agent, messages)
+    checkpoint_worker_tool_result(agent, messages, settled=effect_disposition != "unknown")
 
     if not blocked:
         # ``tool.completed`` projects AFTER the canonical append + flush so resume can
@@ -1546,6 +1546,10 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                worker_max_tool_calls=(
+                    __import__("agent.subagent_lifecycle", fromlist=["worker_tool_calls_remaining"])
+                    .worker_tool_calls_remaining(agent)
+                ),
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
                 skip_tool_execution_middleware=True,

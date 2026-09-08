@@ -200,7 +200,6 @@ class TestStripBlockedTools(unittest.TestCase):
         for toolset_name in (
             "clarify",
             "cronjob",
-            "delegation",
             "memory",
         ):
             self.assertIn(toolset_name, disabled)
@@ -216,7 +215,11 @@ class TestStripBlockedTools(unittest.TestCase):
         )
         names = {item["function"]["name"] for item in definitions}
         self.assertTrue(names & {"terminal", "read_file", "web_search"})
-        self.assertTrue(DELEGATE_BLOCKED_TOOLS.isdisjoint(names))
+        # Leaves retain the durable worker control surface for discovery,
+        # messaging, and child-to-parent delivery.  Spawn admission remains
+        # depth/policy-gated by delegate_task itself.
+        self.assertIn("delegate_task", names)
+        self.assertTrue((DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names))
 
     def test_orchestrator_composite_regains_only_delegate_task(self):
         import model_tools
@@ -413,8 +416,10 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
+                # macOS aliases /tmp to /private/tmp; the invariant is the
+                # backing file rather than the spelling retained by a handle.
                 self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                    Path(child_db.db_path).resolve(), Path(parent_db.db_path).resolve()
                 )
             finally:
                 if child_db is not None:
