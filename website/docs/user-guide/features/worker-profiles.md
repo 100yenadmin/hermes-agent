@@ -161,6 +161,11 @@ Existing conversations retain their original instructions. Changes to profile
 permissions, available tools, credentials, and models are rechecked on resume.
 Status and completion results are summaries; inspect the conversation explicitly
 when you need detail instead of copying every worker transcript into the parent.
+Use `delegate_task(action="inspect", worker_id="...")` for the retained visible
+conversation and receipt metadata. Conversation entries include user, assistant,
+and tool text, capped at 32,000 characters per entry. System prompts, hidden
+reasoning, and provider session objects are excluded. Ownership checks apply to
+this inspection just as they do to worker controls.
 
 The parent uses these actions on `delegate_task`:
 
