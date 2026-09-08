@@ -96,7 +96,8 @@ acknowledgments survive restart, while external message transports retain their
 own delivery guarantees.
 
 Requests are fail-closed: goal/context/metadata sizes are capped, unknown or
-parent-broadening toolsets are rejected, and per-tool blocks, working-directory
-overrides, and per-launch timeouts are explicitly rejected until Hermes can
-support them without weakening isolation. Use `allowed_toolsets` to narrow a
-child; Hermes's existing unsafe-tool block remains enforced.
+parent-broadening toolsets are rejected. The legacy request-level
+`blocked_tools`, working-directory override, and timeout fields retain their
+explicit unsupported errors; select a worker profile to use its supported
+tool and execution policy. `allowed_toolsets` narrows a child within the parent
+and profile limits. Hermes's existing unsafe-tool block remains enforced.
