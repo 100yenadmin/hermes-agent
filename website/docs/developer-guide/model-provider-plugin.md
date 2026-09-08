@@ -169,6 +169,8 @@ The client your `create_client` returns receives `command` and `args` in `client
 
 For interruptible non-HTTP requests, implement a class-declared `cancel(self)` method. Hermes calls it from the interrupting thread after marking the request client unusable. It must return promptly and safely stop its own transport, including cancellation racing process startup; it must not close file descriptors owned by the request thread. The request owner still calls `close()` for cleanup. Clients without this method retain the existing socket-shutdown cancellation path.
 
+Explicit external-process delegation retains the selected provider and its protocol when resolving the child command; an executable override alone does not change an external-process provider into ACP.
+
 ## Hook reference examples
 
 Look at these bundled plugins for idioms:
@@ -327,3 +329,4 @@ See [Building a Hermes Plugin](/developer-guide/plugins#distribute-via-pip) for 
 - [Memory Provider Plugins](/developer-guide/memory-provider-plugin)
 - [Context Engine Plugins](/developer-guide/context-engine-plugin)
 - [Building a Hermes Plugin](/developer-guide/plugins) — general plugin authoring
+
