@@ -153,7 +153,8 @@ class _FixtureOpenAI:
         pass
 
 
-def _effect_handler(effect_id: str) -> str:
+def _effect_handler(args: dict, **_metadata) -> str:
+    effect_id = str(args.get("effect_id") or "")
     _append_json(
         os.environ.get("HERMES_ACCEPTANCE_EFFECT", ""),
         {"effect_id": effect_id, "pid": os.getpid()},
