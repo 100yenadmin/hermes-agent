@@ -5,7 +5,7 @@ sidebar_label: Worker profiles
 
 # Worker profiles and orchestration
 
-Worker profiles describe the people-like roles you want Hermes to delegate to:
+Worker profiles describe the roles you want Hermes to delegate to:
 their purpose, instructions, model, thinking level, tools, and execution limits.
 They are independent of provider. You can use one model everywhere or combine
 models from different providers. Hermes does not install a prescribed team.
@@ -107,6 +107,24 @@ Existing conversations retain their original instructions. Changes to profile
 permissions, available tools, credentials, and models are rechecked on resume.
 Status and completion results are summaries; inspect the conversation explicitly
 when you need detail instead of copying every worker transcript into the parent.
+
+The parent uses these actions on `delegate_task`:
+
+| Action | Purpose |
+| --- | --- |
+| `discover` | List worker profiles and routing metadata |
+| `spawn` | Start the selected profiles through task items |
+| `status` | Read worker/run summaries, optionally selecting `worker_id` and `run_id` |
+| `inspect` | Explicitly inspect retained worker details |
+| `message` | Send `message` to a selected `worker_id` |
+| `wait` | Wait for a selected worker/run, bounded by `timeout_seconds` |
+| `resume` | Submit `message` as a new assignment with retained conversation |
+| `cancel` | Request cancellation of a selected worker/run |
+| `ack` | Acknowledge receipt of a terminal completion |
+
+Legacy `list`, `steer`, and `stop` actions remain available. Retain the returned
+worker and run IDs to target subsequent controls; do not infer identity from a
+profile name when several workers use the same profile.
 
 ## After a restart
 
