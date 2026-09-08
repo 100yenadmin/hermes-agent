@@ -2,17 +2,17 @@
 
 Behavior contracts (not snapshots): parsing rejects malformed shapes loudly, selection follows the
 documented precedence ladder, unknown profile names fail before child construction with an
-actionable message, invalid reasoning_effort warns and is ignored (NS-696 clamp-at-transport
-doctrine — never reject), and the resolved route is immutable.
+actionable message, invalid explicit reasoning effort fails before launch, discovery stays
+credential-free, and the resolved route is immutable.
 """
 
 import dataclasses
-import logging
 
 import pytest
 
 from agent.delegation_model_routing import (
     ProfileRoute,
+    discover_workers,
     parse_profiles,
     profile_config_errors,
     resolve_profile_route,
@@ -97,12 +97,9 @@ class TestParseProfiles:
         specs = parse_profiles(_cfg({"small": {**SMALL, "reasoning_effort": "none"}}))
         assert specs["small"].reasoning_config == {"enabled": False}
 
-    def test_invalid_reasoning_effort_warns_and_is_ignored(self, caplog):
-        """NS-696 clamp doctrine: an invalid effort must never reject the profile."""
-        with caplog.at_level(logging.WARNING):
-            specs = parse_profiles(_cfg({"small": {**SMALL, "reasoning_effort": "turbo"}}))
-        assert specs["small"].reasoning_config is None
-        assert any("turbo" in rec.getMessage() for rec in caplog.records)
+    def test_invalid_reasoning_effort_is_rejected(self):
+        with pytest.raises(ValueError, match="turbo"):
+            parse_profiles(_cfg({"small": {**SMALL, "reasoning_effort": "turbo"}}))
 
     def test_max_iterations_parsed(self):
         specs = parse_profiles(_cfg({"small": {**SMALL, "max_iterations": 20}}))
@@ -112,6 +109,23 @@ class TestParseProfiles:
         with pytest.raises(ValueError) as exc:
             parse_profiles(_cfg({"small": {**SMALL, "max_iterations": "lots"}}))
         assert "max_iterations" in str(exc.value)
+
+    def test_parses_profile_policy_and_limits(self):
+        spec = parse_profiles(_cfg({"small": {
+            **SMALL,
+            "description": "Bounded retrieval",
+            "instructions": "Return evidence.",
+            "tool_policy": {"allowed_toolsets": ["file"], "blocked_tools": ["write_file"]},
+            "workspace_context": {"mode": "none"},
+            "execution_limits": {"max_iterations": 8, "timeout_seconds": 30, "max_followups": 2},
+            "enabled_routes": [{"provider": "anthropic", "model": "claude-sonnet-current", "reasoning_effort": "high"}],
+        }}))["small"]
+        assert spec.description == "Bounded retrieval"
+        assert spec.tool_policy.allowed_toolsets == ("file",)
+        assert spec.tool_policy.blocked_tools == ("write_file",)
+        assert spec.workspace_context.mode == "none"
+        assert spec.execution_limits.max_iterations == 8
+        assert spec.enabled_routes[0].reasoning_effort == "high"
 
 
 class TestProfileConfigErrors:
@@ -274,3 +288,44 @@ class TestResolveProfileRoute:
     def test_route_fallback_is_immutable_sequence(self, fake_runtime):
         route = resolve_profile_route("small", _cfg({"small": dict(SMALL)}), parent_agent=None)
         assert isinstance(route.fallback, tuple)
+
+    def test_dynamic_override_must_be_enabled(self, fake_runtime):
+        cfg = _cfg({"small": {
+            **SMALL,
+            "enabled_routes": [{"provider": "openrouter", "model": "approved/model", "reasoning_effort": "high"}],
+        }}, routing_mode="dynamic")
+        route = resolve_profile_route(
+            "small", cfg, requested_provider="openrouter", requested_model="approved/model",
+            requested_reasoning_effort="high",
+        )
+        assert route.model == "approved/model"
+        with pytest.raises(ValueError, match="not enabled"):
+            resolve_profile_route("small", cfg, requested_model="other/model")
+
+    def test_profile_only_rejects_task_route_override(self, fake_runtime):
+        with pytest.raises(ValueError, match="profile_only"):
+            resolve_profile_route("small", _cfg({"small": dict(SMALL)}), requested_model="other")
+
+
+class TestDiscoverWorkers:
+    def test_catalog_is_safe_and_does_not_resolve_credentials(self, monkeypatch):
+        import hermes_cli.runtime_provider as rp
+        monkeypatch.setattr(rp, "resolve_runtime_provider", lambda **kwargs: pytest.fail("credential resolution"))
+        catalog = discover_workers(_cfg({"small": {
+            **SMALL,
+            "description": "Small worker",
+            "tool_policy": {"allowed_toolsets": ["file"]},
+        }}))
+        assert catalog["routing_mode"] == "profile_only"
+        assert catalog["profiles"][0]["name"] == "small"
+        assert catalog["profiles"][0]["availability"]["status"] == "unknown"
+        assert catalog["profiles"][0]["tool_policy"]["allowed_toolsets"] == ["file"]
+        assert "api_key" not in repr(catalog)
+
+    def test_catalog_keeps_unknown_metadata_explicit(self, monkeypatch):
+        import agent.models_dev as md
+        monkeypatch.setattr(md, "get_model_capabilities", lambda *args, **kwargs: None)
+        profile = discover_workers(_cfg({"small": dict(SMALL)}))["profiles"][0]
+        assert profile["capabilities"]["supports_tools"] is None
+        assert profile["freshness"]["status"] == "unknown"
+        assert profile["provenance"]["capabilities"] == "unknown"
