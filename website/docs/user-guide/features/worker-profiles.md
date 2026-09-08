@@ -199,6 +199,13 @@ state to see whether the message has reached a committed conversation checkpoint
 Sibling messaging is optional (`delegation.allow_sibling_messaging`); it does not
 grant permission to resume, cancel, or inspect an unrelated worker.
 
+A worker can send a message back to its parent through the same `message` action.
+For a top-level worker, the parent can read `messages_to_parent` through `inspect`,
+including while the message is `QUEUED`. Terminal publication changes it to
+`PUBLISHED` and includes it with the result. The parent's `ack` of that terminal
+run changes published messages to `ACKNOWLEDGED`. These states survive restart;
+publication alone does not mean the parent has consumed the message.
+
 ## After a restart
 
 Worker conversations, messages, and result delivery state live in the active
