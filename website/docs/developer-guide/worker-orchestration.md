@@ -60,6 +60,14 @@ unique index allows only one running assignment per worker; admission also count
 the owner's running assignments to enforce concurrency across nested calls. A
 waiting orchestrator must not strand descendants behind its own capacity slot.
 
+Each explicit root-worker assignment has a durable budget identity. Its nested
+workers inherit the same aggregate iteration and tool-call allocation and absolute
+deadline, in addition to their own profile ceilings. Reserve spending transactionally
+before the corresponding execution boundary. Restart does not erase spending or
+extend the deadline. A subsequent explicit root assignment receives a new budget;
+descendants and nested follow-ups from an older assignment retain the older budget.
+Owner-wide active-run concurrency applies across these assignment trees.
+
 Every launch, including a queued follow-up with an existing process record, passes
 through current-authority admission immediately before execution. Public handles
 and parent-tool controls use the same FIFO recovery path. The triggering actor is

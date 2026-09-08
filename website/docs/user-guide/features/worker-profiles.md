@@ -88,6 +88,13 @@ Nesting is optional. Enable it through the existing
 `delegation.orchestrator_enabled` and `delegation.max_spawn_depth` settings, then
 narrow individual worker profiles as needed.
 
+An assignment to a top-level worker starts a shared execution budget for its tree.
+Nested workers share the iteration and tool-call budget and inherit its deadline;
+their own profiles may narrow these limits further. Restarting a process does not
+replenish that budget. A new explicit assignment to the top-level worker starts a
+new budget, while descendants still finishing an older assignment keep the old
+one. The owner's active-run concurrency ceiling also applies across these trees.
+
 ## Choose the parent's routing freedom
 
 The default `delegation.routing_mode: profile_only` lets the parent select named
