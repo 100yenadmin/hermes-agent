@@ -55,6 +55,39 @@ Listing and validation do not contact providers or prove account availability.
 Credentials remain in Hermes's existing provider authentication system; do not
 put keys, tokens, or endpoints containing credentials in worker definitions.
 
+### Tools, context, and limits
+
+`allowed_toolsets` selects named tool groups. `allowed_tools` narrows exact tool
+names, and `allowed_mcp_tools` adds an exact-name restriction for MCP tools.
+`blocked_tools` removes named tools. Use the names reported by your installed
+tool catalog. Omitted restrictions inherit the applicable authority; an explicit
+empty allowlist grants no tools in its scope. A descendant cannot regain a tool
+denied by its parent. The same restrictions apply when a tool is discovered later
+or called through `execute_code`.
+
+Worker instructions describe behavior; tool policies govern access. Likewise,
+`workspace_context.mode: none` suppresses startup context files and memory, but
+does not create a filesystem sandbox. Supported context modes are `inherit` and
+`none`. A requested filesystem guarantee needs a backend that can enforce it;
+unsupported guarantees are rejected.
+
+Profiles support these execution ceilings:
+
+| Field | Meaning |
+| --- | --- |
+| `max_iterations` | Positive iteration limit |
+| `timeout_seconds` | Positive execution time limit in seconds |
+| `max_followups` | Nonnegative number of subsequent assignments; `0` disables follow-ups |
+| `max_tool_calls` | Nonnegative tool-call limit; `0` disables tool execution |
+| `max_spawn_depth` | Nonnegative descendant-depth limit; `0` disables spawning descendants |
+| `max_concurrent_children` | Nonnegative active-child limit; `0` disables child launches |
+
+Omit a limit to inherit the applicable default. Limits narrow the user's and
+ancestors' ceilings; they do not authorize additional tools or deeper delegation.
+Nesting is optional. Enable it through the existing
+`delegation.orchestrator_enabled` and `delegation.max_spawn_depth` settings, then
+narrow individual worker profiles as needed.
+
 ## Choose the parent's routing freedom
 
 The default `delegation.routing_mode: profile_only` lets the parent select named
@@ -83,6 +116,27 @@ Routing chooses within your policy. It cannot add tools, change credentials,
 or grant filesystem access. Resolution uses allowed task overrides, the selected
 profile, delegation defaults, then parent defaults; user limits apply last.
 An invalid profile or route rejects the batch before workers launch.
+
+For example, after configuring the menu above, the parent can request:
+
+```json
+{
+  "action": "spawn",
+  "tasks": [{
+    "profile": "analyst",
+    "provider": "anthropic",
+    "model": "your-enabled-anthropic-model",
+    "reasoning_effort": "high",
+    "goal": "Check the supplied evidence and explain any inconsistencies."
+  }]
+}
+```
+
+Use an effort that the selected model supports. A profile's optional
+`enabled_routes` list can further narrow its choices, including a specific
+`reasoning_effort` on a route. It cannot add a provider/model outside the global
+enabled menu. An explicit unsupported selection fails with an explanation;
+Hermes does not silently choose a cheaper model or lower thinking level.
 
 The parent discovers profiles and model metadata through `delegate_task` rather
 than having a large model catalog inserted into every prompt. Missing capability
@@ -116,15 +170,22 @@ The parent uses these actions on `delegate_task`:
 | `spawn` | Start the selected profiles through task items |
 | `status` | Read worker/run summaries, optionally selecting `worker_id` and `run_id` |
 | `inspect` | Explicitly inspect retained worker details |
+| `completions` | List terminal results awaiting acknowledgment |
 | `message` | Send `message` to a selected `worker_id` |
 | `wait` | Wait for a selected worker/run, bounded by `timeout_seconds` |
 | `resume` | Submit `message` as a new assignment with retained conversation |
 | `cancel` | Request cancellation of a selected worker/run |
+| `reconcile` | Record an explicit decision about an uncertain tool outcome |
 | `ack` | Acknowledge receipt of a terminal completion |
 
 Legacy `list`, `steer`, and `stop` actions remain available. Retain the returned
 worker and run IDs to target subsequent controls; do not infer identity from a
 profile name when several workers use the same profile.
+
+Message acceptance and message consumption are different events. Inspect delivery
+state to see whether the message has reached a committed conversation checkpoint.
+Sibling messaging is optional (`delegation.allow_sibling_messaging`); it does not
+grant permission to resume, cancel, or inspect an unrelated worker.
 
 ## After a restart
 
@@ -137,6 +198,29 @@ marked interrupted/uncertain. The parent must reconcile that outcome before
 continuing; Hermes does not blindly repeat it. Resume creates a new run linked to
 the interrupted run. Hermes-owned conversation checkpoints work even when a
 provider offers no resumable server-side session.
+
+After checking the external action, record the decision against the latest
+uncertain run:
+
+```json
+{
+  "action": "reconcile",
+  "worker_id": "worker-id-from-status",
+  "run_id": "interrupted-run-id",
+  "reconciliation_disposition": "confirmed_applied",
+  "message": "Checked the operation by its external reference; it completed. Do not repeat it."
+}
+```
+
+The other dispositions are `confirmed_not_applied` and
+`accepted_unknown_no_replay`. The latter records that the outcome remains unknown;
+it is not verification. Supply a nonempty note describing the evidence or decision.
+Reconciliation records the original tool-call identities and prior statuses without
+executing the tool. Then use a separate `resume` action with the next assignment.
+
+Queued assignments are revalidated immediately before launch, including those
+queued before a restart or a configuration change. A saved provider session handle
+does not replace Hermes-owned conversation state or current authorization.
 
 Delivery acknowledgments prevent duplicate internal consumption. An external
 messaging transport may still provide at-least-once delivery; this feature does

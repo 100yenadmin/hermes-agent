@@ -20,6 +20,14 @@ IDs sufficient authority. Parent lineage, nested-depth policy, and effective too
 permissions are resolved before execution. Configured instructions do not grant
 permissions, and narrowing a schema alone is not an execution security boundary.
 
+The effective execution catalog is distinct from model-visible schemas. Tool
+Search may replace permitted tools with bridge schemas; that presentation change
+must neither revoke those tools nor grant hidden ones. Compile the executable
+identities from the current user, ancestor, request, profile, and backend limits,
+then apply the same ceiling at native, deferred MCP, and `execute_code` dispatch.
+Explicit denial also applies to `delegate_task`; default worker controls are not
+an exception to an explicit user restriction.
+
 User-enabled model routes govern dynamic routing. A profile may narrow that menu,
 but cannot expand global policy. The resolver validates the complete launch batch
 before it creates children. Per-task settings take precedence only within allowed
@@ -44,11 +52,20 @@ or rebuild the old conversation under a different permission contract.
 primitives. It does not open a separate database or resolve credentials. Schema
 creation is additive and idempotent. The tables hold workers, ordered runs, and
 ordered internal messages. The service explicitly initializes them before use.
+Per-run tool-effect records bind admission and settlement to the exact tool-call
+identity, so a blocked call cannot settle a different concurrent action.
 
 Run admission and lease acquisition occur inside `BEGIN IMMEDIATE`. A partial
 unique index allows only one running assignment per worker; admission also counts
 the owner's running assignments to enforce concurrency across nested calls. A
 waiting orchestrator must not strand descendants behind its own capacity slot.
+
+Every launch, including a queued follow-up with an existing process record, passes
+through current-authority admission immediately before execution. Public handles
+and parent-tool controls use the same FIFO recovery path. The triggering actor is
+authorized before any queue mutation; it cannot schedule or fail unrelated owner
+subtrees. Revalidation uses the retained worker's correct parent authority rather
+than whichever actor happened to ask for status.
 
 Each executor receives a unique lease token. Heartbeats, conversation checkpoints,
 message acknowledgments, and completion require a live matching lease. An expired
@@ -66,6 +83,11 @@ is an error. Message delivery is acknowledged atomically with the conversation
 checkpoint that includes it. Completions remain available until acknowledged.
 Reconciliation clears the worker's resume barrier while retaining the interrupted
 run's historical uncertainty record.
+
+The reconciliation annotation records an explicit disposition, nonempty decision
+note, affected tool-call IDs, prior statuses, and time. The top-level uncertainty
+flag indicates a currently unresolved barrier; historical uncertainty remains in
+the annotation. Reconciliation itself performs no provider or tool dispatch.
 
 No recovery protocol here promises exactly-once behavior from external tools or
 message transports. The supported guarantee is one leased executor plus explicit
@@ -96,11 +118,15 @@ customer runtime readiness or complete parity with every Codex feature.
 
 | Capability | Codex comparison reference | Hermes acceptance requirement |
 | --- | --- | --- |
-| Named worker roles | Custom agents and descriptions | User-defined profiles appear in discovery and affect execution |
-| Model and effort routing | Per-agent model/effort selection | Different provider requests match selected routes and efforts |
-| Tools and authority | Agent configuration and runtime permission overrides | Native/MCP enforcement cannot exceed parent/user authority |
-| Messaging and follow-up | Message, wait, interrupt, follow-up controls | Delivery boundaries and retained conversation are exercised |
+| Discovery | Agent descriptions and model/effort metadata exposed by the harness | Compact discovery plus on-demand profile details preserve unknown metadata |
+| Custom profiles | Custom agents and descriptions | User-defined profiles appear in discovery and affect execution |
+| Model routing | Per-agent model selection | Different provider requests match selected routes |
+| Per-worker effort | Supported reasoning-effort overrides | Requested, resolved, and transmitted effort agree or show an explicit configured transformation |
+| Permissions | Agent configuration and runtime permission controls | Native/MCP enforcement cannot exceed parent/user/profile authority |
+| Messaging | Parent/child messaging and waiting | Durable message IDs, ownership, and supported delivery boundaries are exercised |
+| Follow-up | Subsequent assignments to retained agents | A new run retains the worker conversation without rebuilding its system prefix |
 | Nested orchestration | Harness limits and role configuration | Tree-wide limits hold without nested-wait deadlock |
+| Cancellation | Cooperative interrupt controls | Cancellation reaches owned active descendants and does not imply external effects stopped |
 | Restart recovery | Deployment-specific; no universal comparison claimed | Conversation, queue, lease and uncertain-action tests pass |
 | Execution evidence | Harness/model metadata | Requested/resolved/transmitted/reported values remain distinct |
 

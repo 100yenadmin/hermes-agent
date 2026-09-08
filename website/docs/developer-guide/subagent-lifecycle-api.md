@@ -45,6 +45,9 @@ interrupt at its next safe boundary and returns `CANCEL_REQUESTED`; it never
 claims completion until `wait` or `result` observes a terminal state. Terminal
 results are immutable, idempotent, bounded to 32k characters, omit transcripts
 and hidden reasoning, and include a stable result hash.
+An explicit reconciliation may add an audit annotation to a durable run; it does
+not rewrite the original execution summary or turn an unknown effect into a
+verified success.
 
 This API is lifecycle-managed asynchronous execution. Child construction and
 completion use the same host-owned path as `delegate_task`, including parent
@@ -95,9 +98,29 @@ before resuming; it must not assume the action failed. Internal completion
 acknowledgments survive restart, while external message transports retain their
 own delivery guarantees.
 
+For a retained plugin handle, the explicit reconciliation form is:
+
+```python
+next_run = service.resume(
+    handle,
+    "Continue with the next assignment; do not repeat the previous operation.",
+    reconcile_uncertain=True,
+    reconciliation_disposition="confirmed_applied",
+    reconciliation_note="Checked the external operation by its reference; it completed.",
+)
+```
+
+Use `confirmed_not_applied` or `accepted_unknown_no_replay` when that accurately
+describes the caller's decision. The latter preserves the fact that the external
+outcome is unknown. A nonempty note is required. This records the decision and
+affected tool-call identities without replaying the effect; the new run still
+passes current-authority validation. The parent tool exposes reconciliation and
+resume as separate actions.
+
 Requests are fail-closed: goal/context/metadata sizes are capped, unknown or
-parent-broadening toolsets are rejected. The legacy request-level
-`blocked_tools`, working-directory override, and timeout fields retain their
-explicit unsupported errors; select a worker profile to use its supported
-tool and execution policy. `allowed_toolsets` narrows a child within the parent
-and profile limits. Hermes's existing unsafe-tool block remains enforced.
+parent-broadening toolsets are rejected. Request-level `blocked_tools` is a tuple
+of exact tool names and narrows the effective grant alongside `allowed_toolsets`
+and the selected profile. Working-directory overrides and request-level timeout
+fields retain explicit unsupported errors; select a worker profile for its
+supported context and execution policy. Hermes's existing unsafe-tool block
+remains enforced.
