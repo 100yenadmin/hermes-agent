@@ -352,7 +352,10 @@ def _tool_search_scoped_names(agent) -> frozenset:
         names = _ts.scoped_deferrable_names(model_tools.get_tool_definitions(
             enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True, skip_tool_search_assembly=True,
         ) or [])
-        exact = getattr(agent, "valid_tool_names", None)
+        exact = getattr(
+            agent, "_worker_effective_tool_names",
+            getattr(agent, "_executable_tool_names", None),
+        )
         if isinstance(exact, (set, frozenset, list, tuple)):
             names = frozenset(names).intersection(exact)
     except Exception:
@@ -360,6 +363,15 @@ def _tool_search_scoped_names(agent) -> frozenset:
     with contextlib.suppress(Exception):
         agent._tool_search_scope_cache = (cache_key, names)
     return names
+
+
+def _execution_authority_names(agent) -> frozenset:
+    """Full executable catalog for this session, separate from visible schemas."""
+    names = getattr(
+        agent, "_worker_effective_tool_names",
+        getattr(agent, "_executable_tool_names", getattr(agent, "valid_tool_names", ())),
+    )
+    return frozenset(names or ())
 
 
 def _canonical_tool_name(function_name: str) -> str:
@@ -432,6 +444,15 @@ def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _Parse
     scope_block = None
     if parse_error is None:
         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
+        exact = getattr(agent, "_worker_effective_tool_names", None)
+        if scope_block is None and isinstance(exact, (set, frozenset, list, tuple)):
+            try:
+                from tools import tool_search as _ts
+                bridge = _ts.is_bridge_tool(name)
+            except Exception:
+                bridge = False
+            if not bridge and name not in exact:
+                scope_block = f"'{name}' is not permitted by this worker's effective tool policy."
     return _ParsedCall(tool_call, name, args, [], parse_error, scope_block)
 
 
@@ -1554,7 +1575,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                enabled_tools=list(_execution_authority_names(agent)),
                 worker_max_tool_calls=(
                     __import__("agent.subagent_lifecycle", fromlist=["worker_tool_calls_remaining"])
                     .worker_tool_calls_remaining(agent)

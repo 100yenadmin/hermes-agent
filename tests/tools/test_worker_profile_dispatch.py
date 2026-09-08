@@ -107,6 +107,40 @@ def test_invalid_second_profile_preflight_returns_no_routes(monkeypatch):
     assert "missing" in error
 
 
+def test_explicitly_unavailable_route_fails_batch_preflight_before_construction(monkeypatch):
+    import hermes_cli.runtime_provider as runtime_provider
+
+    calls = []
+
+    def runtime(**kwargs):
+        calls.append(kwargs.get("target_model"))
+        if kwargs.get("target_model") == "unavailable-model":
+            raise ValueError("configured route is unavailable")
+        return _runtime(**kwargs)
+
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", runtime)
+    cfg = {
+        "profiles": {
+            "small": {"provider": "provider-a", "model": "small-model"},
+            "offline": {"provider": "provider-b", "model": "unavailable-model"},
+        },
+    }
+    parent = SimpleNamespace(model="parent-model")
+    base = _resolve_delegation_credentials(cfg, parent, "small")
+    routes, error = delegate._resolve_task_credentials(
+        [
+            {"goal": "Collect", "profile": "small"},
+            {"goal": "Must reject", "profile": "offline"},
+        ],
+        base,
+        cfg,
+        parent,
+    )
+    assert routes == []
+    assert "unavailable" in error
+    assert calls == ["small-model", "small-model", "unavailable-model"]
+
+
 def test_two_worker_dispatch_receipts_match_transport_requests(monkeypatch):
     """The fan-out executor must preserve each resolved route through the real request hook."""
     import agent.models_dev as models_dev

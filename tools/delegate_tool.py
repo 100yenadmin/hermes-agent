@@ -350,7 +350,10 @@ def _build_child_agent(
                     from hermes_state_registry import release_or_close
                     release_or_close(child_session_db)
             raise
-    parent_exact_tools = getattr(parent_agent, "valid_tool_names", None)
+    parent_exact_tools = getattr(
+        parent_agent, "_worker_effective_tool_names",
+        getattr(parent_agent, "_executable_tool_names", getattr(parent_agent, "valid_tool_names", None)),
+    )
     _apply_exact_tool_policy(
         child,
         profile_tool_policy,
@@ -985,7 +988,8 @@ DELEGATE_TASK_SCHEMA = {
             "action": _p(
                 "string",
                 "Default 'spawn'. 'discover' returns configured worker profiles. Durable worker actions are "
-                "'status', 'inspect', 'completions', 'message', 'wait', 'cancel', 'reconcile', 'resume', and 'ack'. "
+                "'status', 'inspect' (explicit visible conversation plus receipt metadata), 'completions', "
+                "'message', 'wait', 'cancel', 'reconcile', 'resume', and 'ack'. "
                 "Legacy live controls are "
                 "'list' = ids/goals/status/transcripts; 'steer' = queue "
                 "course-correction text into one child (subagent_id + "
@@ -998,7 +1002,11 @@ DELEGATE_TASK_SCHEMA = {
                 ],
             ),
             "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
-            "worker_id": _p("string", "Stable worker target for status/inspect/message/wait/cancel/resume/ack."),
+            "worker_id": _p(
+                "string",
+                "Stable worker target. action='inspect' returns its retained user/assistant/tool conversation "
+                "without hidden reasoning or system prompts.",
+            ),
             "run_id": _p("string", "Optional exact run target for inspect/wait/cancel/resume/ack."),
             "reconciliation_disposition": _p(
                 "string",

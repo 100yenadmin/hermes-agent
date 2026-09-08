@@ -103,17 +103,19 @@ def _resolve_child_toolsets(
     parent_has_delegate = any(
         "delegate_task" in (TOOLSETS.get(name) or {}).get("tools", ()) for name in parent_toolsets
     )
-    # Leaves retain the existing delegate_task surface for status/message/wait/cancel
-    # controls. The handler enforces spawn authority from the child's depth/profile.
-    if parent_has_delegate and "delegation" not in child_toolsets:
+    # Legacy inheritance retains the control surface.  An explicit request
+    # allowlist is a ceiling and may remove it.
+    if toolsets is None and parent_has_delegate and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
     raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
     inherited_disabled = (
         [str(name) for name in raw_parent_disabled] if isinstance(raw_parent_disabled, (list, tuple, set)) else []
     )
-    if effective_role == "orchestrator":
-        inherited_disabled = [name for name in inherited_disabled if name != "delegation"]
+    if (
+        effective_role == "orchestrator" and toolsets is None and parent_has_delegate
+        and "delegation" not in inherited_disabled
+    ):
         if "delegation" not in child_toolsets:
             child_toolsets.append("delegation")
     child_disabled_toolsets = list(
@@ -147,19 +149,14 @@ def _apply_exact_tool_policy(
     request_blocked_tools: Optional[List[str]] = None,
     ancestor_allowed_tools: Any = None,
 ) -> None:
-    """Apply profile tool-name ceilings to schemas and every execution validation path.
+    """Apply every ancestor/request/profile ceiling to execution and presentation.
 
-    ``AIAgent`` validates direct, inline, and deferred tool-search calls against
-    ``valid_tool_names``. Keeping ``tools`` and that set aligned means a tool hidden from the
-    schema also cannot be reached by naming it directly or through the generic bridge.
+    The executable catalog remains complete even when tool-search collapses deferred
+    schemas.  ``tools``/``valid_tool_names`` are only the model-visible projection;
+    ``_worker_effective_tool_names`` is the exact dispatch authority.
     """
-    current = set(getattr(child, "valid_tool_names", set()) or set())
-    # ``delegate_task`` is a worker control plane as well as a spawn tool.
-    # Descendants retain it only when the ancestor had it; action admission
-    # separately denies spawn for leaves/profile depth zero.
-    retain_worker_control = "delegate_task" in current and (
-        ancestor_allowed_tools is None or "delegate_task" in set(ancestor_allowed_tools or ())
-    )
+    visible = set(getattr(child, "valid_tool_names", set()) or set())
+    current = set(getattr(child, "_executable_tool_names", visible) or set())
     ancestor = (
         set(ancestor_allowed_tools)
         if isinstance(ancestor_allowed_tools, (set, frozenset, list, tuple))
@@ -192,11 +189,18 @@ def _apply_exact_tool_policy(
             if _is_mcp_toolset_name(str(toolset or "")) and name not in allowed_mcp_names:
                 current.discard(name)
     current.difference_update(blocked)
-    if retain_worker_control:
-        current.add("delegate_task")
+    bridge_names = set()
+    try:
+        from tools import tool_search as _ts
+        defer_tools = _ts.load_config_readonly().effective_defer_tools
+        if any(_ts.is_deferrable_tool_name(name, defer_tools) for name in current):
+            bridge_names = set(_ts.BRIDGE_TOOL_NAMES)
+    except Exception:
+        pass
+    visible_authorized = visible.intersection(current).union(visible.intersection(bridge_names))
     child.tools = [
         item for item in (getattr(child, "tools", None) or [])
-        if item.get("function", {}).get("name") in current
+        if item.get("function", {}).get("name") in visible_authorized
     ]
-    child.valid_tool_names = current
+    child.valid_tool_names = visible_authorized
     child._worker_effective_tool_names = frozenset(current)

@@ -330,7 +330,12 @@ def _profile_policy_snapshot(
             "enabled_routes": [dataclasses.asdict(item) for item in spec.enabled_routes],
         }
     effective_tools = sorted(
-        name for name in (getattr(child, "valid_tool_names", None) or ()) if isinstance(name, str)
+        name for name in (
+            getattr(child, "_worker_effective_tool_names", None)
+            or getattr(child, "_executable_tool_names", None)
+            or getattr(child, "valid_tool_names", None)
+            or ()
+        ) if isinstance(name, str)
     )
     policy = {
         "profile_contract": selected,
@@ -662,7 +667,9 @@ class SubagentLifecycleService:
             run_id=run_id,
         )
         record = _Record(
-            handle, SubagentState.PENDING, created, agent=child, store=store,
+            handle, SubagentState.PENDING, created,
+            agent=child if lease_token is not None or store is None else None,
+            store=store,
             owner_session_id=parent_session_id, worker_id=worker_id, run_id=run_id, lease_token=lease_token,
             max_tool_calls=getattr(creds.get("execution_limits"), "max_tool_calls", None),
             max_concurrent=_concurrency_limit(cfg), goal=request.goal, parent_agent=parent,
@@ -675,6 +682,12 @@ class SubagentLifecycleService:
             self._start_record(record)
         elif store is None:
             record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        else:
+            # A queued run retains identity and policy, never a pre-authorized
+            # live agent.  It is rebuilt from current authority immediately
+            # before its exact lease is claimed.
+            with contextlib.suppress(Exception):
+                child.close()
         return handle
 
     def status(self, handle: SubagentHandle) -> SubagentStatus:
@@ -693,15 +706,36 @@ class SubagentLifecycleService:
             durable = self._durable_snapshot(handle)
             if durable is None:
                 return SubagentTerminalState(handle, SubagentState.UNKNOWN, True, diagnostic="UNKNOWN_HANDLE")
-            store, _worker, run = durable
+            store, worker, run = durable
             if run["status"] == "RUNNING" and run.get("lease_expires_at", 0) <= time.time():
-                store.recover_expired_runs(handle.parent_session_id)
+                store.recover_expired_runs(handle.parent_session_id, [worker["worker_id"]])
                 run = store.get_run(handle.run_id, handle.parent_session_id)
+            if run["status"] == "PENDING":
+                self._schedule_owner(
+                    store, handle.parent_session_id, self._parent_agent_resolver(),
+                    worker_id=worker["worker_id"], run_id=run["run_id"],
+                )
+                deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+                while run["status"] in {"PENDING", "RUNNING"}:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+                    run = store.get_run(handle.run_id, handle.parent_session_id)
             state = SubagentState(run["status"])
             completed = state in {
                 SubagentState.SUCCEEDED, SubagentState.FAILED, SubagentState.INTERRUPTED, SubagentState.CANCELLED,
             }
             return SubagentTerminalState(handle, state, completed, diagnostic="DURABLE_SNAPSHOT")
+        if (
+            record.state is SubagentState.PENDING
+            and record.future is None
+            and record.store is not None
+            and record.owner_session_id
+        ):
+            self._schedule_owner(
+                record.store, record.owner_session_id, self._parent_agent_resolver(),
+                worker_id=record.worker_id, run_id=record.run_id,
+            )
         deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
         while record.result is None:
             future = record.future
@@ -845,14 +879,7 @@ class SubagentLifecycleService:
         store = _persistent_store(parent) if parent is not None else None
         if store is None or not owner:
             raise SubagentLifecycleError("Durable worker state is unavailable for this session.")
-        store.recover_expired_runs(owner)
         normalized = action.strip().lower()
-        # Cancellation and operator decisions must observe the durable queue
-        # before any restart scheduler can claim it. Read-only inspect and
-        # mailbox actions likewise do not need to cause execution as a side
-        # effect. Status/wait/completions/resume remain scheduler entrypoints.
-        if normalized not in {"cancel", "reconcile", "ack", "inspect", "message"}:
-            self._schedule_owner(store, owner, parent)
         actor_worker_id = getattr(parent, "_worker_id", None)
         from tools.delegate_tool_config import _load_config
         cfg = _load_config()
@@ -871,6 +898,8 @@ class SubagentLifecycleService:
                 store, owner, actor_worker_id, worker, message_only=False, allow_siblings=allow_siblings
             ):
                 raise PermissionError("Worker control target is outside the actor's owned subtree.")
+            store.recover_expired_runs(owner, [worker_id])
+            worker = store.get_worker(worker_id, owner)
             return self._safe_worker_snapshot(store, worker, owner)
         if normalized == "completions":
             pending = store.pending_completions(owner)
@@ -896,6 +925,8 @@ class SubagentLifecycleService:
             message_only=message_action, allow_siblings=allow_siblings,
         ):
             raise PermissionError("Worker control target is outside the actor's authorized relation.")
+        store.recover_expired_runs(owner, [worker_id])
+        worker = store.get_worker(worker_id, owner)
         runs = store.list_runs(worker_id, owner)
         selected = next((item for item in runs if item["run_id"] == run_id), None) if run_id else (runs[-1] if runs else None)
         if normalized == "message":
@@ -928,6 +959,10 @@ class SubagentLifecycleService:
             return {
                 **self._safe_worker_snapshot(store, worker, owner),
                 "run": self._inspect_run_snapshot(selected),
+                # Explicit inspection is the opt-in transcript surface.  Keep
+                # routine status/results compact and never expose system
+                # prompts, hidden reasoning, or provider/session objects.
+                "conversation": self._inspect_conversation(worker.get("history") or []),
                 "messages": [
                     {
                         key: item.get(key) for key in (
@@ -941,11 +976,15 @@ class SubagentLifecycleService:
             timeout = 0.0 if timeout_seconds is None else float(timeout_seconds)
             if timeout < 0 or timeout > 60:
                 raise SubagentLifecycleError("timeout_seconds must be between 0 and 60.")
+            self._schedule_owner(
+                store, owner, parent, worker_id=worker_id, run_id=selected["run_id"])
+            selected = store.get_run(selected["run_id"], owner)
             deadline = time.monotonic() + timeout
             while selected["status"] in {"PENDING", "RUNNING"} and time.monotonic() < deadline:
                 if selected["status"] == "RUNNING" and selected.get("lease_expires_at", 0) <= time.time():
-                    store.recover_expired_runs(owner)
-                    self._schedule_owner(store, owner)
+                    store.recover_expired_runs(owner, [worker_id])
+                    self._schedule_owner(
+                        store, owner, parent, worker_id=worker_id, run_id=selected["run_id"])
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
                 selected = store.get_run(selected["run_id"], owner)
             return self._safe_run_snapshot(selected)
@@ -1064,6 +1103,38 @@ class SubagentLifecycleService:
             } if result else None,
         }
 
+    @staticmethod
+    def _inspect_conversation(history: list) -> list[Mapping[str, Any]]:
+        visible = []
+        for item in history:
+            if not isinstance(item, Mapping):
+                continue
+            role = str(item.get("role") or "")
+            if role not in {"user", "assistant", "tool"}:
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if not isinstance(block, Mapping):
+                        continue
+                    if block.get("type") not in {"text", "input_text", "output_text"}:
+                        continue
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                content = "\n".join(parts)
+            if not isinstance(content, str):
+                content = ""
+            entry = {"role": role, "content": _clip(content)}
+            if role == "tool":
+                for key in ("name", "tool_call_id"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value:
+                        entry[key] = value
+            visible.append(entry)
+        return visible
+
     @classmethod
     def _safe_worker_snapshot(cls, store: Any, worker: Mapping[str, Any], owner: str) -> Mapping[str, Any]:
         runs = store.list_runs(worker["worker_id"], owner)
@@ -1120,62 +1191,65 @@ class SubagentLifecycleService:
     def _launch_existing_worker(
         self, request: SubagentLaunchRequest, prior: SubagentHandle, worker: Mapping[str, Any], previous: Mapping[str, Any],
     ) -> SubagentHandle:
-        """Validate and queue one retained turn; an active predecessor starts it FIFO on completion."""
+        """Validate and queue one retained turn behind the exact durable FIFO."""
         parent = self._parent_agent_resolver()
         owner = _owner_session_id_of(parent)
         store = _persistent_store(parent)
         if store is None or not owner:
             raise SubagentLifecycleError("Durable resume is unavailable for this session.")
-        store.recover_expired_runs(owner)
+        store.recover_expired_runs(owner, [worker["worker_id"]])
         worker = store.get_worker(worker["worker_id"], owner)
         if worker["uncertain_side_effect"]:
             raise SubagentLifecycleError(
                 "The prior run stopped with an uncertain tool side effect; reconcile it before resume.")
-        child, creds, cfg, stored_policy = self._build_revalidated_child(
-            worker, goal=request.goal, role=request.role)
         runs = store.list_runs(worker["worker_id"], owner)
         if not runs or runs[-1]["run_id"] != previous["run_id"]:
-            with contextlib.suppress(Exception):
-                child.close()
             raise SubagentLifecycleError("Followup must link from the worker's latest run.")
+        # A cold public handle may point at a queued predecessor.  Rehydrate
+        # that exact run before appending another turn; no unrelated control
+        # action is required to start the older FIFO item.
+        if previous["status"] == "PENDING":
+            self._schedule_owner(
+                store, owner, parent,
+                worker_id=worker["worker_id"], run_id=previous["run_id"],
+            )
+        authority = self._retained_parent_authority(store, owner, worker, parent)
+        if authority is None:
+            raise SubagentLifecycleError(
+                "The retained worker's parent authority is unavailable; its queued work remains pending.")
+        validation_service = type(self)(lambda: authority)
+        child, _creds, cfg, stored_policy = validation_service._build_revalidated_child(
+            worker, goal=request.goal, role=request.role)
+        with contextlib.suppress(Exception):
+            child.close()
         followup_limit = ((stored_policy.get("profile_contract") or {}).get("execution_limits") or {}).get("max_followups")
         if isinstance(followup_limit, int) and len(runs) - 1 >= followup_limit:
-            with contextlib.suppress(Exception):
-                child.close()
             raise SubagentLifecycleError("Worker followup limit reached.")
         created = time.time()
-        subagent_id = str(getattr(child, "_subagent_id", "") or "")
+        subagent_id = f"queued-{uuid.uuid4().hex}"
         capability = self._capability(subagent_id, owner, created)
         queued = store.enqueue_run(
             worker["worker_id"], owner, goal=request.goal, previous_run_id=previous["run_id"],
             capability_digest=hashlib.sha256(capability.encode()).hexdigest(),
         )
         max_concurrent = _concurrency_limit(cfg)
-        active = store.claim_run(queued["run_id"], owner, max_concurrent=max_concurrent)
-        active_run = active if active is not None else None
-        child._worker_id, child._worker_run_id = worker["worker_id"], queued["run_id"]
-        child._worker_owner_session_id = owner
         result_handle = dataclasses.replace(
             prior,
             subagent_id=subagent_id,
             created_at=created,
-            provider=_text_or_none(getattr(child, "provider", None)),
-            model=_text_or_none(getattr(child, "model", None)),
             capability=capability,
             run_id=queued["run_id"],
         )
         record = _Record(
-            result_handle, SubagentState.PENDING, created, agent=child, store=store,
+            result_handle, SubagentState.PENDING, created, agent=None, store=store,
             owner_session_id=owner, worker_id=worker["worker_id"], run_id=queued["run_id"],
-            lease_token=active_run["lease_token"] if active_run else None,
             conversation_history=list(worker.get("history") or []),
-            max_tool_calls=getattr(creds.get("execution_limits"), "max_tool_calls", None),
             max_concurrent=max_concurrent, goal=request.goal, parent_agent=parent,
         )
         with _REGISTRY.lock:
             _REGISTRY.records[subagent_id] = record
-        if active_run is not None:
-            self._start_record(record)
+        self._schedule_owner(
+            store, owner, parent, worker_id=worker["worker_id"], run_id=queued["run_id"])
         return result_handle
 
     def _build_revalidated_child(
@@ -1267,34 +1341,76 @@ class SubagentLifecycleService:
         cls._schedule_owner(completed.store, completed.owner_session_id, completed.parent_agent)
 
     @classmethod
-    def _schedule_owner(cls, store: Any, owner_session_id: str, parent_agent: Any = None) -> None:
-        # A process restart loses registry records, not the durable FIFO. Claim
-        # each exact eligible run, revalidate current authority, then rebuild
-        # its executor. A validation failure is terminal and inspectable rather
-        # than a permanently leased or silently skipped run.
-        if parent_agent is not None:
+    def _retained_parent_authority(
+        cls, store: Any, owner_session_id: str,
+        worker: Mapping[str, Any], triggering_agent: Any = None,
+    ) -> Any:
+        """Resolve the worker's immediate retained parent, never a sibling actor."""
+        expected = worker.get("parent_worker_id")
+
+        def matches(agent: Any) -> bool:
+            if agent is None or _owner_session_id_of(agent) != owner_session_id:
+                return False
+            actor = getattr(agent, "_worker_id", None)
+            return actor == expected if expected else not actor
+
+        if matches(triggering_agent):
+            return triggering_agent
+        with _REGISTRY.lock:
+            records = list(_REGISTRY.records.values())
+        # A warm record remembers the authority that created it.
+        for record in records:
+            if record.owner_session_id == owner_session_id and record.worker_id == worker["worker_id"]:
+                if matches(record.parent_agent):
+                    return record.parent_agent
+        # For a nested worker the immediate parent worker's live agent is its
+        # authority.  Its root owner identity remains separate in storage.
+        if expected:
+            for record in records:
+                if record.owner_session_id == owner_session_id and record.worker_id == expected:
+                    if matches(record.agent):
+                        return record.agent
+        return None
+
+    @classmethod
+    def _schedule_owner(
+        cls, store: Any, owner_session_id: str, parent_agent: Any = None,
+        *, worker_id: Optional[str] = None, run_id: Optional[str] = None,
+    ) -> None:
+        """Just-in-time admission for the exact durable FIFO run(s)."""
+        from tools.delegate_tool_config import _load_config
+
+        max_concurrent = _concurrency_limit(_load_config())
+        for pending in store.pending_runs(owner_session_id):
+            if worker_id is not None and pending["worker_id"] != worker_id:
+                continue
+            if run_id is not None and pending["run_id"] != run_id:
+                continue
+            worker = store.get_worker(pending["worker_id"], owner_session_id)
+            authority = cls._retained_parent_authority(
+                store, owner_session_id, worker, parent_agent)
+            if authority is None:
+                continue
             with _REGISTRY.lock:
-                represented = {
-                    item.run_id for item in _REGISTRY.records.values()
-                    if item.owner_session_id == owner_session_id and item.run_id
-                }
-            from tools.delegate_tool_config import _load_config
-            max_concurrent = _concurrency_limit(_load_config())
-            service = cls(lambda: parent_agent)
-            for pending in store.pending_runs(owner_session_id):
-                if pending["run_id"] in represented:
-                    continue
+                record = next((
+                    item for item in _REGISTRY.records.values()
+                    if item.owner_session_id == owner_session_id
+                    and item.run_id == pending["run_id"]
+                ), None)
+            # A live lease already owns execution.  Every unleased record,
+            # including an old warm/prebuilt record, is rebuilt below.
+            if record is not None and record.lease_token is not None:
+                continue
+            role = str((worker.get("policy") or {}).get("role") or "leaf")
+            service = cls(lambda authority=authority: authority)
+            try:
+                child, creds, cfg, _policy = service._build_revalidated_child(
+                    worker, goal=pending["goal"], role=role)
+            except Exception as exc:
                 claimed = store.claim_run(
                     pending["run_id"], owner_session_id, max_concurrent=max_concurrent)
-                if claimed is None:
-                    continue
-                worker = store.get_worker(pending["worker_id"], owner_session_id)
-                role = str((worker.get("policy") or {}).get("role") or "leaf")
-                try:
-                    child, creds, _cfg, _policy = service._build_revalidated_child(
-                        worker, goal=pending["goal"], role=role)
-                except Exception as exc:
-                    store.finish_run(
+                if claimed is not None:
+                    failed = store.finish_run(
                         pending["run_id"], owner_session_id, claimed["lease_token"],
                         status="FAILED",
                         result={
@@ -1306,12 +1422,33 @@ class SubagentLifecycleService:
                         },
                         history=list(worker.get("history") or []),
                     )
-                    continue
-                child._worker_id = pending["worker_id"]
-                child._worker_run_id = pending["run_id"]
-                child._worker_owner_session_id = owner_session_id
-                created = time.time()
-                subagent_id = str(getattr(child, "_subagent_id", "") or f"recovered-{pending['run_id']}")
+                if record is not None and claimed is not None:
+                    with _REGISTRY.lock:
+                        _REGISTRY.records.pop(record.handle.subagent_id, None)
+                        record.agent = None
+                        record.state = SubagentState.FAILED
+                        record.completed_at = record.updated_at = failed["updated_at"]
+                        record.result = SubagentResult(
+                            record.handle, SubagentState.FAILED, True,
+                            completed_at=record.completed_at,
+                            error_classification="AUTHORITY_REVALIDATION_FAILED",
+                            error_message=_clip(exc),
+                        )
+                continue
+            max_concurrent = _concurrency_limit(cfg)
+            claimed = store.claim_run(
+                pending["run_id"], owner_session_id, max_concurrent=max_concurrent)
+            if claimed is None:
+                with contextlib.suppress(Exception):
+                    child.close()
+                continue
+            child._worker_id = pending["worker_id"]
+            child._worker_run_id = pending["run_id"]
+            child._worker_owner_session_id = owner_session_id
+            created = time.time()
+            if record is None:
+                subagent_id = str(
+                    getattr(child, "_subagent_id", "") or f"recovered-{pending['run_id']}")
                 handle = SubagentHandle(
                     PUBLIC_CONTRACT_VERSION, subagent_id, owner_session_id, None, created,
                     _text_or_none(getattr(child, "provider", None)),
@@ -1319,39 +1456,26 @@ class SubagentLifecycleService:
                     pending["worker_id"], pending["run_id"],
                 )
                 record = _Record(
-                    handle, SubagentState.PENDING, created, agent=child, store=store,
+                    handle, SubagentState.PENDING, created, store=store,
                     owner_session_id=owner_session_id, worker_id=pending["worker_id"],
-                    run_id=pending["run_id"], lease_token=claimed["lease_token"],
-                    conversation_history=list(worker.get("history") or []),
-                    max_tool_calls=getattr(creds.get("execution_limits"), "max_tool_calls", None),
-                    max_concurrent=max_concurrent, goal=pending["goal"], parent_agent=parent_agent,
+                    run_id=pending["run_id"], conversation_history=list(worker.get("history") or []),
+                    goal=pending["goal"],
                 )
                 with _REGISTRY.lock:
                     _REGISTRY.records[subagent_id] = record
-                represented.add(pending["run_id"])
-                cls._start_record(record)
-
-        with _REGISTRY.lock:
-            candidates = sorted(
-                (
-                    item for item in _REGISTRY.records.values()
-                    if item.owner_session_id == owner_session_id
-                    and item.state is SubagentState.PENDING
-                    and item.lease_token is None
-                    and item.agent is not None
-                ),
-                key=lambda item: item.updated_at,
-            )
-        for candidate in candidates:
-            active = candidate.store.claim_run(
-                candidate.run_id,
-                candidate.owner_session_id,
-                max_concurrent=candidate.max_concurrent,
-            )
-            if active is None:
-                continue
-            candidate.lease_token = active["lease_token"]
-            cls._start_record(candidate)
+            else:
+                old_agent = record.agent
+                if old_agent is not None and old_agent is not child:
+                    with contextlib.suppress(Exception):
+                        old_agent.close()
+                child._subagent_id = record.handle.subagent_id
+            record.agent = child
+            record.parent_agent = authority
+            record.lease_token = claimed["lease_token"]
+            record.max_tool_calls = getattr(creds.get("execution_limits"), "max_tool_calls", None)
+            record.max_concurrent = max_concurrent
+            record.goal = pending["goal"]
+            cls._start_record(record)
 
     @staticmethod
     def _bind_tool_boundary(record: _Record) -> None:

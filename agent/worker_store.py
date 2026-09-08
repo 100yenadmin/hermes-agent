@@ -441,11 +441,19 @@ class WorkerStore:
             self._ack_message(conn, self._lease(conn, run_id, owner_session_id, lease_token), message_id)
         self.db._execute_write(ack)
 
-    def recover_expired_runs(self, owner_session_id):
+    def recover_expired_runs(self, owner_session_id, worker_ids=None):
+        worker_ids = tuple(dict.fromkeys(worker_ids or ()))
         def recover(conn):
+            params = [owner_session_id, time.time()]
+            scope = ""
+            if worker_ids:
+                for worker_id in worker_ids:
+                    self._worker(conn, worker_id, owner_session_id)
+                scope = f" AND r.worker_id IN ({','.join('?' for _ in worker_ids)})"
+                params.extend(worker_ids)
             expired = conn.execute("""SELECT r.run_id FROM orchestration_runs r JOIN orchestration_workers w
-                ON r.worker_id=w.worker_id WHERE w.owner_session_id=? AND r.status='RUNNING' AND r.lease_expires_at<=?""",
-                (owner_session_id, time.time())).fetchall()
+                ON r.worker_id=w.worker_id WHERE w.owner_session_id=? AND r.status='RUNNING'
+                AND r.lease_expires_at<=?""" + scope, params).fetchall()
             for row in expired:
                 run = self._run(conn, row[0], owner_session_id)
                 uncertain = int(run["tool_inflight"])
