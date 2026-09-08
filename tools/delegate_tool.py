@@ -390,11 +390,17 @@ def _build_child_agent(
     def _parent_message_sink(content: str) -> Dict[str, Any]:
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Message must be nonempty text")
-        item = {
+        from agent.subagent_lifecycle import queue_worker_parent_message
+        durable = queue_worker_parent_message(child, content)
+        item = ({
+            "message_id": durable["message_id"],
+            "status": durable["status"],
+            "content": content,
+        } if durable is not None else {
             "message_id": "message-" + _uuid.uuid4().hex,
             "status": "DELIVERED_ON_COMPLETION",
             "content": content,
-        }
+        })
         child._delegate_outbound_messages.append(item)
         return item
 

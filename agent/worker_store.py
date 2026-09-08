@@ -26,6 +26,7 @@ _SCHEMA = (
         request_id TEXT NOT NULL, previous_run_id TEXT,
         goal TEXT NOT NULL, context TEXT NOT NULL, status TEXT NOT NULL,
         capability_digest TEXT NOT NULL DEFAULT '',
+        budget_epoch_id TEXT,
         lease_token TEXT, lease_expires_at REAL, tool_inflight INTEGER NOT NULL DEFAULT 0,
         tool_inflight_count INTEGER NOT NULL DEFAULT 0,
         uncertain_side_effect INTEGER NOT NULL DEFAULT 0, result TEXT,
@@ -44,14 +45,38 @@ _SCHEMA = (
         tool_call_id TEXT NOT NULL, status TEXT NOT NULL,
         admitted_at REAL NOT NULL, settled_at REAL,
         PRIMARY KEY(run_id, tool_call_id))""",
+    """CREATE TABLE IF NOT EXISTS orchestration_budget_epochs (
+        budget_epoch_id TEXT PRIMARY KEY, owner_session_id TEXT NOT NULL,
+        root_worker_id TEXT NOT NULL, max_iterations INTEGER, used_iterations INTEGER NOT NULL DEFAULT 0,
+        max_tool_calls INTEGER, used_tool_calls INTEGER NOT NULL DEFAULT 0,
+        deadline_at REAL, created_at REAL NOT NULL, updated_at REAL NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS orchestration_budget_scopes (
+        budget_epoch_id TEXT NOT NULL REFERENCES orchestration_budget_epochs(budget_epoch_id),
+        worker_id TEXT NOT NULL REFERENCES orchestration_workers(worker_id),
+        max_iterations INTEGER, used_iterations INTEGER NOT NULL DEFAULT 0,
+        max_tool_calls INTEGER, used_tool_calls INTEGER NOT NULL DEFAULT 0,
+        deadline_at REAL, PRIMARY KEY(budget_epoch_id,worker_id))""",
+    """CREATE TABLE IF NOT EXISTS orchestration_parent_messages (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT UNIQUE NOT NULL,
+        owner_session_id TEXT NOT NULL, worker_id TEXT NOT NULL REFERENCES orchestration_workers(worker_id),
+        run_id TEXT NOT NULL REFERENCES orchestration_runs(run_id), content TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'QUEUED', created_at REAL NOT NULL,
+        published_at REAL, acknowledged_at REAL)""",
     "CREATE INDEX IF NOT EXISTS orchestration_owner ON orchestration_workers(owner_session_id)",
     "CREATE INDEX IF NOT EXISTS orchestration_queue ON orchestration_runs(worker_id, status, sequence)",
     "CREATE INDEX IF NOT EXISTS orchestration_mailbox ON orchestration_messages(worker_id, status, sequence)",
     "CREATE INDEX IF NOT EXISTS orchestration_tool_effect_state ON orchestration_tool_effects(run_id, status)",
+    "CREATE INDEX IF NOT EXISTS orchestration_parent_outbox ON orchestration_parent_messages(owner_session_id,status,sequence)",
 )
 _JSON_FIELDS = {"policy", "history", "result"}
 _SECRET_KEYS = {"api_key", "access_token", "refresh_token", "token", "password", "authorization", "cookie", "credentials"}
 _TERMINAL = {"SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED"}
+
+
+class WorkerBudgetExceeded(ValueError):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason.replace("_", " "))
 
 
 def _row(row):
@@ -100,6 +125,8 @@ class WorkerStore:
             if "capability_digest" not in run_columns:
                 conn.execute(
                     "ALTER TABLE orchestration_runs ADD COLUMN capability_digest TEXT NOT NULL DEFAULT ''")
+            if "budget_epoch_id" not in run_columns:
+                conn.execute("ALTER TABLE orchestration_runs ADD COLUMN budget_epoch_id TEXT")
             # Older boolean/count checkpoints have no call identity. Preserve
             # them as explicit unknown effects so recovery stays fail-closed.
             legacy = conn.execute("""SELECT run_id,tool_inflight_count FROM orchestration_runs r
@@ -197,7 +224,7 @@ class WorkerStore:
 
     def enqueue_run(
         self, worker_id, owner_session_id, *, goal, context="", request_id=None,
-        previous_run_id=None, capability_digest="",
+        previous_run_id=None, capability_digest="", budget_epoch_id=None, budget_limits=None,
     ):
         if not isinstance(goal, str) or not goal.strip() or not isinstance(context, str):
             raise ValueError("A run needs a nonempty goal and text context")
@@ -223,14 +250,116 @@ class WorkerStore:
                 if previous["worker_id"] != worker_id or not latest or latest[0] != previous_run_id:
                     raise ValueError("Followup must link to this worker's latest run")
             now = time.time()
+            epoch_id = budget_epoch_id
+            if budget_limits is not None:
+                limits = self._normalize_budget_limits(budget_limits)
+                if epoch_id is None:
+                    if worker["parent_worker_id"] is not None:
+                        raise ValueError("A nested worker must inherit its parent budget epoch")
+                    epoch_id = "budget-" + uuid.uuid4().hex
+                    deadline = now + limits["timeout_seconds"] if limits["timeout_seconds"] else None
+                    conn.execute("""INSERT INTO orchestration_budget_epochs
+                        (budget_epoch_id,owner_session_id,root_worker_id,max_iterations,max_tool_calls,
+                         deadline_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)""",
+                        (epoch_id, owner_session_id, worker["root_worker_id"], limits["max_iterations"],
+                         limits["max_tool_calls"], deadline, now, now))
+                epoch = self._budget_epoch(conn, epoch_id, owner_session_id)
+                if epoch["root_worker_id"] != worker["root_worker_id"]:
+                    raise PermissionError("Budget epoch belongs to another worker tree")
+                parent_deadline = epoch["deadline_at"]
+                if worker["parent_worker_id"]:
+                    parent_scope = conn.execute("""SELECT deadline_at FROM orchestration_budget_scopes
+                        WHERE budget_epoch_id=? AND worker_id=?""",
+                        (epoch_id, worker["parent_worker_id"])).fetchone()
+                    if parent_scope is None:
+                        raise ValueError("Parent budget scope is unavailable")
+                    parent_deadline = parent_scope[0]
+                local_deadline = now + limits["timeout_seconds"] if limits["timeout_seconds"] else None
+                deadline = min(v for v in (parent_deadline, local_deadline) if v is not None) \
+                    if parent_deadline is not None or local_deadline is not None else None
+                conn.execute("""INSERT OR IGNORE INTO orchestration_budget_scopes
+                    (budget_epoch_id,worker_id,max_iterations,max_tool_calls,deadline_at)
+                    VALUES (?,?,?,?,?)""", (epoch_id, worker_id, limits["max_iterations"],
+                                              limits["max_tool_calls"], deadline))
             conn.execute("""INSERT INTO orchestration_runs
                 (run_id,worker_id,request_id,previous_run_id,goal,context,status,
-                 capability_digest,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,'PENDING',?,?,?)""",
+                 capability_digest,budget_epoch_id,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,'PENDING',?,?,?,?)""",
                 (run_id, worker_id, request_id, previous_run_id, goal, context,
-                 capability_digest, now, now))
+                 capability_digest, epoch_id, now, now))
             return self._run(conn, run_id, owner_session_id)
         return self.db._execute_write(enqueue)
+
+    @staticmethod
+    def _normalize_budget_limits(value):
+        if not isinstance(value, dict):
+            raise ValueError("budget_limits must be a mapping")
+        result = {}
+        for name in ("max_iterations", "max_tool_calls"):
+            item = value.get(name)
+            if item is not None and (isinstance(item, bool) or not isinstance(item, int) or item < 0):
+                raise ValueError(f"{name} must be a nonnegative integer or null")
+            result[name] = item
+        timeout = value.get("timeout_seconds")
+        if timeout is not None:
+            _positive(timeout, "timeout_seconds")
+        result["timeout_seconds"] = timeout
+        return result
+
+    @staticmethod
+    def _budget_epoch(conn, budget_epoch_id, owner_session_id):
+        row = conn.execute("SELECT * FROM orchestration_budget_epochs WHERE budget_epoch_id=?",
+                           (budget_epoch_id,)).fetchone()
+        if row is None or row["owner_session_id"] != owner_session_id:
+            raise PermissionError("Unknown budget epoch or foreign owner")
+        return dict(row)
+
+    @classmethod
+    def _reserve_budget(cls, conn, run, owner_session_id, kind):
+        epoch_id = run.get("budget_epoch_id")
+        if not epoch_id:
+            return
+        epoch = cls._budget_epoch(conn, epoch_id, owner_session_id)
+        worker = cls._worker(conn, run["worker_id"], owner_session_id)
+        scopes = []
+        cursor = worker
+        while cursor is not None:
+            scope = conn.execute("""SELECT * FROM orchestration_budget_scopes
+                WHERE budget_epoch_id=? AND worker_id=?""", (epoch_id, cursor["worker_id"])).fetchone()
+            if scope is None:
+                raise PermissionError("Worker budget scope is unavailable")
+            scopes.append(dict(scope))
+            cursor = cls._worker(conn, cursor["parent_worker_id"], owner_session_id) \
+                if cursor["parent_worker_id"] else None
+        now = time.time()
+        deadlines = [item["deadline_at"] for item in [epoch, *scopes] if item["deadline_at"] is not None]
+        if deadlines and now >= min(deadlines):
+            raise WorkerBudgetExceeded("tree_deadline_exhausted")
+        max_key, used_key = f"max_{kind}s", f"used_{kind}s"
+        for item in [epoch, *scopes]:
+            if item[max_key] is not None and item[used_key] >= item[max_key]:
+                raise WorkerBudgetExceeded(f"tree_{kind}_budget_exhausted")
+        conn.execute(f"UPDATE orchestration_budget_epochs SET {used_key}={used_key}+1,updated_at=? WHERE budget_epoch_id=?",
+                     (now, epoch_id))
+        for scope in scopes:
+            conn.execute(f"UPDATE orchestration_budget_scopes SET {used_key}={used_key}+1 WHERE budget_epoch_id=? AND worker_id=?",
+                         (epoch_id, scope["worker_id"]))
+
+    def reserve_iteration(self, run_id, owner_session_id, lease_token):
+        def reserve(conn):
+            run = self._lease(conn, run_id, owner_session_id, lease_token)
+            self._reserve_budget(conn, run, owner_session_id, "iteration")
+        self.db._execute_write(reserve)
+
+    def budget_snapshot(self, run_id, owner_session_id):
+        with self.db._read_ctx() as conn:
+            run = self._run(conn, run_id, owner_session_id)
+            if not run.get("budget_epoch_id"):
+                return None
+            epoch = self._budget_epoch(conn, run["budget_epoch_id"], owner_session_id)
+            return {key: epoch[key] for key in (
+                "budget_epoch_id", "root_worker_id", "max_iterations", "used_iterations",
+                "max_tool_calls", "used_tool_calls", "deadline_at")}
 
     def claim_next_run(self, worker_id, owner_session_id, *, lease_seconds=60, max_concurrent=10):
         _positive(lease_seconds, "lease_seconds")
@@ -327,11 +456,12 @@ class WorkerStore:
         if not isinstance(tool_call_id, str) or not tool_call_id:
             raise ValueError("tool_call_id must be nonempty text")
         def mark(conn):
-            self._lease(conn, run_id, owner_session_id, lease_token)
+            run = self._lease(conn, run_id, owner_session_id, lease_token)
             existing = conn.execute("""SELECT status FROM orchestration_tool_effects
                 WHERE run_id=? AND tool_call_id=?""", (run_id, tool_call_id)).fetchone()
             if existing is not None:
                 raise ValueError("Tool call was already admitted; refusing duplicate execution")
+            self._reserve_budget(conn, run, owner_session_id, "tool_call")
             now = time.time()
             conn.execute("""INSERT INTO orchestration_tool_effects
                 (run_id,tool_call_id,status,admitted_at) VALUES (?,?,'INFLIGHT',?)""",
@@ -383,11 +513,18 @@ class WorkerStore:
     ):
         if status not in _TERMINAL:
             raise ValueError("Invalid terminal run status")
-        result_json = _policy_json(result)
         def finish(conn):
             run = self._lease(conn, run_id, owner_session_id, lease_token)
             now = time.time()
             uncertain = bool(run["tool_inflight"])
+            parent_messages = [dict(row) for row in conn.execute("""SELECT message_id,content
+                FROM orchestration_parent_messages WHERE run_id=? AND status='QUEUED' ORDER BY sequence""",
+                (run_id,))]
+            stored_result = dict(result)
+            if parent_messages:
+                stored_result["messages_to_parent"] = [
+                    {**item, "status": "PUBLISHED"} for item in parent_messages]
+            result_json = _policy_json(stored_result)
             conn.execute("""UPDATE orchestration_runs SET status=?,result=?,uncertain_side_effect=?,
                 lease_token=NULL,lease_expires_at=NULL,updated_at=? WHERE run_id=?""",
                 (status, result_json, int(uncertain), now, run_id))
@@ -396,8 +533,32 @@ class WorkerStore:
                 conn.execute("UPDATE orchestration_workers SET history=? WHERE worker_id=?", (json.dumps(history, allow_nan=False), run["worker_id"]))
             for message_id in delivered_message_ids:
                 self._ack_message(conn, run, message_id)
+            conn.execute("""UPDATE orchestration_parent_messages SET status='PUBLISHED',published_at=?
+                WHERE run_id=? AND status='QUEUED'""", (now, run_id))
             return self._run(conn, run_id, owner_session_id)
         return self.db._execute_write(finish)
+
+    def enqueue_parent_message(self, run_id, owner_session_id, content, *, message_id=None):
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Message must be nonempty text")
+        message_id = message_id or "message-" + uuid.uuid4().hex
+        def enqueue(conn):
+            run = self._run(conn, run_id, owner_session_id)
+            if run["status"] != "RUNNING":
+                raise ValueError("Parent messages require an active worker run")
+            conn.execute("""INSERT INTO orchestration_parent_messages
+                (message_id,owner_session_id,worker_id,run_id,content,created_at)
+                VALUES (?,?,?,?,?,?)""",
+                (message_id, owner_session_id, run["worker_id"], run_id, content, time.time()))
+            return dict(conn.execute("SELECT * FROM orchestration_parent_messages WHERE message_id=?",
+                                     (message_id,)).fetchone())
+        return self.db._execute_write(enqueue)
+
+    def list_parent_messages(self, run_id, owner_session_id):
+        with self.db._read_ctx() as conn:
+            self._run(conn, run_id, owner_session_id)
+            return [dict(row) for row in conn.execute("""SELECT * FROM orchestration_parent_messages
+                WHERE run_id=? ORDER BY sequence""", (run_id,))]
 
     def enqueue_message(self, worker_id, owner_session_id, content, *, message_id=None, sender_id=None):
         if not isinstance(content, str) or not content.strip():
@@ -457,9 +618,18 @@ class WorkerStore:
             for row in expired:
                 run = self._run(conn, row[0], owner_session_id)
                 uncertain = int(run["tool_inflight"])
+                parent_messages = [dict(item) for item in conn.execute("""SELECT message_id,content
+                    FROM orchestration_parent_messages WHERE run_id=? AND status='QUEUED' ORDER BY sequence""",
+                    (row[0],))]
+                result = {"reason": "execution_lease_expired", "uncertain_side_effect": bool(uncertain)}
+                if parent_messages:
+                    result["messages_to_parent"] = [
+                        {**item, "status": "PUBLISHED"} for item in parent_messages]
                 conn.execute("""UPDATE orchestration_runs SET status='INTERRUPTED',uncertain_side_effect=?,
                     lease_token=NULL,lease_expires_at=NULL,result=?,updated_at=? WHERE run_id=?""",
-                    (uncertain, json.dumps({"reason": "execution_lease_expired", "uncertain_side_effect": bool(uncertain)}), time.time(), row[0]))
+                    (uncertain, _policy_json(result), time.time(), row[0]))
+                conn.execute("""UPDATE orchestration_parent_messages SET status='PUBLISHED',published_at=?
+                    WHERE run_id=? AND status='QUEUED'""", (time.time(), row[0]))
                 conn.execute("UPDATE orchestration_workers SET uncertain_side_effect=?,updated_at=? WHERE worker_id=?", (uncertain, time.time(), run["worker_id"]))
             return [self._run(conn, r[0], owner_session_id) for r in expired]
         return self.db._execute_write(recover)
@@ -531,5 +701,8 @@ class WorkerStore:
             run = self._run(conn, run_id, owner_session_id)
             if run["status"] not in _TERMINAL:
                 raise ValueError("A running task has no completion to acknowledge")
+            now = time.time()
             conn.execute("UPDATE orchestration_runs SET completion_ack=1 WHERE run_id=?", (run_id,))
+            conn.execute("""UPDATE orchestration_parent_messages SET status='ACKNOWLEDGED',acknowledged_at=?
+                WHERE run_id=? AND status='PUBLISHED'""", (now, run_id))
         self.db._execute_write(ack)

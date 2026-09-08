@@ -180,6 +180,7 @@ class _Record:
     goal: str = ""
     parent_agent: Any = None
     completion_owner: str = "service"
+    budget_epoch_id: Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -300,6 +301,9 @@ def _session_db_of(parent: Any) -> Any:
 
 
 def _persistent_store(parent: Any) -> Any:
+    retained = getattr(parent, "_worker_lifecycle_record", None)
+    if isinstance(retained, _Record) and retained.store is not None:
+        return retained.store
     db = _session_db_of(parent)
     if db is None or not hasattr(db, "_execute_write") or not hasattr(db, "_read_ctx"):
         return None
@@ -372,6 +376,54 @@ def _iteration_limit(cfg: Mapping[str, Any], creds: Mapping[str, Any], default: 
     return min(global_limit, profile_limit) if isinstance(profile_limit, int) else global_limit
 
 
+def _tree_budget_limits(cfg: Mapping[str, Any], creds: Mapping[str, Any], default: int) -> dict[str, Any]:
+    limits = creds.get("execution_limits")
+    profile_timeout = getattr(limits, "timeout_seconds", None)
+    from tools.delegate_tool_config import _get_child_timeout
+    global_timeout = _get_child_timeout()
+    timeout = min(value for value in (global_timeout, profile_timeout) if value is not None) \
+        if global_timeout is not None or profile_timeout is not None else None
+    return {
+        "max_iterations": _iteration_limit(cfg, creds, default),
+        "max_tool_calls": getattr(limits, "max_tool_calls", None),
+        "timeout_seconds": timeout,
+    }
+
+
+def _parent_budget_epoch(parent: Any) -> Optional[str]:
+    record = getattr(parent, "_worker_lifecycle_record", None)
+    return record.budget_epoch_id if isinstance(record, _Record) else None
+
+
+def _attach_tree_budget(record: _Record) -> None:
+    if record.agent is None or record.store is None or not record.budget_epoch_id:
+        return
+    record.agent._worker_budget_epoch_id = record.budget_epoch_id
+    snapshot = record.store.budget_snapshot(record.run_id, record.owner_session_id)
+    if not snapshot or snapshot.get("deadline_at") is None:
+        return
+    remaining = max(0.001, float(snapshot["deadline_at"]) - time.time())
+    current = getattr(record.agent, "_worker_timeout_seconds", None)
+    record.agent._worker_timeout_seconds = min(current, remaining) \
+        if isinstance(current, (int, float)) and current > 0 else remaining
+
+
+def before_worker_provider_attempt(agent: Any) -> None:
+    """Reserve one durable tree iteration immediately before provider transport."""
+    record = getattr(agent, "_worker_lifecycle_record", None)
+    if not isinstance(record, _Record) or record.store is None or not record.budget_epoch_id:
+        return
+    try:
+        record.store.reserve_iteration(record.run_id, record.owner_session_id, record.lease_token)
+    except Exception as exc:
+        from agent.worker_store import WorkerBudgetExceeded
+        if not isinstance(exc, WorkerBudgetExceeded):
+            raise
+        agent._worker_budget_termination_reason = exc.reason
+        request_hard_interrupt(agent, exc.reason.replace("_", " "), tool_reason=exc.reason)
+        raise InterruptedError(exc.reason) from exc
+
+
 def before_worker_tool(agent: Any, tool_call_id: str) -> None:
     """Fail-closed durable boundary immediately before a worker tool dispatch."""
     record = getattr(agent, "_worker_lifecycle_record", None)
@@ -379,10 +431,24 @@ def before_worker_tool(agent: Any, tool_call_id: str) -> None:
         return
     if record.max_tool_calls is not None and record.tool_calls >= record.max_tool_calls:
         raise SubagentLifecycleError("Worker tool-call limit reached for this run.")
-    record.store.mark_tool_boundary(
-        record.run_id, record.owner_session_id, record.lease_token,
-        tool_call_id=tool_call_id, tool_inflight=True)
+    try:
+        record.store.mark_tool_boundary(
+            record.run_id, record.owner_session_id, record.lease_token,
+            tool_call_id=tool_call_id, tool_inflight=True)
+    except Exception as exc:
+        from agent.worker_store import WorkerBudgetExceeded
+        if isinstance(exc, WorkerBudgetExceeded):
+            agent._worker_budget_termination_reason = exc.reason
+        raise
     record.tool_calls += 1
+
+
+def queue_worker_parent_message(agent: Any, content: str) -> Optional[Mapping[str, Any]]:
+    """Durably queue a child-to-root-parent message when this worker has a store."""
+    record = getattr(agent, "_worker_lifecycle_record", None)
+    if not isinstance(record, _Record) or record.store is None or not record.run_id:
+        return None
+    return record.store.enqueue_parent_message(record.run_id, record.owner_session_id, content)
 
 
 def checkpoint_worker_tool_result(
@@ -440,6 +506,7 @@ class SubagentLifecycleService:
         cfg: Mapping[str, Any],
     ) -> Optional[SubagentHandle]:
         """Attach the parent tool's child to the same durable lifecycle used by plugins."""
+        from tools.delegate_tool import DEFAULT_MAX_ITERATIONS
         parent = self._parent_agent_resolver()
         owner = _owner_session_id_of(parent)
         store = _persistent_store(parent) if parent is not None else None
@@ -470,6 +537,8 @@ class SubagentLifecycleService:
         queued = store.enqueue_run(
             worker["worker_id"], owner, goal=goal, context=context or "",
             capability_digest=hashlib.sha256(capability.encode()).hexdigest(),
+            budget_epoch_id=_parent_budget_epoch(parent),
+            budget_limits=_tree_budget_limits(cfg, creds, DEFAULT_MAX_ITERATIONS),
         )
         max_concurrent = _concurrency_limit(cfg)
         active = store.claim_next_run(worker["worker_id"], owner, max_concurrent=max_concurrent)
@@ -498,8 +567,10 @@ class SubagentLifecycleService:
             max_tool_calls=getattr(creds.get("execution_limits"), "max_tool_calls", None),
             max_concurrent=max_concurrent, goal=goal, parent_agent=parent,
             completion_owner="delegate",
+            budget_epoch_id=active.get("budget_epoch_id"),
         )
         self._bind_tool_boundary(record)
+        _attach_tree_budget(record)
         self._start_external_lease(record)
         child._worker_lifecycle_record = record
         with _REGISTRY.lock:
@@ -643,6 +714,8 @@ class SubagentLifecycleService:
                 worker["worker_id"], parent_session_id, goal=request.goal,
                 context=request.context or "",
                 capability_digest=hashlib.sha256(capability.encode()).hexdigest(),
+                budget_epoch_id=_parent_budget_epoch(parent),
+                budget_limits=_tree_budget_limits(cfg, creds, DEFAULT_MAX_ITERATIONS),
             )
             max_concurrent = _concurrency_limit(cfg)
             active = store.claim_next_run(
@@ -673,6 +746,7 @@ class SubagentLifecycleService:
             owner_session_id=parent_session_id, worker_id=worker_id, run_id=run_id, lease_token=lease_token,
             max_tool_calls=getattr(creds.get("execution_limits"), "max_tool_calls", None),
             max_concurrent=_concurrency_limit(cfg), goal=request.goal, parent_agent=parent,
+            budget_epoch_id=(active_run or queued).get("budget_epoch_id") if store is not None else None,
         )
         with _REGISTRY.lock:
             _REGISTRY.records[subagent_id] = record
@@ -905,7 +979,7 @@ class SubagentLifecycleService:
             pending = store.pending_completions(owner)
             return {
                 "completions": [
-                    self._safe_run_snapshot(item) for item in pending
+                    self._completion_snapshot(item) for item in pending
                     if self._actor_can_target(
                         store,
                         owner,
@@ -956,6 +1030,7 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError("Worker has no matching run.")
         if normalized == "inspect":
             messages = store.list_messages(worker_id, owner)
+            parent_messages = store.list_parent_messages(selected["run_id"], owner)
             return {
                 **self._safe_worker_snapshot(store, worker, owner),
                 "run": self._inspect_run_snapshot(selected),
@@ -970,6 +1045,11 @@ class SubagentLifecycleService:
                         )
                     }
                     for item in messages
+                ],
+                "messages_to_parent": [
+                    {key: item.get(key) for key in (
+                        "message_id", "content", "status", "created_at", "published_at", "acknowledged_at")}
+                    for item in parent_messages
                 ],
             }
         if normalized == "wait":
@@ -1090,6 +1170,16 @@ class SubagentLifecycleService:
         }
 
     @classmethod
+    def _completion_snapshot(cls, run: Mapping[str, Any]) -> Mapping[str, Any]:
+        result = dict(run.get("result") or {})
+        return {
+            **cls._safe_run_snapshot(run),
+            "summary": result.get("summary"),
+            "termination": result.get("termination"),
+            "messages_to_parent": list(result.get("messages_to_parent") or []),
+        }
+
+    @classmethod
     def _inspect_run_snapshot(cls, run: Mapping[str, Any]) -> Mapping[str, Any]:
         result = dict(run.get("result") or {})
         return {
@@ -1192,6 +1282,7 @@ class SubagentLifecycleService:
         self, request: SubagentLaunchRequest, prior: SubagentHandle, worker: Mapping[str, Any], previous: Mapping[str, Any],
     ) -> SubagentHandle:
         """Validate and queue one retained turn behind the exact durable FIFO."""
+        from tools.delegate_tool import DEFAULT_MAX_ITERATIONS
         parent = self._parent_agent_resolver()
         owner = _owner_session_id_of(parent)
         store = _persistent_store(parent)
@@ -1218,7 +1309,7 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError(
                 "The retained worker's parent authority is unavailable; its queued work remains pending.")
         validation_service = type(self)(lambda: authority)
-        child, _creds, cfg, stored_policy = validation_service._build_revalidated_child(
+        child, current_creds, cfg, stored_policy = validation_service._build_revalidated_child(
             worker, goal=request.goal, role=request.role)
         with contextlib.suppress(Exception):
             child.close()
@@ -1231,6 +1322,8 @@ class SubagentLifecycleService:
         queued = store.enqueue_run(
             worker["worker_id"], owner, goal=request.goal, previous_run_id=previous["run_id"],
             capability_digest=hashlib.sha256(capability.encode()).hexdigest(),
+            budget_epoch_id=(previous.get("budget_epoch_id") if int(worker["depth"]) > 1 else None),
+            budget_limits=_tree_budget_limits(cfg, current_creds, DEFAULT_MAX_ITERATIONS),
         )
         max_concurrent = _concurrency_limit(cfg)
         result_handle = dataclasses.replace(
@@ -1245,6 +1338,7 @@ class SubagentLifecycleService:
             owner_session_id=owner, worker_id=worker["worker_id"], run_id=queued["run_id"],
             conversation_history=list(worker.get("history") or []),
             max_concurrent=max_concurrent, goal=request.goal, parent_agent=parent,
+            budget_epoch_id=queued.get("budget_epoch_id"),
         )
         with _REGISTRY.lock:
             _REGISTRY.records[subagent_id] = record
@@ -1331,6 +1425,7 @@ class SubagentLifecycleService:
         record.agent._worker_run_id = record.run_id
         record.state = SubagentState.PENDING
         cls._bind_tool_boundary(record)
+        _attach_tree_budget(record)
         service = cls(lambda: record.parent_agent)
         record.future = _EXECUTOR.submit(service._run, record, record.goal, record.parent_agent)
 
@@ -1381,10 +1476,17 @@ class SubagentLifecycleService:
         from tools.delegate_tool_config import _load_config
 
         max_concurrent = _concurrency_limit(_load_config())
+        target_sequence = None
+        if run_id is not None:
+            target = store.get_run(run_id, owner_session_id)
+            if worker_id is not None and target["worker_id"] != worker_id:
+                raise SubagentLifecycleError("Requested run does not belong to the target worker.")
+            worker_id = target["worker_id"]
+            target_sequence = int(target["sequence"])
         for pending in store.pending_runs(owner_session_id):
             if worker_id is not None and pending["worker_id"] != worker_id:
                 continue
-            if run_id is not None and pending["run_id"] != run_id:
+            if target_sequence is not None and int(pending["sequence"]) > target_sequence:
                 continue
             worker = store.get_worker(pending["worker_id"], owner_session_id)
             authority = cls._retained_parent_authority(
@@ -1459,7 +1561,7 @@ class SubagentLifecycleService:
                     handle, SubagentState.PENDING, created, store=store,
                     owner_session_id=owner_session_id, worker_id=pending["worker_id"],
                     run_id=pending["run_id"], conversation_history=list(worker.get("history") or []),
-                    goal=pending["goal"],
+                    goal=pending["goal"], budget_epoch_id=pending.get("budget_epoch_id"),
                 )
                 with _REGISTRY.lock:
                     _REGISTRY.records[subagent_id] = record
@@ -1475,6 +1577,7 @@ class SubagentLifecycleService:
             record.max_tool_calls = getattr(creds.get("execution_limits"), "max_tool_calls", None)
             record.max_concurrent = max_concurrent
             record.goal = pending["goal"]
+            record.budget_epoch_id = pending.get("budget_epoch_id")
             cls._start_record(record)
 
     @staticmethod
@@ -1664,6 +1767,8 @@ class SubagentLifecycleService:
                     else durable_history
                 )
                 route = dict(getattr(record.agent, "_worker_route_receipt", None) or {})
+                budget = record.store.budget_snapshot(record.run_id, record.owner_session_id)
+                budget_reason = getattr(record.agent, "_worker_budget_termination_reason", None)
                 durable_result = {
                     "summary": result.summary,
                     "error_classification": result.error_classification,
@@ -1678,8 +1783,9 @@ class SubagentLifecycleService:
                     },
                     "termination": {
                         "status": _terminal_status(state),
-                        "reason": (evidence or {}).get("exit_reason") or result.error_classification,
+                        "reason": budget_reason or (evidence or {}).get("exit_reason") or result.error_classification,
                     },
+                    "tree_budget": budget,
                     "usage": {
                         **dict(result.usage_metadata or {}),
                         "tokens": dict((evidence or {}).get("tokens") or {}),
@@ -1694,7 +1800,7 @@ class SubagentLifecycleService:
                     },
                     "effective_tools": list((worker.get("policy") or {}).get("effective_tools") or []),
                 }
-                record.store.finish_run(
+                finished = record.store.finish_run(
                     record.run_id,
                     record.owner_session_id,
                     record.lease_token,
@@ -1703,6 +1809,13 @@ class SubagentLifecycleService:
                     history=history,
                     delivered_message_ids=tuple(delivered_ids),
                 )
+                published = {
+                    item["message_id"]: item["status"]
+                    for item in ((finished.get("result") or {}).get("messages_to_parent") or [])
+                }
+                for item in list(getattr(record.agent, "_delegate_outbound_messages", None) or []):
+                    if item.get("message_id") in published:
+                        item["status"] = published[item["message_id"]]
             except Exception as exc:
                 result = dataclasses.replace(
                     result,

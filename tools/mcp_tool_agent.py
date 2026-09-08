@@ -122,8 +122,19 @@ def refresh_agent_mcp_tools(
     worker_ceiling = getattr(agent, "_worker_effective_tool_names", None)
     if isinstance(worker_ceiling, (set, frozenset, list, tuple)):
         executable_names.intersection_update(worker_ceiling)
-        new_defs = [item for item in new_defs if _def_name(item) in executable_names]
-        new_names.intersection_update(executable_names)
+        # Bridge schemas are presentation capabilities, not executable catalog
+        # identities. Preserve them whenever at least one deferred executable is
+        # still authorized, exactly as initial tool assembly does.
+        presentation_names = set(executable_names)
+        try:
+            from tools.tool_search import BRIDGE_TOOL_NAMES, is_deferrable_tool_name, load_config_readonly
+            deferred = load_config_readonly().effective_defer_tools
+            if any(is_deferrable_tool_name(name, deferred) for name in executable_names):
+                presentation_names.update(BRIDGE_TOOL_NAMES)
+        except Exception:  # noqa: BLE001
+            pass
+        new_defs = [item for item in new_defs if _def_name(item) in presentation_names]
+        new_names.intersection_update(presentation_names)
     # Post-build families re-appended on LOCALS only; live attributes untouched until publish.
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
     _reinject_authorized_dynamic_tools(agent, new_defs, new_names)

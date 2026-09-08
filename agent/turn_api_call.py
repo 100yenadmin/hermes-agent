@@ -87,6 +87,12 @@ def perform_api_call(
             )
         from agent.worker_receipts import observe_worker_request
         observe_worker_request(agent, next_api_kwargs)
+        # The durable tree budget counts actual provider attempts, including
+        # retries. Reservation happens after final request middleware/preflight
+        # and immediately before transport, so a crash can never replay an
+        # uncounted or ambiguously transmitted attempt.
+        from agent.subagent_lifecycle import before_worker_provider_attempt
+        before_worker_provider_attempt(agent)
         if _use_streaming:
             return agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
