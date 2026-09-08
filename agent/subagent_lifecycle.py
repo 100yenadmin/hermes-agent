@@ -443,6 +443,15 @@ def before_worker_tool(agent: Any, tool_call_id: str) -> None:
     record.tool_calls += 1
 
 
+def before_worker_nested_tool(agent: Any, tool_call_id: str) -> bool:
+    """Admit an execute_code RPC under the worker captured for that cell."""
+    record = getattr(agent, "_worker_lifecycle_record", None)
+    if not isinstance(record, _Record) or record.store is None:
+        return False
+    before_worker_tool(agent, tool_call_id)
+    return True
+
+
 def queue_worker_parent_message(agent: Any, content: str) -> Optional[Mapping[str, Any]]:
     """Durably queue a child-to-root-parent message when this worker has a store."""
     record = getattr(agent, "_worker_lifecycle_record", None)
@@ -476,6 +485,35 @@ def checkpoint_worker_tool_result(
     )
     record.conversation_history = list(history)
     record.delivered_message_ids.clear()
+
+
+def checkpoint_worker_nested_tool_result(agent: Any, tool_call_id: str) -> None:
+    """Settle one nested RPC without replacing the worker's conversation checkpoint."""
+    record = getattr(agent, "_worker_lifecycle_record", None)
+    if not isinstance(record, _Record) or record.store is None:
+        return
+    worker = record.store.get_worker(record.worker_id, record.owner_session_id)
+    checkpoint_worker_tool_result(
+        agent, list(worker.get("history") or record.conversation_history),
+        tool_call_id=tool_call_id, settled=True,
+    )
+
+
+def dispatch_worker_nested_tool(tool_name: str, tool_args: dict, *, task_id: str) -> str:
+    """Dispatch one execute_code RPC with the cell's captured worker authority."""
+    from model_tools import handle_function_call
+    from tools.registry import tool_error
+
+    agent = get_active_subagent_parent()
+    tool_call_id = "execute-code-rpc-" + uuid.uuid4().hex
+    try:
+        admitted = before_worker_nested_tool(agent, tool_call_id)
+    except Exception as exc:
+        return tool_error(str(exc))
+    result = handle_function_call(tool_name, tool_args, task_id=task_id)
+    if admitted:
+        checkpoint_worker_nested_tool_result(agent, tool_call_id)
+    return result
 
 
 def worker_tool_calls_remaining(agent: Any) -> Optional[int]:

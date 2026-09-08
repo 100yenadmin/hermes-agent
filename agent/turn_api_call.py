@@ -85,14 +85,15 @@ def perform_api_call(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
-        from agent.worker_receipts import observe_worker_request
-        observe_worker_request(agent, next_api_kwargs)
-        # The durable tree budget counts actual provider attempts, including
-        # retries. Reservation happens after final request middleware/preflight
-        # and immediately before transport, so a crash can never replay an
-        # uncounted or ambiguously transmitted attempt.
-        from agent.subagent_lifecycle import before_worker_provider_attempt
-        before_worker_provider_attempt(agent)
+        # Streaming Codex can reconnect inside run_codex_stream. Its physical
+        # send boundary owns both reservation and receipt observation so each
+        # adapter attempt is counted exactly once.
+        internal_codex_stream = agent.api_mode == "codex_responses" and _use_streaming
+        if not internal_codex_stream:
+            from agent.worker_receipts import observe_worker_request
+            from agent.subagent_lifecycle import before_worker_provider_attempt
+            before_worker_provider_attempt(agent)
+            observe_worker_request(agent, next_api_kwargs)
         if _use_streaming:
             return agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
