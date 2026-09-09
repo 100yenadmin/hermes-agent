@@ -34,7 +34,8 @@ def _fake_observation(scenario_id, secret):
                 {"tool_name": "spawn_agent", "profiles": ["route-a", "route-b"], "accepted": True},
                 {
                     "tool_name": "send_message", "accepted": True,
-                    "effective_action": "message", "target_was_running": True,
+                    "effective_action": "message", "selected_run_status": "RUNNING",
+                    "delivery": "RUNNING_STEER_PENDING_CHECKPOINT",
                 },
                 {
                     "tool_name": "followup_task", "accepted": True,
@@ -137,6 +138,15 @@ def test_fake_transport_qualifies_all_scenarios_without_leaking_transport_data()
         set(fixture["required_receipt_fields"]).issubset(item)
         for item in report["receipts"]
     )
+    workflow = next(
+        item for item in report["receipts"]
+        if item["scenario_id"] == "two_provider_retained_workflow"
+    )
+    assert workflow["guidance_delivery_evidence"] == [{
+        "accepted": True,
+        "selected_run_status": "RUNNING",
+        "delivery": "RUNNING_STEER_PENDING_CHECKPOINT",
+    }]
     assert secret not in json.dumps(report)
 
     def malformed_denial(scenario):
@@ -150,6 +160,18 @@ def test_fake_transport_qualifies_all_scenarios_without_leaking_transport_data()
     assert failed["qualified"] is False
     assert invalid["task_completed"] is False
     assert invalid["invalid_tool_calls"]["structured"] == 1
+
+    def queued_guidance(scenario):
+        observation = _fake_observation(scenario["id"], secret)
+        if scenario["id"] == "two_provider_retained_workflow":
+            guidance = observation["events"][1]
+            guidance.update(selected_run_status="PENDING", delivery="NEXT_RUN")
+        return observation
+
+    failed = run_suite(fixture, queued_guidance, common)
+    workflow = next(item for item in failed["receipts"] if item["scenario_id"] == "two_provider_retained_workflow")
+    assert failed["qualified"] is False
+    assert workflow["task_completed"] is False
 
 
 def test_timeout_and_controller_failures_are_sanitized(monkeypatch, capsys):
@@ -174,8 +196,11 @@ def test_timeout_and_controller_failures_are_sanitized(monkeypatch, capsys):
     assert secret not in output
 
 
-def test_running_guidance_releases_only_after_an_accepted_message():
-    runs = [{"run_id": "run-1", "status": "RUNNING"}]
+def test_running_guidance_requires_selected_running_delivery():
+    runs = [
+        {"run_id": "run-1", "status": "RUNNING"},
+        {"run_id": "run-2", "status": "PENDING"},
+    ]
 
     class Store:
         def list_runs(self, worker_id, owner):
@@ -183,9 +208,14 @@ def test_running_guidance_releases_only_after_an_accepted_message():
             return list(runs)
 
     responses = [
-        {"error": "denied", "orchestration_interface": {"effective_action": "message"}},
-        {"success": True, "orchestration_interface": {"effective_action": "resume"}},
-        {"success": True, "orchestration_interface": {"effective_action": "message"}},
+        {
+            "success": True, "delivery": "NEXT_RUN",
+            "orchestration_interface": {"effective_action": "message"},
+        },
+        {
+            "success": True, "delivery": "RUNNING_STEER_PENDING_CHECKPOINT",
+            "orchestration_interface": {"effective_action": "message"},
+        },
     ]
     parent = SimpleNamespace(
         _dispatch_worker_interface=lambda _name, _args: json.dumps(responses.pop(0))
@@ -196,10 +226,16 @@ def test_running_guidance_releases_only_after_an_accepted_message():
     )
     try:
         parent._dispatch_worker_interface("send_message", {"target": "worker-1"})
-        parent._dispatch_worker_interface("followup_task", {"target": "worker-1"})
         assert released == []
-        parent._dispatch_worker_interface("send_message", {"target": "worker-1"})
+        parent._dispatch_worker_interface(
+            "send_message", {"target": "worker-1", "run_id": "run-1"}
+        )
         assert released == [True]
-        assert [event["accepted"] for event in events] == [False, True, True]
+        assert [event["selected_run_status"] for event in events] == ["PENDING", "RUNNING"]
+        assert [event["delivery"] for event in events] == [
+            "NEXT_RUN", "RUNNING_STEER_PENDING_CHECKPOINT",
+        ]
+        assert runner._is_running_guidance(events[0]) is False
+        assert runner._is_running_guidance(events[1]) is True
     finally:
         restore()

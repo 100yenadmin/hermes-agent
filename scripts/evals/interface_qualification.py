@@ -44,7 +44,7 @@ SAFE_USAGE_KEYS = (
     "cache_write_tokens", "reasoning_tokens",
 )
 TERMINAL_STATES = {"SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED"}
-ACTIVE_STATES = {"PENDING", "STARTING", "RUNNING", "CANCEL_REQUESTED"}
+GUIDANCE_DELIVERIES = {"NEXT_RUN", "RUNNING_STEER_PENDING_CHECKPOINT"}
 
 
 @dataclass(frozen=True)
@@ -93,6 +93,15 @@ def _error_classification(error: Any) -> str | None:
     return "SERVICE_ERROR"
 
 
+def _is_running_guidance(event: Mapping[str, Any]) -> bool:
+    return (
+        event.get("accepted") is True
+        and event.get("effective_action") == "message"
+        and event.get("selected_run_status") == "RUNNING"
+        and event.get("delivery") == "RUNNING_STEER_PENDING_CHECKPOINT"
+    )
+
+
 def _scenario_checks(scenario_id: str, observation: Mapping[str, Any]) -> list[bool]:
     events = list(observation.get("events") or ())
     workers = list(observation.get("workers") or ())
@@ -102,7 +111,7 @@ def _scenario_checks(scenario_id: str, observation: Mapping[str, Any]) -> list[b
     if scenario_id == "two_provider_retained_workflow":
         profiles = {profile for item in accepted for profile in item.get("profiles", ())}
         providers = {item.get("provider") for item in workers if item.get("provider")}
-        message_live = any(item.get("effective_action") == "message" and item.get("target_was_running") for item in accepted)
+        message_live = any(_is_running_guidance(item) for item in accepted)
         linked = any(item.get("linked_followup") and item.get("followup_avoids_labels") for item in accepted)
         all_acked = bool(workers) and all(item.get("all_terminal_acked") for item in workers)
         return [
@@ -158,6 +167,14 @@ def build_receipt(
         "interface_version": observation.get("interface_version", UNKNOWN),
         "advertised_orchestration_tool_names": sorted(set(observation.get("advertised_tool_names") or ())),
         "observed_orchestration_tool_names": sorted({str(item.get("tool_name")) for item in events if item.get("tool_name")}),
+        "guidance_delivery_evidence": [
+            {
+                "accepted": item.get("accepted") is True,
+                "selected_run_status": item.get("selected_run_status", UNKNOWN),
+                "delivery": item.get("delivery", UNKNOWN),
+            }
+            for item in events if item.get("effective_action") == "message"
+        ],
         "task_completed": bool(observation.get("parent_completed")) and all(checks),
         "invalid_tool_calls": {
             "structured": invalid_count,
@@ -276,10 +293,16 @@ def _instrument_interface(
         if target:
             with contextlib.suppress(Exception):
                 before_runs = store.list_runs(target, owner)
+        requested_run_id = arguments.get("run_id")
+        selected_run = (
+            next((item for item in before_runs if item.get("run_id") == requested_run_id), None)
+            if isinstance(requested_run_id, str) and requested_run_id
+            else (before_runs[-1] if before_runs else None)
+        )
         event: dict[str, Any] = {
             "tool_name": tool_name,
             "profiles": _profiles_from_args(arguments),
-            "target_was_running": bool(before_runs and before_runs[-1].get("status") in ACTIVE_STATES),
+            "selected_run_status": (selected_run or {}).get("status", UNKNOWN),
             "followup_avoids_labels": not any(
                 label in _all_text(arguments).lower() for label in ("cobalt", "amber", "violet", "sapphire", "silver")
             ),
@@ -293,13 +316,12 @@ def _instrument_interface(
                 "effective_action": interface.get("effective_action"),
                 "accepted": not bool(payload.get("error")),
                 "classification": _error_classification(payload.get("error")),
+                "delivery": (
+                    payload.get("delivery")
+                    if payload.get("delivery") in GUIDANCE_DELIVERIES else UNKNOWN
+                ),
             })
-            if (
-                accepted_running_guidance is not None
-                and event["accepted"]
-                and event["effective_action"] == "message"
-                and event["target_was_running"]
-            ):
+            if accepted_running_guidance is not None and _is_running_guidance(event):
                 accepted_running_guidance()
         except Exception as exc:
             event.update({"accepted": False, "classification": _error_classification(exc), "effective_action": "none"})
