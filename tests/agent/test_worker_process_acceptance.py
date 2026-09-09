@@ -17,7 +17,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 def _configure(home: Path) -> None:
     home.mkdir()
     (home / "config.yaml").write_text(
-        """delegation:
+        # Native tool crash boundaries are exercised here; tool-search bridge
+        # dispatch is covered separately by the enforcement acceptance tests.
+        """tools:
+  tool_search:
+    enabled: "off"
+delegation:
   independent_completions: true
   max_concurrent_children: 2
   max_iterations: 4
@@ -291,7 +296,10 @@ def test_credential_disappearance_fails_closed_before_cold_resume(tmp_path):
         "--run-id", seed["run_id"], "--message", "post-checkpoint",
         credential=False, capture=capture,
     )
-    assert "API key" in blocked["error"] or "credential" in blocked["error"].lower()
+    assert not blocked.get("success", False)
+    assert "Worker resume admission failed" in blocked["error"]
+    assert "No LLM provider configured" in blocked["error"]
+    assert len(_json_lines(capture)) == 1  # the original seed; no revoked-route request
     snapshot = _run(home, "snapshot", "--worker-id", seed["worker_id"])
     assert len(snapshot["runs"]) == 1
 

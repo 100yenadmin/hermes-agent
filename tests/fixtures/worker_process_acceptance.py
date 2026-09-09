@@ -365,8 +365,8 @@ def _async_group(args) -> None:
     try:
         dispatched = json.loads(delegate_task(
             tasks=[
-                {"goal": "group-one", "group": "joined", "profile": PROFILE},
-                {"goal": "group-two", "group": "joined", "profile": PROFILE},
+                {"goal": "Complete synthetic group-one task", "group": "joined", "profile": PROFILE},
+                {"goal": "Complete synthetic group-two task", "group": "joined", "profile": PROFILE},
             ],
             background=True,
             parent_agent=parent,
