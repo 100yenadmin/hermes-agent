@@ -43,6 +43,10 @@ hooks, request counts and the assembled continuation.
   on the next admitted generation. Allow/deny/cancel pass (three cases). The compressor
   algorithm itself is stubbed to verify routing, not requalified by this test; cancellation
   before recovery prevents both compression and the next generation.
+- A queued redirect during context recovery must also retain the completed
+  generation's budget charge. The focused delta covers that branch. The synthetic
+  native fixture now ignores historical assistant seed frames, matching the real
+  native replay protocol; final remote validation of that correction is required.
 - Whitespace edit and legacy stripped carrier: canonical visible text replaces stale
   native blocks; unchanged prefixes retain their original blocks.
 

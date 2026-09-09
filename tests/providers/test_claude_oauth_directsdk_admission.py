@@ -18,6 +18,8 @@ NATIVE = r'''
 import json, os, sys, urllib.request, urllib.error
 for line in sys.stdin:
     frame=json.loads(line)
+    if frame.get('type') != 'user':
+        continue
     if frame.get('shouldQuery') is False:
         print(json.dumps({'type':'result','num_turns':0}),flush=True)
         continue
@@ -107,8 +109,10 @@ def test_cancel_closes_the_active_upstream_socket(tmp_path):
         client.close(); peer.shutdown(); thread.join(); peer.server_close()
 
 
-@pytest.mark.parametrize('continuation', ['allow', 'budget_denied', 'cancelled'])
-@pytest.mark.parametrize('response_kind', ['text', 'tool', 'context'])
+@pytest.mark.parametrize('response_kind,continuation', [
+    (kind, action) for kind in ('text', 'tool', 'context')
+    for action in ('allow', 'budget_denied', 'cancelled')
+] + [('context', 'redirect')])
 def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuation, response_kind):
     """Real host loop + real relay; only the native process and HTTPS peer are fixtures."""
     from unittest.mock import patch
@@ -118,7 +122,7 @@ def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuat
     partial_tool = response_kind == 'tool'
     context_overflow = response_kind == 'context'
     calls, order, receipts, requests = [], [], [], []
-    compressions, saved = [], []
+    compressions, saved, refunds = [], [], []
 
     class Peer(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -216,6 +220,13 @@ def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuat
             monkeypatch.setattr(agent, '_persist_session', lambda messages, *_: saved.append(copy.deepcopy(messages)))
         agent.step_callback = lambda *_: order.append('step')
         consume = IterationBudget.consume
+        refund = IterationBudget.refund
+
+        def refunded(budget):
+            refunds.append(budget.used)
+            return refund(budget)
+
+        monkeypatch.setattr(IterationBudget, 'refund', refunded)
 
         def admitted(budget):
             if continuation == 'budget_denied' and budget.used == 1:
@@ -236,20 +247,28 @@ def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuat
             if name == 'post_api_request' and len(calls) == 1:
                 if continuation == 'cancelled':
                     agent.interrupt()
+                elif continuation == 'redirect':
+                    # A redirect admitted while the model was active can remain
+                    # queued when its completed response reaches this hook.
+                    agent._pending_redirect = 'Use the corrected fixture instruction.'
+                    agent._interrupt_requested = True
 
         monkeypatch.setattr('hermes_cli.lifecycle.has_hook', lambda name: name in ('pre_api_request', 'post_api_request'))
         monkeypatch.setattr('hermes_cli.lifecycle.invoke_hook', hook)
         with patch.object(agent, '_cleanup_task_resources'):
             result = agent.run_conversation('Complete the fixture response.', conversation_history=history)
 
-        expected = 2 if continuation == 'allow' else 1
+        expected = 2 if continuation in ('allow', 'redirect') else 1
         if context_overflow:
-            assert len(compressions) == (0 if continuation == 'cancelled' else 1)
+            assert len(compressions) == (0 if continuation in ('cancelled', 'redirect') else 1)
             assert any(any(m.get('content') == 'Part 1 ' for m in rows) for rows in saved)
-        assert len(calls) == len(requests) == len(receipts) == expected
+        assert refunds == []
+        assert len(calls) == len(requests) == len(receipts) == expected, (
+            order, result.get('error'), (result.get('final_response') or '')[:300]
+        )
         assert all(row['upstream_requests'] == 1 and row['blocked_requests'] == 1 for row in receipts)
         expected_order = ['budget', 'step', 'pre_api_request', 'upstream', 'post_api_request'] * expected
-        if context_overflow and continuation != 'cancelled':
+        if context_overflow and continuation not in ('cancelled', 'redirect'):
             expected_order.insert(5, 'compress')
         if continuation == 'budget_denied':
             expected_order.append('denied')
@@ -258,14 +277,14 @@ def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuat
         assert agent.session_api_calls == expected
         assert agent.session_output_tokens == expected * 3
         assert not any(m.get('tool_calls') or m.get('role') == 'tool' for m in result['messages'])
-        if continuation == 'allow':
+        if continuation in ('allow', 'redirect'):
             assert result['completed'] is True
             assert result['final_response'] == ('Part 2' if partial_tool or context_overflow else 'Part 1 Part 2')
             assert result['api_calls'] == 2
             if partial_tool or context_overflow:
                 assert sum(m.get('content') == 'Part 1 ' for m in result['messages']) == 1
                 assert not any(m.get('tool_calls') for m in requests[1]['messages'])
-                if context_overflow:
+                if context_overflow and continuation != 'redirect':
                     assert not any('old fixture' in (m.get('content') or '') for m in requests[1]['messages'])
                     assert not any('truncated by the output length limit' in (m.get('content') or '') for m in requests[1]['messages'])
             else:

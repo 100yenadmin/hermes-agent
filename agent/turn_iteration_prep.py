@@ -409,10 +409,11 @@ def apply_retry_restarts(
         )
 
     if _retry.restart_with_redirected_messages:
-        # Cancelled request produced no valid assistant item: reuse the same logical
-        # iteration after the outer loop appends partial context + correction.
-        api_call_count -= 1
-        agent.iteration_budget.refund()
+        # A redirect can arrive after a complete partial response, during context
+        # recovery. Refund only requests cancelled before a completed generation.
+        if not _retry.restart_after_completed_generation:
+            api_call_count -= 1
+            agent.iteration_budget.refund()
         _retry.restart_with_redirected_messages = False
         return _verdict("continue")
 
