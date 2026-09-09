@@ -314,6 +314,18 @@ def _control(args) -> None:
                 timeout_seconds=args.timeout,
                 parent_agent=parent,
             ))
+        terminal = payload.get("terminal") or payload
+        if terminal.get("status") == "FAILED":
+            inspected = json.loads(delegate_task(
+                action="inspect", worker_id=terminal["worker_id"],
+                run_id=terminal["run_id"], parent_agent=parent,
+            ))
+            failure = (inspected.get("run") or {}).get("result") or {}
+            # This fixture owns only synthetic inputs and no live credentials.
+            # Expose the existing diagnostic fields, never the conversation.
+            payload["failure"] = {
+                key: failure.get(key) for key in ("error_classification", "error_message", "termination")
+            }
         _emit(payload)
     finally:
         db.close()
