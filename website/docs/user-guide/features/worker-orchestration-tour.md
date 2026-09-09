@@ -13,7 +13,7 @@ This page explains the changes in [PR #106268](https://github.com/NousResearch/h
 
 ## The whole system at a glance
 
-![A user defines profiles and limits. A parent selects researcher, checker and optional coordinator workers. All use one service with retained state and execution receipts.](/img/worker-orchestration/overview.svg)
+<img src="/img/worker-orchestration/overview.svg" width="1100" alt="A user defines profiles and limits. A parent selects researcher, checker and optional coordinator workers. All use one service with retained state and execution receipts." />
 
 Read the diagram from top to bottom:
 
@@ -27,7 +27,7 @@ A powerful model alone does not provide this machinery. Selecting an OpenAI Code
 
 ## Codex, existing Hermes, and this change
 
-![Three columns compare the Codex reference, existing Hermes delegation, and the retained worker capabilities added by this PR.](/img/worker-orchestration/comparison.svg)
+<img src="/img/worker-orchestration/comparison.svg" width="1100" alt="Three columns compare the Codex reference, existing Hermes delegation, and the retained worker capabilities added by this PR." />
 
 **Comparison scope:** “Hermes before” means the inspected upstream baseline `c076d653a216939b97a93ab0c10ce709bacde667`, not a claim about every subsequent release. The Codex column summarizes [official subagent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents), checked on September 9, 2026, and the agent tool contracts exposed during this work. Client, account, model and policy differences still apply. “Not established” means this comparison has no supporting evidence; it does not mean the other product cannot do it.
 
@@ -74,7 +74,7 @@ Legacy `list`, `steer` and `stop` remain available. Plugins use the [shared life
 
 ## How model routing and permissions fit together
 
-![Profile-only and dynamic routing converge on batch validation, the narrowest effective permissions, and execution receipts.](/img/worker-orchestration/routing.svg)
+<img src="/img/worker-orchestration/routing.svg" width="1100" alt="Profile-only and dynamic routing converge on batch validation, the narrowest effective permissions, and execution receipts." />
 
 A **provider** is the service handling the model request. A **model** is the selected model identifier. **Thinking level**, also called reasoning effort, is a model-supported request setting. A higher level can change latency and usage; it is not a guarantee of a better answer.
 
@@ -90,7 +90,7 @@ Instructions such as “never edit files” describe intended behavior. A tool p
 
 ## Messages, follow-ups and nested work
 
-![A first run receives a message, then a second run starts with retained context. Optional descendants share limits, and the parent collects compact results.](/img/worker-orchestration/lifecycle.svg)
+<img src="/img/worker-orchestration/lifecycle.svg" width="1100" alt="A first run receives a message, then a second run starts with retained context. Optional descendants share limits, and the parent collects compact results." />
 
 A **worker ID** identifies the retained conversation. A **run ID** identifies one assignment within it. Two workers using the same profile still have different identities. Only one run executes on a worker at a time; follow-ups queue in order.
 
@@ -104,7 +104,7 @@ Context is also deliberate. The parent should pass the information needed for th
 
 ## What happens if Hermes stops halfway through?
 
-![After a restart, Hermes restores records and reclaims expired leases. Known checkpoints can resume after validation; uncertain tool outcomes pause for reconciliation.](/img/worker-orchestration/recovery.svg)
+<img src="/img/worker-orchestration/recovery.svg" width="1100" alt="After a restart, Hermes restores records and reclaims expired leases. Known checkpoints can resume after validation; uncertain tool outcomes pause for reconciliation." />
 
 The durable source is the active Hermes profile's database. **Durable** means recorded so it can survive process exit. It does not mean the old Python thread or an in-flight provider request survives.
 
