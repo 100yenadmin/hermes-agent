@@ -1,180 +1,103 @@
-name: Fork exact-head validation
+name: Fork exact-head validation (quickstart comparison)
+permissions:
+  contents: read
+concurrency:
+  group: quickstart-comparison-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  quickstart-comparison:
+    name: Quickstart ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      EXPECTED_SHA: ${{ matrix.sha }}
+      OPENROUTER_API_KEY: ''
+      OPENAI_API_KEY: ''
+      NOUS_API_KEY: ''
+      HERMES_TEST_WORKERS: '1'
+      HERMES_TEST_FILE_RETRIES: '0'
+    steps:
+    - name: Checkout exact candidate
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        ref: ${{ matrix.sha }}
+    - name: Verify exact candidate
+      shell: bash
+      run: "if [[ ! \"$EXPECTED_SHA\" =~ ^[0-9a-f]{40}$ ]]; then\n  exit 2\nfi\ntest\
+        \ \"$(git rev-parse HEAD)\" = \"$EXPECTED_SHA\"\n"
+    - name: Install ripgrep (prebuilt binary)
+      shell: bash
+      run: "set -euo pipefail\nRG_VERSION=15.1.0\nRG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599\n\
+        RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz\ncurl -sSfL\
+        \ --retry 3 --retry-delay 5 -o \"$RG_TARBALL\" \\\n  \"https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}\"\
+        \necho \"${RG_SHA256}  ${RG_TARBALL}\" | sha256sum -c -\ntar -xzf \"$RG_TARBALL\"\
+        \nsudo mv \"ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg\" /usr/local/bin/rg\n\
+        rm -rf \"$RG_TARBALL\" \"ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl\"\
+        \nrg --version\n"
+    - name: Install uv
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+      with:
+        version: 0.9.28
+        enable-cache: true
+        cache-dependency-glob: 'pyproject.toml
 
-on:
+          uv.lock
+
+          '
+    - name: Set up Python 3.11
+      uses: ./.github/actions/retry
+      with:
+        command: uv python install 3.11
+    - name: Install locked dependencies
+      uses: ./.github/actions/retry
+      with:
+        command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic
+          --extra mistral --extra fal --extra modal --extra daytona --extra hindsight
+          --extra parallel-web
+    - name: Read hardware budget without credentials
+      shell: bash
+      run: 'probe_home=$(mktemp -d)
+
+        env -i HOME="$probe_home" HERMES_HOME="$probe_home" PATH="$PATH" .venv/bin/python
+        - <<''PYCODE''
+
+        from dataclasses import asdict
+
+        import json
+
+        from hermes_cli.local_runtime.hardware import probe_budget
+
+        print(json.dumps({''planning_budget'': asdict(probe_budget(planning=True))},
+        sort_keys=True))
+
+        PYCODE'
+    - name: Run unchanged quickstart contract file
+      shell: bash
+      run: 'uv lock --check
+
+        source .venv/bin/activate
+
+        scripts/run_tests.sh tests/hermes_cli/test_local_quickstart.py -j 1 --file-retries
+        0 --tb=short
+
+        '
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - label: candidate
+          sha: ${{ inputs.target_sha }}
+        - label: baseline
+          sha: ${{ inputs.baseline_sha }}
+'on':
   workflow_dispatch:
     inputs:
       target_sha:
         description: Exact 40-character commit SHA to validate
         required: true
         type: string
-
-permissions:
-  contents: read
-
-concurrency:
-  group: fork-exact-head-${{ inputs.target_sha }}
-  cancel-in-progress: false
-
-jobs:
-  python-tests:
-    name: Python tests (portable runner)
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      EXPECTED_SHA: ${{ inputs.target_sha }}
-      OPENROUTER_API_KEY: ""
-      OPENAI_API_KEY: ""
-      NOUS_API_KEY: ""
-      HERMES_TEST_WORKERS: "4"
-    steps:
-      - name: Checkout exact candidate
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ inputs.target_sha }}
-
-      - name: Verify exact candidate
-        shell: bash
-        run: |
-          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            exit 2
-          fi
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-
-      - name: Install ripgrep (prebuilt binary)
-        shell: bash
-        run: |
-          set -euo pipefail
-          RG_VERSION=15.1.0
-          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
-          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
-          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
-            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
-          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
-          tar -xzf "$RG_TARBALL"
-          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
-          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
-          rg --version
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
-        with:
-          version: "0.9.28"
-          enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
-
-      - name: Set up Python 3.11
-        uses: ./.github/actions/retry
-        with:
-          command: uv python install 3.11
-
-      - name: Install locked dependencies
-        uses: ./.github/actions/retry
-        with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
-
-      - name: Verify lock and run canonical suite
-        shell: bash
-        run: |
-          uv lock --check
-          source .venv/bin/activate
-          scripts/run_tests.sh
-
-  windows-tests:
-    name: Windows-only tests (portable runner)
-    runs-on: windows-latest
-    timeout-minutes: 90
-    env:
-      EXPECTED_SHA: ${{ inputs.target_sha }}
-      OPENROUTER_API_KEY: ""
-      OPENAI_API_KEY: ""
-      NOUS_API_KEY: ""
-    steps:
-      - name: Checkout exact candidate
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ inputs.target_sha }}
-
-      - name: Verify exact candidate
-        shell: bash
-        run: |
-          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            exit 2
-          fi
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
-        with:
-          version: "0.9.28"
-          enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
-
-      - name: Set up Python 3.11
-        uses: ./.github/actions/retry
-        with:
-          command: uv python install 3.11
-
-      - name: Install locked dependencies
-        uses: ./.github/actions/retry
-        with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
-
-      - name: Run Windows-only tests
-        shell: bash
-        run: |
-          set -uo pipefail
-          list_file="${RUNNER_TEMP}/selected-tests.txt"
-          uv run --no-sync python scripts/ci/list_os_marked_tests.py windows_only > "$list_file"
-          test -s "$list_file"
-          # shellcheck disable=SC2046
-          set -- $(cat "$list_file")
-          status=0
-          uv run --no-sync python -m pytest \
-            "$@" \
-            -m "windows_only and not integration" || status=$?
-          if [ "$status" -eq 5 ]; then
-            exit 1
-          fi
-          exit "$status"
-
-  nix-check:
-    name: Nix flake check (portable runner)
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      EXPECTED_SHA: ${{ inputs.target_sha }}
-    steps:
-      - name: Checkout exact candidate
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ inputs.target_sha }}
-
-      - name: Verify exact candidate
-        shell: bash
-        run: |
-          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            exit 2
-          fi
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            fallback = true
-            tarball-ttl = 3600
-
-      - name: Restore and save Nix store
-        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
-        with:
-          primary-key: fork-nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/**', 'pyproject.toml', 'uv.lock') }}
-          restore-prefixes-first-match: fork-nix-${{ runner.os }}-
-          save: false
-
-      - name: Run Nix flake check
-        run: nix flake check --print-build-logs
+      baseline_sha:
+        description: Exact baseline SHA for the same quickstart file on the same runner
+          class
+        required: true
+        type: string
