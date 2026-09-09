@@ -152,7 +152,7 @@ main/worker baselines above:
 | --- | --- | --- |
 | One selected worker interface per conversation | ✓ #106463 | Deterministic conformance and independent review passed; live pilot has both passes and failures; automatic qualification registry remains empty |
 | Discover permitted workers, runs, Bots, rooms and tasks | ✓ #106647 | Read-only discovery, typed references and action-time checks exercised; room grants permit inspection only |
-| Coordinate dependency tasks, review and retained corrections | Planned | Integrated-team acceptance is not yet established |
+| Coordinate dependency tasks, review and retained corrections | ◐ Draft #106696 | Source is published; independent review still blocks acceptance on service authority and review evidence |
 | Repeat a saved bounded workflow after restart | Planned | Workflow execution acceptance is not yet established |
 
 Discovery answers “what can this parent see and use?” It does not create a room,
@@ -166,7 +166,7 @@ their own implementation and acceptance evidence.
 | Worker PR #106268 | Profiles, retained workers, messages, limits and receipts | Existing two-provider workflow and recorded recovery/CI tests; see illustrated tour |
 | [Follow-up 1: #106463](https://github.com/NousResearch/hermes-agent/pull/106463) | Model-appropriate interfaces | Deterministic authorized event/receipt conformance passed; live qualification remains limited as recorded in the pilot |
 | [Follow-up 2: #106647](https://github.com/NousResearch/hermes-agent/pull/106647) | Shared discovery and references | Read-only discovery, authorization, owner relationships and no-write identity handling passed at the head recorded above |
-| Follow-up 3 | Integrated teams | Dependency/review/correction workflow with guidance, retained context and restart |
+| [Follow-up 3: #106696](https://github.com/NousResearch/hermes-agent/pull/106696) | Integrated teams | Dependency/review/correction workflow with guidance, retained context and restart; acceptance remains pending |
 | Follow-up 4 | Saved bounded workflows | Repeat with new input; pause/restart/collect/cancel without duplicate owned execution |
 
 Unproven follow-up rows remain planned. A draft implementation and its tests do not change what is available on main. Compare each model against itself when qualifying interfaces. Measure task completion, invalid tool calls, corrections, tokens and latency; do not claim that familiar naming necessarily improves performance.
