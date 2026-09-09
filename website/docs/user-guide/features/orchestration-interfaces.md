@@ -114,6 +114,8 @@ contract before launching.
 
 ## Discover shared work safely
 
+<img src="/img/worker-orchestration/discovery-sequence.svg" width="1100" alt="Shared discovery queries existing services read-only, returns only eligible references, and checks current authorization again when the parent inspects one." />
+
 The discover operation can also return typed references for workers, runs, local
 Bot teammates, hosted rooms and Kanban tasks. The reference form includes its
 kind, for example `worker:<id>`, `bot:<handle>`, `room:<id>` or `task:<id>`.
