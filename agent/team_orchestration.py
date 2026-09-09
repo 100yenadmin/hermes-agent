@@ -22,6 +22,7 @@ TEAM_TOOL_NAME = "kanban_team"
 TEAM_CONTRACT_VERSION = "kanban-team-v1"
 _UNKNOWN = "Unknown or unavailable team reference."
 _TERMINAL_WORKER = {"SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED"}
+_REVIEW_EVIDENCE_MAX_CHARS = 4_000
 _MONITORS: dict[tuple[str, str, int], threading.Event] = {}
 _MONITOR_LOCK = threading.RLock()
 
@@ -110,6 +111,11 @@ class TeamOrchestrationService:
 
     def _guard_action(self, action: str, args: Mapping[str, Any]) -> None:
         """Enforce canonical service authority even for direct/styled dispatch."""
+        from tools.kanban_tools import _require_orchestrator_tool
+        try:
+            _require_orchestrator_tool(TEAM_TOOL_NAME)
+        except Exception as exc:
+            raise PermissionError(str(exc)) from exc
         required = {
             "create": ("kanban_create",),
             "start": ("delegate_task", "kanban_heartbeat"),
@@ -128,7 +134,20 @@ class TeamOrchestrationService:
                 if kind == "task":
                     self._require("delegate_task")
                 elif kind == "bot":
-                    self._require("message_agent")
+                    from tools.bot_mode_dm import (
+                        MESSAGE_AGENT_TOOL_NAME,
+                        message_agent_authorized,
+                    )
+                    injected = any(
+                        isinstance(item, Mapping)
+                        and item.get("function", {}).get("name") == MESSAGE_AGENT_TOOL_NAME
+                        for item in (getattr(self.agent, "tools", None) or ())
+                    )
+                    if (
+                        not message_agent_authorized(self.agent) or not injected
+                        or MESSAGE_AGENT_TOOL_NAME not in getattr(self.agent, "valid_tool_names", set())
+                    ):
+                        raise PermissionError("Bot guidance is unavailable in this session")
                 elif kind != "room":
                     raise PermissionError(_UNKNOWN)
 
@@ -202,6 +221,31 @@ class TeamOrchestrationService:
             "wait", worker_id=worker_id, run_id=run_id, timeout_seconds=0,
         )
 
+    def _review_evidence(self, reference: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Collect a bounded parent-authorized receipt, never a sibling transcript."""
+        from agent.redact import redact_sensitive_text
+        worker_id, run_id = self._attachment_ids(reference)
+        inspected = self.lifecycle.control("inspect", worker_id=worker_id, run_id=run_id)
+        run = inspected.get("run") if isinstance(inspected, Mapping) else None
+        run = run if isinstance(run, Mapping) else {}
+        result = run.get("result") if isinstance(run.get("result"), Mapping) else {}
+        raw_summary = str(result.get("summary") or "")
+        summary = redact_sensitive_text(raw_summary, force=True)[:_REVIEW_EVIDENCE_MAX_CHARS]
+        termination = result.get("termination") if isinstance(result.get("termination"), Mapping) else {}
+        termination = {
+            key: str(termination.get(key))[:256]
+            for key in ("status", "reason") if termination.get(key) is not None
+        }
+        return {
+            "version": "team-review-evidence-v1",
+            "status": str(run.get("status") or "UNKNOWN"),
+            "summary": summary,
+            "summary_truncated": len(raw_summary) > _REVIEW_EVIDENCE_MAX_CHARS,
+            "result_hash": str(result.get("result_hash") or "")[:256] or None,
+            "termination": termination,
+            "available": bool(summary or result.get("result_hash") or termination),
+        }
+
     def _claim(self, conn: Any, task: Any) -> tuple[Any, str, str]:
         from hermes_cli import kanban_db as kb
         task = self._authorize_task(task)
@@ -231,13 +275,22 @@ class TeamOrchestrationService:
             if _text(intent.get("reviewer"), required=True) != _text(task.assignee, required=True):
                 raise PermissionError("Review assignment changed after the durable handoff")
             evidence = intent.get("implementation") or {}
+            receipt = intent.get("evidence") if isinstance(intent.get("evidence"), Mapping) else {}
+            evidence_summary = _text(receipt.get("summary")) or "No implementation summary was available."
             goal = (
                 f"Review task:{task.id}. Submitted handoff: {_text(intent.get('summary'))}. "
-                f"Inspect the exact implementation references "
-                f"{_text(evidence.get('worker_ref'))} and {_text(evidence.get('run_ref'))}; "
-                "report concrete acceptance evidence or request changes."
+                f"Parent-authorized implementation evidence: status={_text(receipt.get('status'))}; "
+                f"summary={evidence_summary} "
+                f"Provenance references: {_text(evidence.get('worker_ref'))}, "
+                f"{_text(evidence.get('run_ref'))}. These references are provenance only; "
+                "do not inspect or control the implementation worker. Report concrete "
+                "acceptance evidence or request changes."
             )
-            return goal, "Reviewer assignment for the submitted implementation handoff.", None
+            context = (
+                "Reviewer assignment for the submitted implementation handoff. Use the "
+                "bounded parent-provided evidence and task artifacts; sibling worker access is not granted."
+            )
+            return goal, context, None
         correction = kb.pending_team_intent(conn, task.id, kind="correction")
         if correction:
             implementation = correction.get("implementation") or {}
@@ -522,11 +575,15 @@ class TeamOrchestrationService:
         with self._board() as (_scope, conn):
             from hermes_cli import kanban_db as kb
             _task, kanban_run, attachment = self._current_attachment(conn, task_id)
-            if self._worker_status(attachment).get("status") != "SUCCEEDED":
+            evidence = self._review_evidence(attachment)
+            if evidence.get("status") != "SUCCEEDED":
                 raise RuntimeError("Worker success is required before requesting review")
             kb.record_team_intent(
                 conn, task_id, kanban_run, kind="review", owner_session_id=self._owner(),
-                payload={"summary": summary, "reviewer": reviewer, "implementation": dict(attachment)},
+                payload={
+                    "summary": summary, "reviewer": reviewer,
+                    "implementation": dict(attachment), "evidence": dict(evidence),
+                },
             )
             ok, reason = kb.request_review(
                 conn, task_id, summary=summary, reviewer=reviewer,

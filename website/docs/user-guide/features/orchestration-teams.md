@@ -48,7 +48,11 @@ native permission:
 Bot guidance also requires the existing Bot Chat authorization. Room guidance
 requires an explicit current room message grant. Discovery and knowing an ID
 do not grant these capabilities. Dispatcher task workers and delegated children
-do not receive parent team control.
+do not receive parent team control. The service rechecks dispatcher exclusion
+before any board or action access, including styled and direct calls. Bot Chat's
+`message_agent` tool is session-injected rather than globally registered; the
+team service requires both that real injection and the current canonical Bot
+Chat authorization.
 
 ## Example: research, review, correct
 
@@ -80,6 +84,12 @@ Once the implementation succeeds:
 
 The second `start` claims the task's review phase. After that reviewer succeeds,
 the parent can request a correction or accept the result:
+
+Before the review transition, the parent reads the successful implementation
+through its own worker authority and stores a bounded, secret-redacted summary
+receipt with the review intent. The reviewer receives that evidence in its
+assignment. Worker and run references record provenance; they do not grant the
+reviewer access to an implementation sibling.
 
 ```json
 {"action":"request_changes","task_ref":"task:comparison","message":"Recheck the second proposal's date."}

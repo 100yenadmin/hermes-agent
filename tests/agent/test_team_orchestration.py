@@ -70,6 +70,7 @@ def _agent(scope, *, tools=TEAM_TOOLS):
         _worker_effective_tool_names=set(tools),
         _executable_tool_names=set(tools),
         valid_tool_names=set(tools),
+        tools=[],
         provider="fixture",
         model="fixture",
     )
@@ -81,7 +82,7 @@ def _service(tmp_path, monkeypatch, *, tools=TEAM_TOOLS):
     board_db = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(board_db))
-    db = SessionDB(tmp_path / "state.db")
+    db = SessionDB(home / "state.db")
     scope = build_local_discovery_scope()
     agent = _agent(scope, tools=tools)
     agent._session_db = db
@@ -246,7 +247,6 @@ def test_parent_mode_claim_attachment_and_worker_admission_are_immutable(tmp_pat
             )
     finally:
         conn.close()
-
     db = SessionDB(tmp_path / "state.db")
     try:
         store = WorkerStore(db)
@@ -432,7 +432,11 @@ def test_two_worker_dependency_review_rejection_retained_correction_and_acceptan
         if str(kwargs.get("goal", "")).startswith("Review task:")
     )
     assert "Submitted handoff: Correction complete." in reviewer_build["goal"]
+    assert "Parent-authorized implementation evidence: status=SUCCEEDED" in reviewer_build["goal"]
+    assert "summary=fixture evidence" in reviewer_build["goal"]
     assert correction["worker_ref"] in reviewer_build["goal"]
+    assert "do not inspect or control the implementation worker" in reviewer_build["goal"]
+    assert "Inspect the exact implementation references" not in reviewer_build["goal"]
     lifecycle.succeed(second_review["run_ref"])
     accepted = restarted_service.dispatch({
         "action": "accept", "task_ref": first["task_ref"], "summary": "Accepted.",
@@ -448,6 +452,12 @@ def test_two_worker_dependency_review_rejection_retained_correction_and_acceptan
             if event.kind == "execution_attached"
         ]
         assert roles == ["implementer", "reviewer", "correction", "reviewer"]
+        review_intents = [
+            event.payload for event in kb.list_events(conn, first["task_ref"].partition(":")[2])
+            if event.kind == "team_review_intent"
+        ]
+        assert review_intents[-1]["evidence"]["summary"] == "fixture evidence"
+        assert review_intents[-1]["evidence"]["status"] == "SUCCEEDED"
     finally:
         conn.close()
 
@@ -493,6 +503,63 @@ def test_foreign_parent_and_list_only_policy_cannot_mutate(tmp_path, monkeypatch
             ).fetchone() is None
     finally:
         conn.close()
+
+
+def test_dispatcher_direct_and_styled_team_calls_fail_before_store_write(tmp_path, monkeypatch):
+    service, _lifecycle, board_db = _service(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "dispatcher-owned-task")
+    direct = service.dispatch({"action": "create", "title": "Denied", "profile": "alpha"})
+    assert "orchestrator-only" in direct["error"]
+    assert not board_db.exists()
+
+    selection = bind_worker_interface(
+        InterfaceSelection("codex", "explicit", "experimental_unqualified", "fixture", "fixture"),
+        _definitions(),
+    )
+    service.agent._worker_interface_selection = selection
+    styled = json.loads(dispatch_worker_interface_call(
+        service.agent, dict(selection.aliases)["team_task"],
+        {"action": "create", "title": "Denied styled", "profile": "alpha"},
+        lambda _args: pytest.fail("styled team call reached delegate dispatch"),
+    ))
+    assert "orchestrator-only" in styled["error"]
+    assert not board_db.exists()
+
+
+def test_real_bot_chat_injection_authorizes_guidance_with_session_ceiling(tmp_path, monkeypatch):
+    service, _lifecycle, _board_db = _service(tmp_path, monkeypatch)
+    profile = tmp_path / "home" / "profiles" / "researcher"
+    profile.mkdir(parents=True)
+    (profile / "profile.yaml").write_text(
+        "description: fixture teammate\nui_meta:\n  hermes-bots:\n    shape: cloud\n",
+        encoding="utf-8",
+    )
+    service.agent._session_db.ensure_session("owner-synthetic", source="test")
+    assert service.agent._session_db.set_session_title("owner-synthetic", "Bot Chat")
+    from tools import bot_mode_dm, bot_mode_probe
+    bot_mode_probe._reset_cache_for_tests()
+    assert bot_mode_dm.ensure_message_agent_tool(service.agent) is True
+    assert "message_agent" not in service.agent._worker_effective_tool_names
+    monkeypatch.setattr(
+        bot_mode_dm, "message_agent_tool",
+        lambda **kwargs: json.dumps({"status": "sent", "to": kwargs["target"]}),
+    )
+    delivered = service.dispatch({
+        "action": "guide", "targets": ["bot:researcher"], "message": "Review the boundary.",
+    })
+    assert delivered["outcomes"] == [{"status": "sent", "target": "bot:researcher", "to": "researcher"}]
+
+    service.agent.valid_tool_names.remove("message_agent")
+    removed = service.dispatch({
+        "action": "guide", "targets": ["bot:researcher"], "message": "Must remain denied.",
+    })
+    assert "Bot guidance is unavailable" in removed["error"]
+    service.agent.valid_tool_names.add("message_agent")
+    service.agent._bot_mode_protocol = False
+    denied = service.dispatch({
+        "action": "guide", "targets": ["bot:researcher"], "message": "Must remain denied.",
+    })
+    assert "Bot guidance is unavailable" in denied["error"]
 
 
 def test_exact_cancel_ack_does_not_dispose_task_or_newer_run(tmp_path, monkeypatch):

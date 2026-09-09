@@ -106,6 +106,9 @@ orchestrator toolset. The selected worker interface projects it as a canonical
 or styled tool; transport aliases do not grant native capabilities. Schemas are
 bound once per conversation, including collision resolution. Retained pre-team
 catalogs are not silently expanded during a worker's next run.
+The service calls the canonical dispatcher-worker exclusion before consulting
+its catalog or opening a board, so a stale canonical or styled registration
+cannot enter parent orchestration.
 
 Kanban tasks gain `execution_mode`, defaulting to `dispatcher`. Team-created
 tasks use `parent`. Dispatcher enumeration and claim CAS both enforce the mode;
@@ -134,9 +137,17 @@ attached run. It cannot cancel a newer retained run. Requests, execution termina
 state, task acceptance and completion acknowledgments remain separate.
 
 Guidance returns per-target outcomes. Bots use the existing canonical Bot Chat
-gate. Hosted rooms require a session-bound explicit `message` grant and reuse
-the existing service send contract, with gateway/epoch/participant checks.
-Inspection grants do not authorize sending or room adoption.
+gate and must carry the actual session-injected `message_agent` schema; the tool
+is deliberately absent from the global registry. A stale visible name alone
+does not grant sending. Hosted rooms require a session-bound explicit `message`
+grant and reuse the existing service send contract, with gateway/epoch/participant
+checks. Inspection grants do not authorize sending or room adoption.
+
+Before `request_review` changes Kanban state, the parent uses its authorized
+worker inspection path to collect a forced-redacted, size-bounded result receipt.
+That immutable evidence is stored in the existing review-intent event and copied
+into the reviewer assignment. Worker/run references remain provenance only; a
+reviewer leaf receives no sibling worker inspection authority.
 
 The focused `test_team_orchestration.py` cases cover schema projection, real
 store admission and attachment, held-run scheduler exclusion, crash-boundary
