@@ -556,6 +556,35 @@ def test_native_complete_cannot_bypass_required_workflow_review_or_success(tmp_p
     })["status"] == "done"
 
 
+def test_optional_workflow_reviewer_can_be_selected_and_accepted(tmp_path, monkeypatch):
+    service, execution, _board_db = _service(tmp_path, monkeypatch)
+    saved = _save(service, {
+        "name": "Optional reviewer",
+        "steps": [{"key": "only", "title": "Only", "profile": "alpha"}],
+    })
+    invoked = service.dispatch({
+        "action": "workflow_invoke",
+        "template_ref": saved["template_ref"],
+        "admission_key": "dynamic-reviewer",
+    })
+    task_ref = _step_refs(invoked)["only"]
+    implementation = _outcome_for(invoked, task_ref)
+    execution.finish(implementation["run_ref"])
+    assert service.dispatch({
+        "action": "submit_review",
+        "task_ref": task_ref,
+        "summary": "Ready for caller-selected review.",
+        "reviewer": "checker",
+    })["status"] == "review"
+    reviewer = service.dispatch({"action": "start", "task_ref": task_ref})
+    execution.finish(reviewer["run_ref"])
+    accepted = service.dispatch({
+        "action": "accept", "task_ref": task_ref, "summary": "Accepted dynamic review.",
+    })
+    assert accepted["status"] == "done"
+    assert accepted["workflow_completed"] is True
+
+
 def test_pause_and_claim_share_one_board_serialization_point(tmp_path, monkeypatch):
     service, _execution, _board_db = _service(tmp_path, monkeypatch)
     saved = _save(service, {
@@ -645,8 +674,12 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
             {"key": "stop", "title": "Stop", "profile": "beta", "reviewer": "checker"},
             {"key": "stale", "title": "Stale", "profile": "beta", "reviewer": "checker"},
             {
+                "key": "done-live", "title": "Done with live worker", "profile": "beta",
+                "depends_on": ["keep"],
+            },
+            {
                 "key": "join", "title": "Join", "profile": "alpha",
-                "depends_on": ["keep", "stop", "stale"],
+                "depends_on": ["keep", "stop", "stale", "done-live"],
             },
         ],
     })
@@ -660,6 +693,14 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
     stop = _outcome_for(invoked, refs["stop"])
     stale = _outcome_for(invoked, refs["stale"])
     _review_and_accept(service, execution, refs["keep"], keep)
+    advanced = service.dispatch({
+        "action": "workflow_resume",
+        "workflow_ref": invoked["workflow_ref"],
+        "expected_version": 1,
+    })
+    done_live = next(
+        item for item in advanced["outcomes"] if item["task_ref"] == refs["done-live"]
+    )
 
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
@@ -668,6 +709,11 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
     try:
         stop_id = refs["stop"].partition(":")[2]
         stale_id = refs["stale"].partition(":")[2]
+        done_live_id = refs["done-live"].partition(":")[2]
+        assert kb.complete_task(
+            conn, done_live_id, summary="Optional review was not requested.",
+            expected_run_id=kb.get_task(conn, done_live_id).current_run_id,
+        ) is True
         assert kb.block_task(
             conn, stop_id, reason="Native block left the worker execution live.",
             expected_run_id=kb.get_task(conn, stop_id).current_run_id,
@@ -697,6 +743,7 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
     stop_run_id = stop["run_ref"].partition(":")[2]
     stop_child = execution.records[stop_run_id].agent
     stale_child = execution.records[stale["run_ref"].partition(":")[2]].agent
+    done_live_child = execution.records[done_live["run_ref"].partition(":")[2]].agent
     real_control = service.lifecycle.control
     lost_receipt = True
 
@@ -719,9 +766,11 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
     assert stop_outcome["status"] == "effect_uncertain"
     assert stop_child.interruptions == 1
     assert stale_child.interruptions == 1
+    assert done_live_child.interruptions == 1
 
     execution.finish(stop["run_ref"], status="CANCELLED")
     execution.finish(stale["run_ref"], status="CANCELLED")
+    execution.finish(done_live["run_ref"], status="CANCELLED")
     service.lifecycle.control = real_control
     second = service.dispatch({
         "action": "workflow_cancel",
@@ -731,10 +780,12 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
     assert second["task_disposition"] == "cancelled"
     assert stop_child.interruptions == 1
     assert stale_child.interruptions == 1
+    assert done_live_child.interruptions == 1
 
     conn = kbc.connect()
     try:
         assert kb.get_task(conn, refs["keep"].partition(":")[2]).status == "done"
+        assert kb.get_task(conn, refs["done-live"].partition(":")[2]).status == "done"
         assert kb.get_task(conn, refs["stop"].partition(":")[2]).status == "blocked"
         assert kb.get_task(conn, refs["stale"].partition(":")[2]).status == "blocked"
         assert kb.get_task(conn, refs["join"].partition(":")[2]).status == "blocked"
@@ -815,11 +866,20 @@ def test_readonly_and_styled_paths_preserve_owner_board_and_capability(tmp_path,
     assert not board_db.exists()
     monkeypatch.delenv("HERMES_KANBAN_TASK")
     saved = _save(service)
-    invoked = service.dispatch({
-        "action": "workflow_invoke",
-        "template_ref": saved["template_ref"],
-        "admission_key": "owner-only",
-    })
+    service.agent._worker_interface_selection = claude
+    invoked = json.loads(dispatch_worker_interface_call(
+        service.agent,
+        "TeamTask",
+        {
+            "action": "workflow_invoke",
+            "template_ref": saved["template_ref"],
+            "admission_key": "owner-only",
+        },
+        lambda _args: pytest.fail("Claude workflow invoke reached worker dispatch"),
+    ))
+    assert "error" not in invoked
+    assert invoked["action"] == "workflow_invoke"
+    assert invoked["advancement"]["outcomes"]
     foreign = TeamOrchestrationService(_agent(service.agent._shared_discovery_scope, session_id="foreign"))
     foreign_result = foreign.dispatch({
         "action": "workflow_inspect", "workflow_ref": invoked["workflow_ref"],

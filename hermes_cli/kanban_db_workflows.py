@@ -474,8 +474,8 @@ def record_acceptance_evidence(
         raise ValueError("Reviewer success is required before acceptance")
     with kb.write_txn(conn):
         policy = correction_policy(conn, task_id, owner_session_id=owner_session_id)
-        if policy is None or not policy["reviewer"]:
-            raise RuntimeError("Workflow step does not require reviewer acceptance")
+        if policy is None:
+            raise RuntimeError("Task is not an owned workflow step")
         task = conn.execute(
             "SELECT status,current_run_id FROM tasks WHERE id=?", (task_id,),
         ).fetchone()
@@ -606,15 +606,15 @@ def finalize_completed(
     return True
 
 
-def _unfinished_execution_attachments(
+def _workflow_execution_attachments(
     conn: sqlite3.Connection, invocation_id: str,
 ) -> list[dict[str, Any]]:
-    """Return every exact attached execution for unfinished workflow steps."""
+    """Return every exact execution attachment owned by workflow steps."""
     rows = conn.execute(
         "SELECT t.id AS task_id,e.run_id,e.payload FROM tasks t "
         "JOIN task_events e ON e.task_id=t.id AND e.kind='execution_attached' "
-        "WHERE t.workflow_invocation_id=? AND t.status!='done' "
-        "AND t.current_step_key!='__coordinator__' ORDER BY t.id,e.run_id,e.id",
+        "WHERE t.workflow_invocation_id=? AND t.current_step_key!='__coordinator__' "
+        "ORDER BY t.id,e.run_id,e.id",
         (invocation_id,),
     ).fetchall()
     attachments: list[dict[str, Any]] = []
@@ -654,7 +654,7 @@ def cancellation_targets(
         row = _owned_invocation(conn, invocation_id, owner_session_id)
         if row["control_state"] != "cancelling":
             raise RuntimeError("Workflow is not cancelling")
-        for payload in _unfinished_execution_attachments(conn, invocation_id):
+        for payload in _workflow_execution_attachments(conn, invocation_id):
             subject = _cancel_subject(payload)
             terminal = conn.execute(
                 "SELECT payload FROM workflow_invocation_events "
@@ -761,7 +761,7 @@ def finalize_cancelled(
             return invocation_detail(conn, invocation_id, owner_session_id=owner_session_id)
         if row["control_state"] != "cancelling":
             raise RuntimeError("Workflow is not cancelling")
-        attachments = _unfinished_execution_attachments(conn, invocation_id)
+        attachments = _workflow_execution_attachments(conn, invocation_id)
         for attachment in attachments:
             terminal = conn.execute(
                 "SELECT payload FROM workflow_invocation_events WHERE invocation_id=? "
