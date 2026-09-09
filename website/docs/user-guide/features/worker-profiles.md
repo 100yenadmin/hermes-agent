@@ -14,6 +14,9 @@ A **Hermes profile** selects an independent configuration and state directory.
 A **worker profile** is a delegation definition inside that configuration.
 Worker definitions do not inherit live settings from other Hermes profiles.
 
+For a plain-English overview, feature comparison and diagrams, see the
+[illustrated orchestration tour](worker-orchestration-tour.md).
+
 ## Configure a worker
 
 Use your existing configured provider and its model identifier in a YAML file:

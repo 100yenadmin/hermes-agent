@@ -11,6 +11,9 @@ configuration in the active Hermes profile, not a process-global team definition
 The existing provider resolver remains responsible for authentication and runtime
 transport selection.
 
+Start with the [illustrated tour](../user-guide/features/worker-orchestration-tour.md)
+for the user workflow, before/after comparison and visual explanations.
+
 ## Identity and authority
 
 A worker ID identifies a retained conversation; a run ID identifies one assignment.
