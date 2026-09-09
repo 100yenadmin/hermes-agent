@@ -310,3 +310,249 @@ def test_review_correction_restart_retains_context_and_never_replays_uncertain_e
     assert correction_records[0]["user_markers"] == ["implementation-context", "correction-context"]
     assert len({record["pid"] for record in records}) == len(records)
     _assert_role_alternation(records)
+
+
+def test_saved_workflow_pause_branch_join_and_review_continue_across_process_restarts(tmp_path):
+    home, board = tmp_path / "profile", tmp_path / "kanban.db"
+    capture, effect, events = (
+        tmp_path / name for name in ("requests.jsonl", "effects.jsonl", "events.jsonl")
+    )
+    _configure(home)
+    definition = {
+        "name": "Process workflow",
+        "steps": [
+            {
+                "key": "left", "title": "workflow-left", "profile": "team-process",
+                "reviewer": "team-process", "max_corrections": 1,
+            },
+            {
+                "key": "right", "title": "workflow-right", "profile": "team-process",
+                "reviewer": "team-process", "max_corrections": 1,
+            },
+            {
+                "key": "join", "title": "workflow-join", "profile": "team-process",
+                "reviewer": "team-process", "depends_on": ["left", "right"],
+                "max_corrections": 1,
+            },
+        ],
+    }
+    saved = _run(
+        home, board, "dispatch", phase="workflow-save",
+        payload={"action": "workflow_save", "definition": definition},
+    )
+    assert saved["version"] == 1
+    invoke = {
+        "action": "workflow_invoke",
+        "template_ref": saved["template_ref"],
+        "admission_key": "process-workflow-one",
+        "input": {"fixture": "finite"},
+    }
+
+    invoke_marker = tmp_path / "workflow-left-attached.ready"
+    invoking = _start(
+        home, board, invoke, phase="workflow-invoke-held", behavior="block-before-schedule",
+        marker=invoke_marker, capture=capture, effect=effect, events=events,
+    )
+    _kill_after_marker(invoke_marker, invoking)
+    initial_attachment = _json_lines(events)[0]
+
+    listed = _run(
+        home, board, "dispatch", phase="workflow-list",
+        payload={"action": "workflow_list"},
+    )
+    assert [item["template_ref"] for item in listed["templates"]] == [saved["template_ref"]]
+    assert len(listed["invocations"]) == 1
+    initial = listed["invocations"][0]
+    workflow_ref = initial["workflow_ref"]
+    task_refs = {item["step_key"]: item["task_ref"] for item in initial["steps"]}
+    assert initial["template_ref"] == saved["template_ref"]
+    assert initial_attachment["task_ref"] == task_refs["left"]
+    assert {item["step_key"]: item["status"] for item in initial["steps"]} == {
+        "left": "running", "right": "ready", "join": "todo",
+    }
+
+    paused = _run(
+        home, board, "dispatch", phase="workflow-pause",
+        payload={
+            "action": "workflow_pause", "workflow_ref": workflow_ref, "expected_version": 1,
+        },
+    )
+    assert paused["control_state"] == "paused"
+    assert paused["control_version"] == 2
+    repeated = _run(
+        home, board, "dispatch", phase="workflow-paused-reinvoke", payload=invoke,
+    )
+    assert repeated["workflow_ref"] == workflow_ref
+    assert repeated["advancement"]["outcomes"] == []
+    assert repeated["advancement"]["workflow"]["control_state"] == "paused"
+    assert {
+        item["step_key"]: item["task_ref"]
+        for item in repeated["advancement"]["workflow"]["steps"]
+    } == task_refs
+    held_left = _run(
+        home, board, "snapshot", phase="workflow-paused-snapshot", task_ref=task_refs["left"],
+    )
+    unclaimed_right = _run(
+        home, board, "snapshot", phase="workflow-paused-snapshot", task_ref=task_refs["right"],
+    )
+    assert [(item["run_ref"], item["status"]) for item in held_left["attachments"]] == [
+        (initial_attachment["run_ref"], "PENDING")
+    ]
+    assert unclaimed_right["attachments"] == []
+
+    resumed = _run(
+        home, board, "dispatch", phase="workflow-resume",
+        payload={
+            "action": "workflow_resume", "workflow_ref": workflow_ref, "expected_version": 2,
+        },
+        wait=True, capture=capture, effect=effect,
+    )
+    assert resumed["workflow"]["control_state"] == "active"
+    assert resumed["workflow"]["control_version"] == 3
+    branch_outcomes = {item["task_ref"]: item for item in resumed["outcomes"]}
+    assert branch_outcomes[task_refs["left"]]["run_ref"] == initial_attachment["run_ref"]
+    assert branch_outcomes[task_refs["left"]]["recovered"] is True
+    assert branch_outcomes[task_refs["left"]]["terminal"]["status"] == "SUCCEEDED"
+    assert branch_outcomes[task_refs["right"]]["terminal"]["status"] == "SUCCEEDED"
+
+    assert _run(
+        home, board, "dispatch", phase="workflow-left-submit-one",
+        payload={
+            "action": "submit_review", "task_ref": task_refs["left"],
+            "summary": "workflow-left review-one", "reviewer": "team-process",
+        },
+    )["status"] == "review"
+    reviewer_marker = tmp_path / "workflow-left-review-attached.ready"
+    held_reviewer = _start(
+        home, board, {"action": "start", "task_ref": task_refs["left"]},
+        phase="workflow-left-review-held", behavior="block-before-schedule",
+        marker=reviewer_marker, capture=capture, effect=effect, events=events,
+    )
+    _kill_after_marker(reviewer_marker, held_reviewer)
+    reviewer_attachment = _json_lines(events)[-1]
+    restarted_reviewer = _run(
+        home, board, "dispatch", phase="workflow-left-review-resume",
+        payload={"action": "start", "task_ref": task_refs["left"]},
+        wait=True, capture=capture, effect=effect,
+    )
+    assert restarted_reviewer["run_ref"] == reviewer_attachment["run_ref"]
+    assert restarted_reviewer["terminal"]["status"] == "SUCCEEDED"
+
+    correction_marker = tmp_path / "workflow-left-correction-attached.ready"
+    held_correction = _start(
+        home, board,
+        {
+            "action": "request_changes", "task_ref": task_refs["left"],
+            "message": "workflow-correction",
+        },
+        phase="workflow-left-correction-held", behavior="block-before-schedule",
+        marker=correction_marker, capture=capture, effect=effect, events=events,
+    )
+    _kill_after_marker(correction_marker, held_correction)
+    correction_attachment = _json_lines(events)[-1]
+    left_durable = _run(
+        home, board, "snapshot", phase="workflow-left-snapshot", task_ref=task_refs["left"],
+    )
+    assert [item["role"] for item in left_durable["attachments"]] == [
+        "implementer", "reviewer", "correction",
+    ]
+    assert left_durable["attachments"][-1]["worker_ref"] == initial_attachment["worker_ref"]
+    assert left_durable["attachments"][-1]["previous_run_ref"] == initial_attachment["run_ref"]
+    assert left_durable["attachments"][-1]["run_ref"] == correction_attachment["run_ref"]
+    restarted_correction = _run(
+        home, board, "dispatch", phase="workflow-left-correction-resume",
+        payload={"action": "start", "task_ref": task_refs["left"]},
+        wait=True, capture=capture, effect=effect,
+    )
+    assert restarted_correction["run_ref"] == correction_attachment["run_ref"]
+    assert restarted_correction["terminal"]["status"] == "SUCCEEDED"
+
+    assert _run(
+        home, board, "dispatch", phase="workflow-left-submit-two",
+        payload={
+            "action": "submit_review", "task_ref": task_refs["left"],
+            "summary": "workflow-left correction ready", "reviewer": "team-process",
+        },
+    )["status"] == "review"
+    left_second_review = _run(
+        home, board, "dispatch", phase="workflow-left-review-two",
+        payload={"action": "start", "task_ref": task_refs["left"]},
+        wait=True, capture=capture, effect=effect,
+    )
+    assert left_second_review["terminal"]["status"] == "SUCCEEDED"
+    assert _run(
+        home, board, "dispatch", phase="workflow-left-accept",
+        payload={"action": "accept", "task_ref": task_refs["left"], "summary": "left accepted"},
+    )["status"] == "done"
+
+    assert _run(
+        home, board, "dispatch", phase="workflow-right-submit",
+        payload={
+            "action": "submit_review", "task_ref": task_refs["right"],
+            "summary": "workflow-right ready", "reviewer": "team-process",
+        },
+    )["status"] == "review"
+    right_review = _run(
+        home, board, "dispatch", phase="workflow-right-review",
+        payload={"action": "start", "task_ref": task_refs["right"]},
+        wait=True, capture=capture, effect=effect,
+    )
+    assert right_review["terminal"]["status"] == "SUCCEEDED"
+    assert _run(
+        home, board, "dispatch", phase="workflow-right-accept",
+        payload={"action": "accept", "task_ref": task_refs["right"], "summary": "right accepted"},
+    )["status"] == "done"
+
+    join_started = _run(
+        home, board, "dispatch", phase="workflow-join",
+        payload={
+            "action": "workflow_resume", "workflow_ref": workflow_ref, "expected_version": 3,
+        },
+        wait=True, capture=capture, effect=effect,
+    )
+    join = next(item for item in join_started["outcomes"] if item["task_ref"] == task_refs["join"])
+    assert join["terminal"]["status"] == "SUCCEEDED"
+    assert _run(
+        home, board, "dispatch", phase="workflow-join-submit",
+        payload={
+            "action": "submit_review", "task_ref": task_refs["join"],
+            "summary": "workflow-join ready", "reviewer": "team-process",
+        },
+    )["status"] == "review"
+    join_review = _run(
+        home, board, "dispatch", phase="workflow-join-review",
+        payload={"action": "start", "task_ref": task_refs["join"]},
+        wait=True, capture=capture, effect=effect,
+    )
+    assert join_review["terminal"]["status"] == "SUCCEEDED"
+    accepted = _run(
+        home, board, "dispatch", phase="workflow-join-accept",
+        payload={"action": "accept", "task_ref": task_refs["join"], "summary": "join accepted"},
+    )
+    assert accepted["workflow_completed"] is True
+
+    final = _run(
+        home, board, "dispatch", phase="workflow-final",
+        payload={"action": "workflow_inspect", "workflow_ref": workflow_ref},
+    )
+    assert final["workflow_ref"] == workflow_ref
+    assert final["template_ref"] == saved["template_ref"]
+    assert {item["step_key"]: item["task_ref"] for item in final["steps"]} == task_refs
+    assert final["completed"] is True
+    assert {item["status"] for item in final["steps"]} == {"done"}
+    left_final = _run(
+        home, board, "snapshot", phase="workflow-left-final", task_ref=task_refs["left"],
+    )
+    assert [item["role"] for item in left_final["attachments"]] == [
+        "implementer", "reviewer", "correction", "reviewer",
+    ]
+    assert len({item["run_ref"] for item in left_final["attachments"]}) == 4
+    assert {item["status"] for item in left_final["attachments"]} == {"SUCCEEDED"}
+    records = _json_lines(capture)
+    correction_records = [
+        item for item in records if item["phase"] == "workflow-left-correction-resume"
+    ]
+    assert len(correction_records) == 1
+    assert correction_records[0]["user_markers"] == ["workflow-left", "workflow-correction"]
+    assert _json_lines(effect) == []
+    _assert_role_alternation(records)

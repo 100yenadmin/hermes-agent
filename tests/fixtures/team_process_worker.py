@@ -21,9 +21,13 @@ PROFILE = "team-process"
 EFFECT_TOOL = "team_process_effect"
 TEAM_TOOLS = {
     "kanban_team", "delegate_task", "kanban_create", "kanban_heartbeat",
+    "kanban_list", "kanban_show",
     "kanban_request_review", "kanban_request_changes", "kanban_complete", "kanban_block",
 }
-MARKERS = ("implementation-context", "review-one", "correction-context", "review-two")
+MARKERS = (
+    "implementation-context", "review-one", "correction-context", "review-two",
+    "workflow-left", "workflow-right", "workflow-join", "workflow-correction",
+)
 
 
 def _append_json(path: str, value: dict) -> None:
@@ -232,15 +236,23 @@ def _dispatch(args) -> None:
         if os.environ.get("HERMES_TEAM_BEHAVIOR") == "block-before-schedule":
             _hold_before_schedule(service)
         result = dict(service.dispatch(json.loads(args.payload)))
-        run_ref = str(result.get("run_ref") or "")
-        worker_ref = str(result.get("worker_ref") or "")
-        if args.wait and run_ref and worker_ref:
-            result["terminal"] = service.lifecycle.control(
-                "wait",
-                worker_id=worker_ref.partition(":")[2],
-                run_id=run_ref.partition(":")[2],
-                timeout_seconds=args.timeout,
-            )
+        if args.wait:
+            groups = [result]
+            groups.extend(result.get("outcomes") or [])
+            groups.extend((result.get("advancement") or {}).get("outcomes") or [])
+            seen = set()
+            for item in groups:
+                run_ref = str(item.get("run_ref") or "")
+                worker_ref = str(item.get("worker_ref") or "")
+                if not run_ref or not worker_ref or run_ref in seen:
+                    continue
+                seen.add(run_ref)
+                item["terminal"] = service.lifecycle.control(
+                    "wait",
+                    worker_id=worker_ref.partition(":")[2],
+                    run_id=run_ref.partition(":")[2],
+                    timeout_seconds=args.timeout,
+                )
         _emit(result)
     finally:
         db.close()
