@@ -106,14 +106,19 @@ def _start(
     )
 
 
-def _wait_for(path: Path, process: subprocess.Popen, timeout: float = 10) -> None:
+def _wait_for(
+    path: Path, process: subprocess.Popen, timeout: float = 10, diagnostics: Path | None = None,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
             return
         if process.poll() is not None:
             stdout, stderr = process.communicate()
-            raise AssertionError(f"fixture exited before fault marker: {stdout}\n{stderr}")
+            detail = _json_lines(diagnostics) if diagnostics is not None else []
+            raise AssertionError(
+                f"fixture exited before fault marker: {stdout}\n{stderr}\nrequest diagnostics: {detail}"
+            )
         time.sleep(0.02)
     process.kill()
     process.wait(timeout=5)
@@ -213,7 +218,7 @@ def test_message_delivery_and_conversation_checkpoint_cross_cold_restart(tmp_pat
     snapshot = _run(
         home, "snapshot", "--worker-id", seed["worker_id"], "--expire-leases",
     )
-    assert snapshot["message_statuses"] == ["DELIVERED", "DELIVERED"]
+    assert snapshot["message_statuses"] == ["DELIVERED", "DELIVERED"], _json_lines(capture)
     assert snapshot["history_roles"][-3:] == ["user", "assistant", "tool"]
     assert snapshot["history_has_provider_session_handle"] is False
     assert len(_json_lines(effect)) == 1
@@ -247,7 +252,7 @@ def test_ambiguous_completed_effect_requires_reconciliation_and_is_not_replayed(
         "--run-id", queued["run_id"], "--timeout", "20",
         behavior="tool-crash", marker=marker, capture=capture, effect=effect,
     )
-    _wait_for(marker, process)
+    _wait_for(marker, process, diagnostics=capture)
     process.wait(timeout=5)
     assert process.returncode == 91
     assert len(_json_lines(effect)) == 1

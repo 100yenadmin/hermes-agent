@@ -65,6 +65,23 @@ def _latest_user_text(messages) -> str:
     return ""
 
 
+def _tool_result_categories(messages) -> list[str]:
+    categories = []
+    for item in messages:
+        if not isinstance(item, dict) or item.get("role") != "tool":
+            continue
+        content = str(item.get("content") or "").lower()
+        if "not permitted" in content:
+            categories.append("policy_denied")
+        elif "error executing tool" in content or '"error"' in content:
+            categories.append("execution_error")
+        elif '"ok": true' in content:
+            categories.append("synthetic_effect_ok")
+        else:
+            categories.append("other")
+    return categories
+
+
 def _capture_request(kwargs: dict, request_index: int) -> None:
     messages = kwargs.get("messages") or []
     system = next(
@@ -81,6 +98,11 @@ def _capture_request(kwargs: dict, request_index: int) -> None:
             "roles": _message_roles(messages),
             "system_hash": hashlib.sha256(system.encode()).hexdigest(),
             "latest_user_markers": [marker for marker in SYNTHETIC_MARKERS if marker in latest_user],
+            "tool_names": sorted(
+                item.get("function", {}).get("name", "")
+                for item in (kwargs.get("tools") or []) if isinstance(item, dict)
+            ),
+            "tool_result_categories": _tool_result_categories(messages),
             "model": str(kwargs.get("model") or ""),
         },
     )
@@ -349,6 +371,17 @@ def _async_group(args) -> None:
             background=True,
             parent_agent=parent,
         ))
+        if not dispatched.get("delegation_id"):
+            error = str(dispatched.get("error") or "").lower()
+            category = (
+                "provider_unconfigured" if "no llm provider configured" in error
+                else "profile_resolution" if "profile" in error
+                else "dispatch_rejected"
+            )
+            raise RuntimeError(
+                f"group dispatch returned no delegation_id "
+                f"(status={dispatched.get('status')!r}, category={category})"
+            )
         delegation_id = dispatched["delegation_id"]
         deadline = time.monotonic() + args.timeout
         durable = None
