@@ -108,6 +108,16 @@ keep their own identities and permission checks.
 
 <img src="/img/worker-orchestration/task-run-link.svg" width="1100" alt="Planned restart-safe assignment: claim task, prepare pending worker, attach its reference, schedule that recorded run, and separately review the result. Each restart point reuses records or pauses for reconciliation." />
 
+## What a saved workflow will add
+
+A saved workflow is a recipe for work you want to repeat: compare two sets of information in parallel, review their results, then combine the accepted answers. Users choose the participant profiles and set a maximum number of corrections. The recipe is versioned so a later edit does not silently change work already in progress.
+
+<img src="/img/worker-orchestration/saved-workflow.svg" width="1100" alt="Planned saved workflow: independent tasks run in parallel, each result is reviewed, accepted prerequisites release the combined task, and a new invocation repeats the recipe. Separate controls explain pause, restart, uncertain effects and cancellation." />
+
+A **pause** prevents new task claims; work already claimed may finish. A **restart** reloads the recorded task and execution identities instead of starting the recipe from the beginning. If the outcome of an external action is unknown, continuation waits for reconciliation. A **cancellation** keeps already accepted results but blocks unfinished tasks, so cancelling a prerequisite cannot accidentally release its dependants.
+
+These are the planned increment-four contracts. They add control records to the existing board and reuse the team execution path. They do not add a second task engine or restore an arbitrary script's interpreter stack.
+
 ## Model-facing interface is not execution backend
 
 | Choice | What changes | What does not follow from it |
