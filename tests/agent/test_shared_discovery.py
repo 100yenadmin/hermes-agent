@@ -252,9 +252,22 @@ def test_room_identity_reads_never_mint_or_repair_install_identity(tmp_path, mon
         room_db, room_id="room-synthetic", name="Synthetic room", members=[],
         authority_gateway_id=authority,
     )
-    service = SimpleNamespace(db_path=room_db)
+    service = SimpleNamespace(
+        db_path=room_db,
+        runtime=SimpleNamespace(status=lambda: {"running": True, "stopping": False}),
+    )
     from tui_gateway import methods_groups
     monkeypatch.setattr(methods_groups, "_service", service)
+    assert methods_groups.get_hosted_room_service() is service
+    from hermes_cli import install_identity
+    original_read = install_identity.read_existing_install_id
+    identity_reads = []
+
+    def observed_identity_read(root=None):
+        identity_reads.append(root)
+        return original_read(root)
+
+    monkeypatch.setattr(install_identity, "read_existing_install_id", observed_identity_read)
     cfg = {"orchestration": {"discovery": {"rooms": [{
         "id": "room-synthetic", "actions": ["inspect"], "participants": [],
     }]}}}
@@ -284,6 +297,7 @@ def test_room_identity_reads_never_mint_or_repair_install_identity(tmp_path, mon
     assert build_gateway_discovery_scope(
         server, sid="unreadable", cfg=cfg, source="tui").room_provider is None
     assert set(unreadable_home.iterdir()) == unreadable_before
+    assert len(identity_reads) == 3
 
 
 def test_existing_readonly_helpers_leave_missing_paths_absent(tmp_path):
