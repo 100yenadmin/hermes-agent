@@ -825,6 +825,136 @@ class SubagentLifecycleService:
                 child.close()
         return handle
 
+    def admit_team_execution(
+        self, request: SubagentLaunchRequest, *, worker_id: str, request_id: str,
+        previous_run_id: Optional[str] = None,
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        """Durably admit a parent-managed run without scheduling it.
+
+        The team service attaches the returned coordinates to the exact Kanban
+        run before calling :meth:`schedule_team_execution`. Deterministic IDs
+        make a crash between the two stores recoverable without another worker.
+        """
+        parent = self._parent_agent_resolver()
+        if parent is None or getattr(parent, "_worker_id", None):
+            raise SubagentLifecycleError("Team execution requires a root parent session.")
+        self._validate_request(request, parent)
+        owner = _owner_session_id_of(parent)
+        if not owner or (request.parent_session_id and request.parent_session_id != owner):
+            raise SubagentLifecycleError("parent_session_id does not match the active session.")
+        from tools.delegate_tool import DEFAULT_MAX_ITERATIONS, _validate_spawn_admission
+        try:
+            _validate_spawn_admission(parent, 1)
+        except ValueError as exc:
+            raise SubagentLifecycleError(str(exc)) from exc
+        store = _persistent_store(parent)
+        if store is None:
+            raise SubagentLifecycleError("Durable worker state is unavailable for this session.")
+
+        if previous_run_id:
+            worker = store.get_worker(worker_id, owner)
+            previous = store.get_run(previous_run_id, owner)
+            if previous["worker_id"] != worker_id:
+                raise SubagentLifecycleError("Retained run does not belong to the implementation worker.")
+            child, creds, cfg, policy = self._build_revalidated_child(
+                worker, goal=request.goal, role=request.role,
+            )
+            with contextlib.suppress(Exception):
+                child.close()
+            profile = worker["profile"]
+            config_revision = worker["config_revision"]
+            frozen_prompt = worker["frozen_prompt"]
+        else:
+            from tools.delegate_tool import _build_child_preserving_parent_tools, _profile_task_overrides
+            from tools.delegate_tool_config import _load_config, _resolve_delegation_credentials
+            cfg = _load_config()
+            if request.profile:
+                creds = _resolve_delegation_credentials(
+                    cfg, parent, request.profile,
+                    requested_provider=request.provider,
+                    requested_model=request.model,
+                    requested_reasoning_effort=request.reasoning_effort,
+                )
+                overrides = _profile_task_overrides(creds)
+                run_iterations = _iteration_limit(cfg, creds, DEFAULT_MAX_ITERATIONS)
+            else:
+                if request.provider or request.reasoning_effort:
+                    raise SubagentLifecycleError(
+                        "provider/reasoning_effort require a configured worker profile."
+                    )
+                creds = _resolve_delegation_credentials(cfg, parent)
+                overrides = {
+                    "override_provider": creds["provider"],
+                    "override_base_url": creds["base_url"],
+                    "override_api_key": creds["api_key"],
+                    "override_api_mode": creds["api_mode"],
+                    "override_request_overrides": creds.get("request_overrides"),
+                    "override_acp_command": creds.get("command"),
+                    "override_acp_args": creds.get("args"),
+                    "routing_cfg": cfg,
+                }
+                run_iterations = _iteration_limit(cfg, creds, DEFAULT_MAX_ITERATIONS)
+            child = _build_child_preserving_parent_tools(
+                task_index=0, goal=request.goal, context=request.context,
+                toolsets=list(request.allowed_toolsets) if request.allowed_toolsets is not None else None,
+                model=(request.model or creds.get("model")), max_iterations=run_iterations,
+                task_count=1, parent_agent=parent, role=request.role,
+                request_blocked_tools=list(request.blocked_tools), **overrides,
+            )
+            config_revision, policy = _profile_policy_snapshot(
+                cfg, request.profile, creds, child=child,
+            )
+            policy["launch_allowed_toolsets"] = (
+                list(request.allowed_toolsets) if request.allowed_toolsets is not None else None
+            )
+            policy["launch_blocked_tools"] = list(request.blocked_tools)
+            policy["role"] = getattr(child, "_delegate_role", request.role)
+            policy["capability_digest"] = ""
+            profile = request.profile
+            frozen_prompt = _prompt_of(child)
+            with contextlib.suppress(Exception):
+                child.close()
+
+        return store.admit_team_run(
+            owner,
+            worker_id=worker_id,
+            request_id=request_id,
+            profile=profile,
+            config_revision=config_revision,
+            policy=policy,
+            frozen_prompt=frozen_prompt,
+            goal=request.goal,
+            context=request.context or "",
+            previous_run_id=previous_run_id,
+            capability_digest="",
+            budget_epoch_id=(
+                previous.get("budget_epoch_id")
+                if previous_run_id and int(worker.get("depth") or 0) > 1
+                else None
+            ),
+            budget_limits=_tree_budget_limits(cfg, creds, DEFAULT_MAX_ITERATIONS),
+        )
+
+    def schedule_team_execution(
+        self, worker_id: str, run_id: str,
+    ) -> Mapping[str, Any]:
+        """Schedule one already-attached PENDING run under current authority."""
+        parent = self._parent_agent_resolver()
+        owner = _owner_session_id_of(parent)
+        store = _persistent_store(parent) if parent is not None else None
+        if store is None or not owner or getattr(parent, "_worker_id", None):
+            raise SubagentLifecycleError("Team execution requires a durable root parent session.")
+        worker = store.get_worker(worker_id, owner)
+        run = store.get_run(run_id, owner)
+        if run["worker_id"] != worker["worker_id"]:
+            raise SubagentLifecycleError("Team execution coordinates do not match.")
+        if worker.get("uncertain_side_effect") or run.get("uncertain_side_effect"):
+            raise SubagentLifecycleError("Reconcile uncertain worker effects before scheduling.")
+        if run["status"] == "PENDING":
+            self._schedule_owner(store, owner, parent, worker_id=worker_id, run_id=run_id)
+            run = store.get_run(run_id, owner)
+        return self._safe_run_snapshot(run)
+
     def status(self, handle: SubagentHandle) -> SubagentStatus:
         record = self._record(handle)
         if record is None:

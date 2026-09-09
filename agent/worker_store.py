@@ -217,6 +217,128 @@ class WorkerStore:
             return self._worker(conn, worker_id, owner_session_id)
         return self.db._execute_write(create)
 
+    def admit_team_run(
+        self, owner_session_id, *, worker_id, request_id, profile=None,
+        config_revision="", policy=None, frozen_prompt="", goal, context="",
+        previous_run_id=None, capability_digest="", budget_epoch_id=None,
+        budget_limits=None,
+    ):
+        """Atomically admit one deterministic parent-managed worker/run pair.
+
+        Worker and request identifiers are coordinates derived by the team
+        service. Reusing them is idempotent only when every immutable field
+        matches; a conflicting retry fails rather than launching another run.
+        """
+        import hashlib
+
+        if not isinstance(owner_session_id, str) or not owner_session_id.strip():
+            raise ValueError("A stable owner session is required")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise ValueError("A stable worker_id is required")
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("A stable request_id is required")
+        if not isinstance(goal, str) or not goal.strip() or not isinstance(context, str):
+            raise ValueError("A run needs a nonempty goal and text context")
+        if not isinstance(capability_digest, str):
+            raise ValueError("capability_digest must be text")
+        policy_value = policy or {}
+        policy_text = _policy_json(policy_value)
+        prompt_hash = hashlib.sha256(frozen_prompt.encode()).hexdigest()
+
+        def admit(conn):
+            now = time.time()
+            worker = _row(conn.execute(
+                "SELECT * FROM orchestration_workers WHERE worker_id=?", (worker_id,),
+            ).fetchone())
+            if worker is None:
+                conn.execute(
+                    """INSERT INTO orchestration_workers
+                    (worker_id,owner_session_id,parent_worker_id,root_worker_id,depth,profile,
+                     config_revision,policy,frozen_prompt,frozen_prompt_hash,created_at,updated_at)
+                    VALUES (?,?,NULL,?,1,?,?,?,?,?,?,?)""",
+                    (
+                        worker_id, owner_session_id, worker_id, profile, config_revision,
+                        policy_text, frozen_prompt, prompt_hash, now, now,
+                    ),
+                )
+                worker = self._worker(conn, worker_id, owner_session_id)
+            else:
+                worker = self._worker(conn, worker_id, owner_session_id)
+                expected = {
+                    "profile": profile,
+                    "config_revision": config_revision,
+                    "policy": policy_value,
+                    "frozen_prompt_hash": prompt_hash,
+                    "parent_worker_id": None,
+                }
+                if any(worker.get(key) != value for key, value in expected.items()):
+                    raise ValueError("Team worker admission conflicts with the existing immutable assignment")
+
+            existing = _row(conn.execute(
+                "SELECT * FROM orchestration_runs WHERE worker_id=? AND request_id=?",
+                (worker_id, request_id),
+            ).fetchone())
+            if existing is not None:
+                if (
+                    existing["goal"], existing["context"], existing["previous_run_id"]
+                ) != (goal, context, previous_run_id):
+                    raise ValueError("Team run admission conflicts with the existing immutable request")
+                return worker, existing
+            if worker["uncertain_side_effect"]:
+                raise ValueError("Reconcile the interrupted tool outcome before resuming this worker")
+            if previous_run_id:
+                previous = self._run(conn, previous_run_id, owner_session_id)
+                latest = conn.execute(
+                    "SELECT run_id FROM orchestration_runs WHERE worker_id=? ORDER BY sequence DESC LIMIT 1",
+                    (worker_id,),
+                ).fetchone()
+                if previous["worker_id"] != worker_id or not latest or latest[0] != previous_run_id:
+                    raise ValueError("Followup must link to this worker's latest run")
+
+            epoch_id = budget_epoch_id
+            if budget_limits is not None:
+                limits = self._normalize_budget_limits(budget_limits)
+                if epoch_id is None:
+                    epoch_id = "budget-" + uuid.uuid4().hex
+                    deadline = now + limits["timeout_seconds"] if limits["timeout_seconds"] else None
+                    conn.execute(
+                        """INSERT INTO orchestration_budget_epochs
+                        (budget_epoch_id,owner_session_id,root_worker_id,max_iterations,max_tool_calls,
+                         deadline_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)""",
+                        (
+                            epoch_id, owner_session_id, worker["root_worker_id"],
+                            limits["max_iterations"], limits["max_tool_calls"],
+                            deadline, now, now,
+                        ),
+                    )
+                epoch = self._budget_epoch(conn, epoch_id, owner_session_id)
+                if epoch["root_worker_id"] != worker["root_worker_id"]:
+                    raise PermissionError("Budget epoch belongs to another worker tree")
+                conn.execute(
+                    """INSERT OR IGNORE INTO orchestration_budget_scopes
+                    (budget_epoch_id,worker_id,max_iterations,max_tool_calls,deadline_at)
+                    VALUES (?,?,?,?,?)""",
+                    (
+                        epoch_id, worker_id, limits["max_iterations"],
+                        limits["max_tool_calls"], epoch["deadline_at"],
+                    ),
+                )
+
+            run_id = "run-" + uuid.uuid4().hex
+            conn.execute(
+                """INSERT INTO orchestration_runs
+                (run_id,worker_id,request_id,previous_run_id,goal,context,status,
+                 capability_digest,budget_epoch_id,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,'PENDING',?,?,?,?)""",
+                (
+                    run_id, worker_id, request_id, previous_run_id, goal, context,
+                    capability_digest, epoch_id, now, now,
+                ),
+            )
+            return worker, self._run(conn, run_id, owner_session_id)
+
+        return self.db._execute_write(admit)
+
     def get_worker(self, worker_id, owner_session_id):
         with self.db._read_ctx() as conn:
             return self._worker(conn, worker_id, owner_session_id)

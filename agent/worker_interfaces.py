@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 INTERFACE_VERSION = "worker-interface-v1"
 CANONICAL_WORKER_TOOL = "delegate_task"
+CANONICAL_TEAM_TOOL = "kanban_team"
 _INTERFACES = frozenset({"auto", "hermes", "codex", "claude"})
 _INTERFACE_NAMES = _INTERFACES - {"auto"}
 _SOURCES = frozenset({"explicit", "qualified_exact_match", "canonical_fallback", "legacy_session"})
@@ -173,6 +174,34 @@ def _control_schema(name: str = "worker_control") -> dict[str, Any]:
     )
 
 
+def _team_schema(name: str) -> dict[str, Any]:
+    return _object_schema(
+        name,
+        "Coordinate dependency-linked Kanban tasks through authorized durable workers and review.",
+        {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "create", "start", "guide", "submit_review", "accept",
+                    "request_changes", "cancel",
+                ],
+            },
+            "task_ref": {"type": "string", "description": "Typed task reference."},
+            "title": _TEXT,
+            "body": _TEXT,
+            "profile": _PROFILE,
+            "parent_refs": {"type": "array", "items": {"type": "string"}},
+            "targets": {"type": "array", "items": {"type": "string"}},
+            "message": _TEXT,
+            "reviewer": _PROFILE,
+            "summary": _TEXT,
+            "idempotency_key": _TEXT,
+            "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 60},
+        },
+        ("action",),
+    )
+
+
 def _codex_schemas() -> tuple[dict[str, Any], ...]:
     return (
         _object_schema("worker_capabilities", "List configured worker profiles and permitted shared references.", {"profile": _PROFILE, "reference": _REFERENCE}),
@@ -252,11 +281,20 @@ def _claude_schemas() -> tuple[dict[str, Any], ...]:
 
 
 _SCHEMA_FACTORIES = {"codex": _codex_schemas, "claude": _claude_schemas}
+_TEAM_SCHEMA_FACTORIES = {
+    "codex": lambda: _team_schema("team_task"),
+    "claude": lambda: _team_schema("TeamTask"),
+}
 
 
 def _semantic_schemas(selection: InterfaceSelection) -> tuple[dict[str, Any], ...]:
     factory = _SCHEMA_FACTORIES.get(selection.name)
     return factory() if factory is not None else ()
+
+
+def _team_semantic_schema(selection: InterfaceSelection) -> Optional[dict[str, Any]]:
+    factory = _TEAM_SCHEMA_FACTORIES.get(selection.name)
+    return factory() if factory is not None else None
 
 
 def _namespaced_alias(name: str) -> str:
@@ -271,12 +309,19 @@ def bind_worker_interface(
 
     if selection.aliases:
         return selection
+    definitions = list(definitions)
+    canonical_names = {
+        str(item.get("function", {}).get("name")) for item in definitions
+    }
     if selection.name == "hermes":
-        return replace(selection, aliases=((CANONICAL_WORKER_TOOL, CANONICAL_WORKER_TOOL),))
+        aliases = [(CANONICAL_WORKER_TOOL, CANONICAL_WORKER_TOOL)]
+        if CANONICAL_TEAM_TOOL in canonical_names:
+            aliases.append((CANONICAL_TEAM_TOOL, CANONICAL_TEAM_TOOL))
+        return replace(selection, aliases=tuple(aliases))
     occupied = {
         str(item.get("function", {}).get("name"))
         for item in definitions
-        if item.get("function", {}).get("name") != CANONICAL_WORKER_TOOL
+        if item.get("function", {}).get("name") not in {CANONICAL_WORKER_TOOL, CANONICAL_TEAM_TOOL}
     }
     aliases: list[tuple[str, str]] = []
     for schema in _semantic_schemas(selection):
@@ -290,6 +335,18 @@ def bind_worker_interface(
                 advertised = f"{base}_{suffix}"
                 suffix += 1
         occupied.add(advertised)
+        aliases.append((semantic, advertised))
+    team_schema = _team_semantic_schema(selection)
+    if CANONICAL_TEAM_TOOL in canonical_names and team_schema is not None:
+        semantic = str(team_schema["function"]["name"])
+        advertised = semantic
+        if advertised in occupied:
+            base = _namespaced_alias(semantic)
+            advertised = base
+            suffix = 2
+            while advertised in occupied:
+                advertised = f"{base}_{suffix}"
+                suffix += 1
         aliases.append((semantic, advertised))
     return replace(selection, aliases=tuple(aliases))
 
@@ -351,12 +408,23 @@ def restore_worker_interface_contract(
         ):
             raise ValueError("Retained worker interface aliases are invalid.")
         aliases.append((item[0], item[1]))
-    expected = (
+    legacy_expected = (
         {CANONICAL_WORKER_TOOL}
         if name == "hermes"
         else {schema["function"]["name"] for schema in _SCHEMA_FACTORIES[name]()}
     )
-    if {semantic for semantic, _ in aliases} != expected or len(aliases) != len(expected):
+    current_expected = set(legacy_expected)
+    team_schema = _team_semantic_schema(InterfaceSelection(
+        str(name), str(source), str(qualification), "", ""
+    ))
+    if name == "hermes":
+        current_expected.add(CANONICAL_TEAM_TOOL)
+    elif team_schema is not None:
+        current_expected.add(str(team_schema["function"]["name"]))
+    actual_semantics = {semantic for semantic, _ in aliases}
+    if frozenset(actual_semantics) not in {
+        frozenset(legacy_expected), frozenset(current_expected),
+    } or len(aliases) != len(actual_semantics):
         raise ValueError("Retained worker interface aliases do not match the interface version.")
     advertised = [alias for _, alias in aliases]
     if len(advertised) != len(set(advertised)):
@@ -364,8 +432,17 @@ def restore_worker_interface_contract(
     occupied = {
         str(item.get("function", {}).get("name"))
         for item in definitions
-        if item.get("function", {}).get("name") != CANONICAL_WORKER_TOOL
+        if item.get("function", {}).get("name") not in {CANONICAL_WORKER_TOOL, CANONICAL_TEAM_TOOL}
     }
+    team_semantic = (
+        CANONICAL_TEAM_TOOL if name == "hermes"
+        else str(team_schema["function"]["name"]) if team_schema is not None else ""
+    )
+    registered_names = {
+        str(item.get("function", {}).get("name")) for item in definitions
+    }
+    if team_semantic in actual_semantics and CANONICAL_TEAM_TOOL not in registered_names:
+        raise ValueError("Retained team interface is unavailable in the current registry.")
     collisions = sorted(occupied.intersection(advertised))
     if collisions:
         raise ValueError(
@@ -387,6 +464,7 @@ def project_worker_tool_definitions(
     aliases = dict(selection.aliases)
     reserved_aliases = set(aliases.values())
     replacement = _SCHEMA_FACTORIES.get(selection.name)
+    team_replacement = _TEAM_SCHEMA_FACTORIES.get(selection.name)
     for definition in definitions:
         name = definition.get("function", {}).get("name")
         if name == CANONICAL_WORKER_TOOL and replacement is not None:
@@ -397,6 +475,18 @@ def project_worker_tool_definitions(
                     "function": {**schema["function"], "name": aliases.get(semantic, semantic)},
                 }
                 projected.append(renamed)
+        elif name == CANONICAL_TEAM_TOOL and team_replacement is not None:
+            schema = team_replacement()
+            semantic = schema["function"]["name"]
+            if semantic in aliases:
+                projected.append({
+                    **schema,
+                    "function": {**schema["function"], "name": aliases[semantic]},
+                })
+            # A retained pre-team contract keeps its original frozen catalog.
+        elif name in {CANONICAL_WORKER_TOOL, CANONICAL_TEAM_TOOL} and name not in aliases:
+            # Retained Hermes sessions also keep the catalog frozen.
+            continue
         elif replacement is not None and name in reserved_aliases:
             raise ValueError(
                 f"Frozen worker interface alias '{name}' now collides with a registered tool."
@@ -417,6 +507,7 @@ _CODEX_OPERATIONS = {
     "interrupt_agent": "interrupt_run",
     "cancel_agent_tree": "cancel_tree",
     "worker_control": "control",
+    "team_task": "team",
 }
 _CLAUDE_OPERATIONS = {
     "TaskCapabilities": "capabilities",
@@ -426,7 +517,12 @@ _CLAUDE_OPERATIONS = {
     "TaskList": "list",
     "TaskStop": "interrupt_run",
     "worker_control": "control",
+    "TeamTask": "team",
 }
+_TEAM_ARGUMENTS = frozenset({
+    "action", "task_ref", "title", "body", "profile", "parent_refs", "targets",
+    "message", "reviewer", "summary", "idempotency_key", "timeout_seconds",
+})
 _CODEX_ARGUMENTS = {
     "worker_capabilities": frozenset({"profile", "reference"}),
     "spawn_agent": frozenset({"message", "context", "profile", "provider", "model", "reasoning_effort"}),
@@ -438,6 +534,7 @@ _CODEX_ARGUMENTS = {
     "interrupt_agent": frozenset({"target", "run_id"}),
     "cancel_agent_tree": frozenset({"target"}),
     "worker_control": frozenset({"action", "target", "run_id", "disposition", "note"}),
+    "team_task": _TEAM_ARGUMENTS,
 }
 _CLAUDE_ARGUMENTS = {
     "TaskCapabilities": frozenset({"profile", "reference"}),
@@ -447,6 +544,7 @@ _CLAUDE_ARGUMENTS = {
     "TaskList": frozenset(),
     "TaskStop": frozenset({"task_id", "run_id", "scope"}),
     "worker_control": frozenset({"action", "target", "run_id", "disposition", "note"}),
+    "TeamTask": _TEAM_ARGUMENTS,
 }
 
 
@@ -457,18 +555,18 @@ def advertised_worker_tool_names(selection: InterfaceSelection) -> frozenset[str
         return frozenset(_CODEX_OPERATIONS)
     if selection.name == "claude":
         return frozenset(_CLAUDE_OPERATIONS)
-    return frozenset({CANONICAL_WORKER_TOOL})
+    return frozenset({CANONICAL_WORKER_TOOL, CANONICAL_TEAM_TOOL})
 
 
 def semantic_worker_tool(selection: Optional[InterfaceSelection], tool_name: str) -> Optional[str]:
     """Resolve only the aliases frozen for this exact session."""
 
     if not isinstance(selection, InterfaceSelection):
-        return CANONICAL_WORKER_TOOL if tool_name == CANONICAL_WORKER_TOOL else None
+        return tool_name if tool_name in {CANONICAL_WORKER_TOOL, CANONICAL_TEAM_TOOL} else None
     aliases = selection.aliases
     if not aliases:
         if selection.name == "hermes":
-            return CANONICAL_WORKER_TOOL if tool_name == CANONICAL_WORKER_TOOL else None
+            return tool_name if tool_name in {CANONICAL_WORKER_TOOL, CANONICAL_TEAM_TOOL} else None
         operations = _CODEX_OPERATIONS if selection.name == "codex" else _CLAUDE_OPERATIONS
         return tool_name if tool_name in operations else None
     return next((semantic for semantic, advertised in aliases if advertised == tool_name), None)
@@ -479,7 +577,10 @@ def canonical_worker_capability(
 ) -> str:
     """Return the authority-bearing registry capability for an interface tool."""
 
-    if semantic_worker_tool(selection, tool_name) is not None:
+    semantic = semantic_worker_tool(selection, tool_name)
+    if semantic is not None:
+        if semantic in {CANONICAL_TEAM_TOOL, "team_task", "TeamTask"}:
+            return CANONICAL_TEAM_TOOL
         return CANONICAL_WORKER_TOOL
     return tool_name
 
@@ -518,6 +619,8 @@ def normalize_worker_call(
     advertised_name = tool_name
     tool_name = semantic_worker_tool(selection, advertised_name) or ""
     if selection.name == "hermes":
+        if tool_name == CANONICAL_TEAM_TOOL:
+            return CanonicalWorkerCall("team", args)
         if tool_name != CANONICAL_WORKER_TOOL:
             raise ValueError(f"Tool '{advertised_name}' is not part of the hermes worker interface.")
         return CanonicalWorkerCall(_hermes_operation(args), args)
@@ -547,6 +650,7 @@ def normalize_worker_call(
                 "run_id": args.get("run_id"), "reconciliation_disposition": args.get("disposition"),
                 "message": args.get("note"),
             },
+            "team_task": lambda: args,
         }[tool_name]()
         if tool_name == "worker_control":
             operation = _normalized(args.get("action"))
@@ -585,6 +689,7 @@ def normalize_worker_call(
             "run_id": args.get("run_id"), "reconciliation_disposition": args.get("disposition"),
             "message": args.get("note"),
         },
+        "TeamTask": lambda: args,
     }[tool_name]()
     if tool_name == "worker_control":
         operation = _normalized(args.get("action"))
@@ -609,6 +714,7 @@ def _receipt(
     tool_name: str,
     operation: str,
     effective_action: str,
+    canonical_tool: str = CANONICAL_WORKER_TOOL,
 ) -> dict[str, Any]:
     receipt = {
         "interface": selection.name,
@@ -617,9 +723,13 @@ def _receipt(
         "qualification": selection.qualification,
         "advertised_tool": tool_name,
         "operation": operation,
-        "canonical_tool": CANONICAL_WORKER_TOOL,
+        "canonical_tool": canonical_tool,
         "effective_action": effective_action,
-        "worker_service": "AIAgent._dispatch_delegate_task/SubagentLifecycleService",
+        "worker_service": (
+            "TeamOrchestrationService"
+            if canonical_tool == CANONICAL_TEAM_TOOL
+            else "AIAgent._dispatch_delegate_task/SubagentLifecycleService"
+        ),
         "provider": selection.provider,
         "model": selection.model,
     }
@@ -652,12 +762,18 @@ def dispatch_worker_interface_call(
         return json.dumps(payload, ensure_ascii=False)
 
     canonical_args = dict(call.arguments)
+    canonical_tool = canonical_worker_capability(selection, tool_name)
     effective_action = str(canonical_args.get("action") or "spawn")
-    payload = _decode_result(dispatch(canonical_args))
+    if canonical_tool == CANONICAL_TEAM_TOOL:
+        from agent.team_orchestration import TeamOrchestrationService
+        payload = _decode_result(TeamOrchestrationService(parent_agent).dispatch(canonical_args))
+    else:
+        payload = _decode_result(dispatch(canonical_args))
     payload["orchestration_interface"] = _receipt(
         selection,
         tool_name=tool_name,
         operation=call.operation,
         effective_action=effective_action,
+        canonical_tool=canonical_tool,
     )
     return json.dumps(payload, ensure_ascii=False)

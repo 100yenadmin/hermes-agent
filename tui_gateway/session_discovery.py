@@ -13,7 +13,7 @@ from agent.shared_discovery import SharedDiscoveryScope, build_local_discovery_s
 
 
 _UNKNOWN = "Unknown or unavailable discovery reference."
-_ROOM_ACTIONS = frozenset({"inspect"})
+_ROOM_ACTIONS = frozenset({"inspect", "message"})
 
 
 @dataclass(frozen=True)
@@ -48,7 +48,7 @@ def _normalized_policy(cfg: Mapping[str, Any]) -> tuple[tuple[dict[str, Any], ..
         actions = tuple(sorted({str(item).strip() for item in raw_actions if str(item).strip()}))
         participants = tuple(sorted({str(item).strip() for item in raw_participants if str(item).strip()}))
         if not set(actions).issubset(_ROOM_ACTIONS):
-            raise ValueError("Discovery room actions currently support only inspect")
+            raise ValueError("Discovery room actions currently support inspect and message")
         normalized.append({"id": room_id, "actions": list(actions), "participants": list(participants)})
         seen.add(room_id)
     encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
@@ -148,6 +148,21 @@ class GatewayRoomDiscoveryProvider:
                 continue
             references.append(self._item(pin, room))
         return {"references": references}
+
+    def send(
+        self, agent: Any, reference: str, *, event_id: str, payload: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Append one user message after revalidating the frozen room grant."""
+
+        room_id = str(reference or "").partition(":")[2]
+        pin = next(
+            (item for item in self.pins if item.room_id == room_id and "message" in item.actions),
+            None,
+        )
+        if pin is None:
+            raise PermissionError(_UNKNOWN)
+        self._validate(agent, pin)
+        return self.service.send(room_id=room_id, event_id=event_id, payload=dict(payload))
 
 
 def build_gateway_discovery_scope(

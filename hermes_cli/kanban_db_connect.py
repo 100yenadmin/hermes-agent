@@ -814,6 +814,7 @@ _LATER_TASK_COLUMNS = (
     ("max_runtime_seconds", "max_runtime_seconds INTEGER"),
     ("last_heartbeat_at", "last_heartbeat_at INTEGER"),
     ("current_run_id", "current_run_id INTEGER"),
+    ("execution_mode", "execution_mode TEXT NOT NULL DEFAULT 'dispatcher'"),
     ("workflow_template_id", "workflow_template_id TEXT"),
     ("current_step_key", "current_step_key TEXT"),
     # JSON array of skill names the dispatcher force-loads via --skills.
