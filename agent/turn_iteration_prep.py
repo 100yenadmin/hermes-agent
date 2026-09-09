@@ -361,6 +361,12 @@ def begin_iteration(
         if not agent.quiet_mode:
             agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
         return _verdict("break")
+    # A toolless/empty cut-off response has no replayable assistant content.
+    # Keep its marker until admission succeeds (the denied exit must not call
+    # the finalizer's summary model), but never send an empty row to a provider.
+    messages[:] = [m for m in messages if not (
+        m.get("_tool_retry_fragment") and not m.get("content")
+    )]
     return _verdict("fallthrough")
 
 
@@ -452,6 +458,11 @@ def apply_retry_restarts(
         # Failover shrank the compressor window: clear the preflight block so
         # preflight re-runs before the first fallback call (single consumer).
         _preflight_compression_blocked = False
+        return _verdict("continue")
+
+    if _retry.restart_with_tool_retry:
+        # The previous generation consumed budget. Do not refund it or retry
+        # inside the API-error loop; retain the existing output-cap adjustment.
         return _verdict("continue")
 
     if _retry.restart_with_length_continuation:

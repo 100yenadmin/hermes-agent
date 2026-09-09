@@ -180,6 +180,9 @@ def check_api_response(
             max_compression_attempts=max_compression_attempts,
         )
         compression_attempts = _usage_outcome.compression_attempts
+        if _usage_outcome.rearmed:
+            _preflight_compression_blocked = False
+            _last_preflight_pressure = None
         _tv = recover_from_truncation(
             agent, response, finish_reason, _retry, messages=messages,
             conversation_history=conversation_history, api_kwargs=api_kwargs,

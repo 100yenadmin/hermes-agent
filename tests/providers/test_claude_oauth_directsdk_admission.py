@@ -108,7 +108,8 @@ def test_cancel_closes_the_active_upstream_socket(tmp_path):
 
 
 @pytest.mark.parametrize('continuation', ['allow', 'budget_denied', 'cancelled'])
-def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuation):
+@pytest.mark.parametrize('partial_tool', [False, True])
+def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuation, partial_tool):
     """Real host loop + real relay; only the native process and HTTPS peer are fixtures."""
     from unittest.mock import patch
     from run_agent import AIAgent
@@ -135,6 +136,12 @@ def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuat
                 {'type': 'message_delta', 'delta': {'stop_reason': stop}, 'usage': usage},
                 {'type': 'message_stop'},
             ]
+            if partial_tool and len(calls) == 1:
+                events[4:4] = [
+                    {'type': 'content_block_start', 'index': 1, 'content_block': {'type': 'tool_use', 'id': 'cut', 'name': 'mcp__hermes__fixture_read', 'input': {}}},
+                    {'type': 'content_block_delta', 'index': 1, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":"'}},
+                    {'type': 'content_block_stop', 'index': 1},
+                ]
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.end_headers()
@@ -177,13 +184,17 @@ def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuat
     from providers import get_provider_profile
     monkeypatch.setattr(get_provider_profile('claude-oauth-directsdk'), 'create_client', fixture_client)
     try:
-        with patch('model_tools.get_tool_definitions', return_value=[]), patch('model_tools.check_toolset_requirements', return_value={}):
+        definitions = [{'type': 'function', 'function': {'name': 'fixture_read', 'description': 'Fixture only', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}}}}}] if partial_tool else []
+        with patch('model_tools.get_tool_definitions', return_value=definitions), patch('model_tools.check_toolset_requirements', return_value={}):
             agent = AIAgent(provider='claude-oauth-directsdk', model='claude-sonnet-4-6',
                             api_key='external-process', base_url='process://claude-oauth-directsdk',
                             quiet_mode=True, skip_context_files=True, skip_memory=True,
                             save_trajectories=False, max_iterations=4)
         agent._cached_system_prompt = 'You are helpful.'
         agent.compression_enabled = False
+        # Exercise the host's distinct truncated-tool path; streaming recovery
+        # may discard the malformed call and select plain-text continuation.
+        agent._disable_streaming = partial_tool
         agent.step_callback = lambda *_: order.append('step')
         consume = IterationBudget.consume
 
@@ -220,18 +231,27 @@ def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuat
             expected_order.append('denied')
         assert order == expected_order, order
         assert all(request['model'] == 'claude-sonnet-4-6' for request in requests)
+        assert agent.session_api_calls == expected
+        assert agent.session_output_tokens == expected * 3
+        assert not any(m.get('tool_calls') or m.get('role') == 'tool' for m in result['messages'])
         if continuation == 'allow':
             assert result['completed'] is True
-            assert result['final_response'] == 'Part 1 Part 2'
+            assert result['final_response'] == ('Part 2' if partial_tool else 'Part 1 Part 2')
             assert result['api_calls'] == 2
-            assert requests[1]['messages'][-1]['role'] == 'user'
-            assert 'truncated by the output length limit' in requests[1]['messages'][-1]['content']
+            if partial_tool:
+                assert sum(m.get('content') == 'Part 1 ' for m in result['messages']) == 1
+                assert not any(m.get('tool_calls') for m in requests[1]['messages'])
+            else:
+                assert requests[1]['messages'][-1]['role'] == 'user'
+                assert 'truncated by the output length limit' in requests[1]['messages'][-1]['content']
         elif continuation == 'cancelled':
             assert result['interrupted'] is True
         else:
             assert result['completed'] is False
-            assert result['final_response'] == 'Part 1'
-            assert sum(m.get('content') == 'Part 1' for m in result['messages']) == 1
+            # Hermes may append its existing iteration-limit explanation; the
+            # partial answer must survive once, still explicitly incomplete.
+            assert result['final_response'].startswith('Part 1')
+            assert sum((m.get('content') or '').startswith('Part 1') for m in result['messages']) == 1
             assert not any(m.get('_length_continuation_nudge') for m in result['messages'])
     finally:
         for client in clients:

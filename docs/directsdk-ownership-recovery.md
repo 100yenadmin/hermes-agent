@@ -28,10 +28,15 @@ hooks, request counts and the assembled continuation.
 - Allowed continuation: two host provider invocations, one forwarded request each;
   both native recovery attempts blocked; assembled answer retained.
 - Hard admission denial: one forwarded request; partial answer returned without the
-  finalizer's extra model call. This is distinct from normal Hermes wrap-up policy.
+  finalizer's extra model call and with an incomplete outcome. This is distinct from
+  normal Hermes wrap-up policy.
 - Cancellation after the partial step: one forwarded request, interrupted result.
 - Incomplete tool arguments: previous text and usage retained with a length finish;
-  no signed replay carrier for the invalid call.
+  no signed replay carrier for the invalid call. The separate non-streaming tool-retry
+  path now returns to outer iteration admission instead of reusing the first permit.
+  Both text and cut-off-tool fixtures pass allow/deny/cancel (six cases); no tool executes.
+- A usage fold confirming compression recovery clears the existing preflight latch
+  before truncation restarts, as it does for a complete response.
 - Whitespace edit and legacy stripped carrier: canonical visible text replaces stale
   native blocks; unchanged prefixes retain their original blocks.
 
