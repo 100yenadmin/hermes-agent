@@ -635,14 +635,14 @@ class WorkerStore:
         return self.db._execute_write(recover)
 
     def cancel_pending_run(self, run_id, owner_session_id):
-        """Cancel one exact queued run without changing its worker or descendants."""
+        """Interrupt one exact queued run without cancelling its durable worker."""
         def cancel(conn):
             run = self._run(conn, run_id, owner_session_id)
             if run["status"] != "PENDING":
                 return None
             now = time.time()
             conn.execute(
-                "UPDATE orchestration_runs SET status='CANCELLED',result=?,updated_at=? WHERE run_id=?",
+                "UPDATE orchestration_runs SET status='INTERRUPTED',result=?,updated_at=? WHERE run_id=?",
                 (json.dumps({"reason": "worker_run_interrupted_before_start"}), now, run_id),
             )
             return self._run(conn, run_id, owner_session_id)

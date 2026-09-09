@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 from scripts.evals import interface_qualification as runner
 from scripts.evals.interface_qualification import load_fixture, run_suite
@@ -171,3 +172,34 @@ def test_timeout_and_controller_failures_are_sanitized(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert json.loads(output)["qualification"] == "unqualified"
     assert secret not in output
+
+
+def test_running_guidance_releases_only_after_an_accepted_message():
+    runs = [{"run_id": "run-1", "status": "RUNNING"}]
+
+    class Store:
+        def list_runs(self, worker_id, owner):
+            assert (worker_id, owner) == ("worker-1", "owner")
+            return list(runs)
+
+    responses = [
+        {"error": "denied", "orchestration_interface": {"effective_action": "message"}},
+        {"success": True, "orchestration_interface": {"effective_action": "resume"}},
+        {"success": True, "orchestration_interface": {"effective_action": "message"}},
+    ]
+    parent = SimpleNamespace(
+        _dispatch_worker_interface=lambda _name, _args: json.dumps(responses.pop(0))
+    )
+    released = []
+    events, restore = runner._instrument_interface(
+        parent, Store(), "owner", accepted_running_guidance=lambda: released.append(True)
+    )
+    try:
+        parent._dispatch_worker_interface("send_message", {"target": "worker-1"})
+        parent._dispatch_worker_interface("followup_task", {"target": "worker-1"})
+        assert released == []
+        parent._dispatch_worker_interface("send_message", {"target": "worker-1"})
+        assert released == [True]
+        assert [event["accepted"] for event in events] == [False, True, True]
+    finally:
+        restore()

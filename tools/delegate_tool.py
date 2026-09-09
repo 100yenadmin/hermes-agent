@@ -229,6 +229,7 @@ def _build_child_agent(
     frozen_system_prompt: Optional[str] = None,
     retained_child_depth: Optional[int] = None,
     retained_parent_worker_id: Optional[str] = None,
+    worker_interface_contract: Optional[Dict[str, Any]] = None,
     # Configuration block that owns the selected provider/model route. Internal
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
@@ -340,6 +341,7 @@ def _build_child_agent(
                     if child_progress_cb else None
                 ),
                 session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
+                worker_interface_contract=worker_interface_contract,
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
             )

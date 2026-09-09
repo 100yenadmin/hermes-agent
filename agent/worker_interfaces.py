@@ -17,6 +17,11 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 INTERFACE_VERSION = "worker-interface-v1"
 CANONICAL_WORKER_TOOL = "delegate_task"
 _INTERFACES = frozenset({"auto", "hermes", "codex", "claude"})
+_INTERFACE_NAMES = _INTERFACES - {"auto"}
+_SOURCES = frozenset({"explicit", "qualified_exact_match", "canonical_fallback", "legacy_session"})
+_QUALIFICATIONS = frozenset({"stable", "experimental_unqualified", "live_evidence_qualified"})
+_TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
+_EVIDENCE_REF = re.compile(r"^[A-Za-z0-9._:/#@+\-]{1,256}$")
 
 
 @dataclass(frozen=True)
@@ -288,6 +293,90 @@ def bind_worker_interface(
     return replace(selection, aliases=tuple(aliases))
 
 
+def frozen_worker_interface_contract(selection: Optional[InterfaceSelection]) -> dict[str, Any]:
+    """Return the sanitized presentation contract stored with a durable worker."""
+
+    if not isinstance(selection, InterfaceSelection):
+        selection = InterfaceSelection(
+            "hermes", "legacy_session", "stable", "", "",
+            aliases=((CANONICAL_WORKER_TOOL, CANONICAL_WORKER_TOOL),),
+        )
+    contract: dict[str, Any] = {
+        "version": selection.version,
+        "name": selection.name,
+        "source": selection.source,
+        "qualification": selection.qualification,
+        "aliases": [list(item) for item in selection.aliases],
+    }
+    if selection.evidence_ref and _EVIDENCE_REF.fullmatch(selection.evidence_ref):
+        contract["evidence_ref"] = selection.evidence_ref
+    return contract
+
+
+def restore_worker_interface_contract(
+    contract: Optional[Mapping[str, Any]], *, provider: Any, model: Any,
+    definitions: Iterable[Mapping[str, Any]],
+) -> InterfaceSelection:
+    """Validate and restore a retained presentation without expanding authority."""
+
+    definitions = list(definitions)
+    if contract is None:
+        return bind_worker_interface(
+            InterfaceSelection(
+                "hermes", "legacy_session", "stable", _normalized(provider), _normalized(model)
+            ),
+            definitions,
+        )
+    if not isinstance(contract, Mapping) or contract.get("version") != INTERFACE_VERSION:
+        raise ValueError("Retained worker interface contract has an unsupported version.")
+    name = contract.get("name")
+    source = contract.get("source")
+    qualification = contract.get("qualification")
+    evidence_ref = contract.get("evidence_ref")
+    if name not in _INTERFACE_NAMES or source not in _SOURCES or qualification not in _QUALIFICATIONS:
+        raise ValueError("Retained worker interface contract metadata is invalid.")
+    if evidence_ref is not None and (
+        not isinstance(evidence_ref, str) or not _EVIDENCE_REF.fullmatch(evidence_ref)
+    ):
+        raise ValueError("Retained worker interface evidence reference is invalid.")
+    raw_aliases = contract.get("aliases")
+    if not isinstance(raw_aliases, list):
+        raise ValueError("Retained worker interface aliases are invalid.")
+    aliases: list[tuple[str, str]] = []
+    for item in raw_aliases:
+        if (
+            not isinstance(item, list) or len(item) != 2
+            or not all(isinstance(value, str) and _TOOL_NAME.fullmatch(value) for value in item)
+        ):
+            raise ValueError("Retained worker interface aliases are invalid.")
+        aliases.append((item[0], item[1]))
+    expected = (
+        {CANONICAL_WORKER_TOOL}
+        if name == "hermes"
+        else {schema["function"]["name"] for schema in _SCHEMA_FACTORIES[name]()}
+    )
+    if {semantic for semantic, _ in aliases} != expected or len(aliases) != len(expected):
+        raise ValueError("Retained worker interface aliases do not match the interface version.")
+    advertised = [alias for _, alias in aliases]
+    if len(advertised) != len(set(advertised)):
+        raise ValueError("Retained worker interface aliases contain duplicate tool names.")
+    occupied = {
+        str(item.get("function", {}).get("name"))
+        for item in definitions
+        if item.get("function", {}).get("name") != CANONICAL_WORKER_TOOL
+    }
+    collisions = sorted(occupied.intersection(advertised))
+    if collisions:
+        raise ValueError(
+            f"Retained worker interface aliases now collide with registered tools: {collisions}"
+        )
+    return InterfaceSelection(
+        str(name), str(source), str(qualification), _normalized(provider), _normalized(model),
+        evidence_ref if isinstance(evidence_ref, str) else None,
+        aliases=tuple(aliases),
+    )
+
+
 def project_worker_tool_definitions(
     definitions: Iterable[Mapping[str, Any]], selection: InterfaceSelection
 ) -> list[dict[str, Any]]:
@@ -308,10 +397,9 @@ def project_worker_tool_definitions(
                 }
                 projected.append(renamed)
         elif replacement is not None and name in reserved_aliases:
-            # A tool registered after the session froze cannot take an alias
-            # already present in model history. It becomes visible next session,
-            # when binding can choose a different worker alias around it.
-            continue
+            raise ValueError(
+                f"Frozen worker interface alias '{name}' now collides with a registered tool."
+            )
         else:
             projected.append(dict(definition))
     return projected

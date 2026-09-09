@@ -17,10 +17,12 @@ from agent.worker_interfaces import (
     bind_worker_interface,
     canonical_worker_capability,
     dispatch_worker_interface_call,
+    frozen_worker_interface_contract,
     is_worker_interface_tool,
     normalize_worker_call,
     project_worker_tool_definitions,
     resolve_worker_interface,
+    restore_worker_interface_contract,
 )
 from agent.worker_store import WorkerStore
 from hermes_state import SessionDB
@@ -87,16 +89,38 @@ def test_resolution_and_collision_binding_preserve_native_tools_and_routes(monke
     assert native_result == {"native": "send_message"}
     assert nested_calls == [("send_message", {"action": "list"})]
 
-    # A later registry refresh cannot rename the frozen alias or create a
-    # duplicate schema in the session. The new collision is reconsidered on
-    # the next session bind.
-    refreshed = project_worker_tool_definitions(
-        [_schema("send_message"), _schema("hermes_worker_send_message"), _schema(CANONICAL_WORKER_TOOL)],
-        codex,
+    contract = frozen_worker_interface_contract(codex)
+    from agent.subagent_lifecycle import _profile_policy_snapshot
+
+    _revision, stored_policy = _profile_policy_snapshot(
+        {}, None, {}, child=SimpleNamespace(
+            _worker_interface_selection=codex,
+            _worker_effective_tool_names={CANONICAL_WORKER_TOOL},
+        ),
     )
-    refreshed_names = [item["function"]["name"] for item in refreshed]
-    assert refreshed_names.count("hermes_worker_send_message") == 1
-    assert refreshed_names.count("send_message") == 1
+    assert stored_policy["worker_interface"] == contract
+    restored = restore_worker_interface_contract(
+        contract, provider="changed-provider", model="changed-model", definitions=definitions,
+    )
+    assert restored.aliases == codex.aliases
+    assert (restored.name, restored.provider, restored.model) == (
+        "codex", "changed-provider", "changed-model",
+    )
+    legacy = restore_worker_interface_contract(
+        None, provider="fixture", model="model", definitions=definitions,
+    )
+    assert (legacy.name, legacy.source) == ("hermes", "legacy_session")
+    with pytest.raises(ValueError, match="now collide"):
+        restore_worker_interface_contract(
+            contract,
+            provider="fixture",
+            model="model",
+            definitions=[*definitions, _schema("hermes_worker_send_message")],
+        )
+    with pytest.raises(ValueError, match="now collides"):
+        project_worker_tool_definitions(
+            [*definitions, _schema("hermes_worker_send_message")], codex,
+        )
 
     qualified = resolve_worker_interface(
         {"orchestration": {"interface": "auto"}},
@@ -133,11 +157,31 @@ def test_resolution_and_collision_binding_preserve_native_tools_and_routes(monke
     assert "Task" not in claude_names
 
 
+def test_configured_native_allowlist_cannot_grant_a_styled_worker_alias():
+    from tools.delegate_tool_toolsets import _apply_exact_tool_policy
+
+    definitions = [_schema(CANONICAL_WORKER_TOOL)]
+    child = SimpleNamespace(
+        _worker_interface_selection=_selection("codex", definitions),
+        _executable_tool_names={CANONICAL_WORKER_TOOL},
+        valid_tool_names={"send_message"},
+        tools=[_schema("send_message")],
+    )
+    policy = SimpleNamespace(
+        allowed_tools=("send_message",), allowed_mcp_tools=None,
+        blocked_tools=(), allowed_toolsets=None,
+    )
+    _apply_exact_tool_policy(child, policy)
+    assert child._worker_effective_tool_names == frozenset()
+    assert child.valid_tool_names == set()
+
+
 def _interface_call(selection, semantic, **values):
     if selection.name == "hermes":
         action = {
             "list": "status", "inspect": "inspect", "wait": "wait", "message": "message",
-            "followup": "resume", "interrupt": "interrupt", "completions": "completions",
+            "followup": "resume", "interrupt": "interrupt", "cancel_tree": "cancel",
+            "completions": "completions",
             "ack": "ack", "reconcile": "reconcile",
         }[semantic]
         return CANONICAL_WORKER_TOOL, {"action": action, **values}
@@ -145,7 +189,8 @@ def _interface_call(selection, semantic, **values):
         names = {
             "list": "list_agents", "inspect": "inspect_agent", "wait": "wait_agent",
             "message": "send_message", "followup": "followup_task",
-            "interrupt": "interrupt_agent", "completions": "worker_control",
+            "interrupt": "interrupt_agent", "cancel_tree": "cancel_agent_tree",
+            "completions": "worker_control",
             "ack": "worker_control", "reconcile": "worker_control",
         }
         args = {
@@ -155,6 +200,7 @@ def _interface_call(selection, semantic, **values):
             "message": {"target": values.get("worker_id"), "message": values.get("message")},
             "followup": {"target": values.get("worker_id"), "message": values.get("message")},
             "interrupt": {"target": values.get("worker_id"), "run_id": values.get("run_id")},
+            "cancel_tree": {"target": values.get("worker_id")},
             "completions": {"action": "completions"},
             "ack": {"action": "ack", "target": values.get("worker_id"), "run_id": values.get("run_id")},
             "reconcile": {
@@ -169,6 +215,7 @@ def _interface_call(selection, semantic, **values):
     names = {
         "list": "TaskList", "inspect": "TaskOutput", "wait": "TaskOutput",
         "message": "SendMessage", "followup": "SendMessage", "interrupt": "TaskStop",
+        "cancel_tree": "TaskStop",
         "completions": "worker_control", "ack": "worker_control", "reconcile": "worker_control",
     }
     args = {
@@ -178,6 +225,7 @@ def _interface_call(selection, semantic, **values):
         "message": {"recipient": values.get("worker_id"), "content": values.get("message")},
         "followup": {"recipient": values.get("worker_id"), "content": values.get("message"), "if_idle": True},
         "interrupt": {"task_id": values.get("worker_id"), "run_id": values.get("run_id"), "scope": "run"},
+        "cancel_tree": {"task_id": values.get("worker_id"), "scope": "tree"},
         "completions": {"action": "completions"},
         "ack": {"action": "ack", "target": values.get("worker_id"), "run_id": values.get("run_id")},
         "reconcile": {
@@ -277,7 +325,12 @@ def test_interfaces_route_real_store_controls_with_ordering_and_authorization(
     assert followup["orchestration_interface"]["effective_action"] == "resume"
 
     interrupted = dispatch("interrupt", worker_id="target", run_id=queued["run_id"])
-    assert interrupted["status"] == "CANCELLED"
+    assert interrupted["status"] == "INTERRUPTED"
+    continued = dispatch("followup", worker_id="target", message="authorized after interrupt")
+    continued_run = store.get_run(continued["run_id"], "owner")
+    assert continued_run["previous_run_id"] == queued["run_id"]
+    cancelled = dispatch("cancel_tree", worker_id="target")
+    assert cancelled["cancel_requested"] is True
     rejected = dispatch("followup", worker_id="target", message="must not wake")
     assert "Cancelled workers stay cancelled" in rejected["error"]
 

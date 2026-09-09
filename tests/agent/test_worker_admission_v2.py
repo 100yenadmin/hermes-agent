@@ -90,6 +90,7 @@ def _install_runtime(monkeypatch, parent, *, run=None, credential_error=None):
 
     def build(**kwargs):
         child = Child(f"child-{len(built)}", parent.valid_tool_names)
+        child._requested_worker_interface_contract = kwargs.get("worker_interface_contract")
         child._delegate_depth = kwargs.get("retained_child_depth") or 1
         child.ephemeral_system_prompt = kwargs.get("frozen_system_prompt") or child.ephemeral_system_prompt
         built.append(child)
@@ -128,7 +129,7 @@ def test_public_resume_rehydrates_exact_cold_fifo_before_new_turn(tmp_path, monk
         child._worker_last_history = history
         return {"status": "completed", "summary": f"done:{goal}", "api_calls": 1}
 
-    _install_runtime(monkeypatch, parent, run=run)
+    _cfg, built = _install_runtime(monkeypatch, parent, run=run)
     service = SubagentLifecycleService(lambda: parent)
     first = service.launch(SubagentLaunchRequest(goal="first", profile="cold"))
     assert service.wait(first, timeout_seconds=2).state is SubagentState.SUCCEEDED
@@ -155,6 +156,11 @@ def test_public_resume_rehydrates_exact_cold_fifo_before_new_turn(tmp_path, monk
     runs = store.list_runs(first.worker_id, parent.session_id)
     assert [item["run_id"] for item in runs] == [first.run_id, second.run_id, third.run_id]
     assert [item["status"] for item in runs] == ["SUCCEEDED", "SUCCEEDED", "SUCCEEDED"]
+    assert built[0]._requested_worker_interface_contract is None
+    assert all(
+        child._requested_worker_interface_contract["name"] == "hermes"
+        for child in built[1:]
+    )
     db.close()
 
 

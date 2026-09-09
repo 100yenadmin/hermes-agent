@@ -177,15 +177,13 @@ def _apply_exact_tool_policy(
         current.intersection_update(profile_names)
     allowed = getattr(policy, "allowed_tools", None) if policy is not None else None
     allowed_mcp = getattr(policy, "allowed_mcp_tools", None) if policy is not None else None
-    blocked = {
-        canonical_worker_capability(selection, name)
-        for name in (getattr(policy, "blocked_tools", ()) or ())
-    } if policy is not None else set()
-    blocked.update(
-        canonical_worker_capability(selection, name) for name in (request_blocked_tools or ())
-    )
+    # Policy/request names are registry capability identities. Presentation
+    # aliases must never turn a configured native-tool allowlist into
+    # delegation authority.
+    blocked = set(getattr(policy, "blocked_tools", ()) or ()) if policy is not None else set()
+    blocked.update(request_blocked_tools or ())
     if allowed is not None:
-        current.intersection_update(canonical_worker_capability(selection, name) for name in allowed)
+        current.intersection_update(allowed)
     if allowed_mcp is not None:
         allowed_mcp_names = set(allowed_mcp)
         for name in tuple(current):

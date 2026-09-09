@@ -353,9 +353,14 @@ def _profile_policy_snapshot(
     if tool_names is None:
         tool_names = getattr(child, "valid_tool_names", None)
     effective_tools = sorted(name for name in (tool_names or ()) if isinstance(name, str))
+    from agent.worker_interfaces import frozen_worker_interface_contract
+
     policy = {
         "profile_contract": selected,
         "effective_tools": effective_tools,
+        "worker_interface": frozen_worker_interface_contract(
+            getattr(child, "_worker_interface_selection", None)
+        ),
         "route": {
             key: creds.get(key) for key in (
                 "requested_profile", "requested_provider", "requested_model", "requested_reasoning_effort",
@@ -1145,13 +1150,13 @@ class SubagentLifecycleService:
                 cancelled = store.cancel_pending_run(selected["run_id"], owner)
                 if live_record is not None:
                     with _REGISTRY.lock:
-                        live_record.state = SubagentState.CANCELLED
+                        live_record.state = SubagentState.INTERRUPTED
                         live_record.result = SubagentResult(
                             live_record.handle,
-                            SubagentState.CANCELLED,
+                            SubagentState.INTERRUPTED,
                             True,
                             completed_at=time.time(),
-                            error_classification="CANCELLED",
+                            error_classification="INTERRUPTED",
                             error_message="Worker run interrupted before it started.",
                         )
                         live_record.updated_at = time.time()
@@ -1178,7 +1183,6 @@ class SubagentLifecycleService:
             )
             if accepted:
                 with _REGISTRY.lock:
-                    live_record.state = SubagentState.CANCEL_REQUESTED
                     live_record.updated_at = time.time()
             return {
                 **self._safe_run_snapshot(selected),
@@ -1507,6 +1511,13 @@ class SubagentLifecycleService:
         }
         launch_toolsets = stored_policy.get("launch_allowed_toolsets")
         launch_blocked_tools = stored_policy.get("launch_blocked_tools")
+        from agent.worker_interfaces import frozen_worker_interface_contract
+
+        retained_interface = (
+            stored_policy["worker_interface"]
+            if "worker_interface" in stored_policy
+            else frozen_worker_interface_contract(None)
+        )
         child = _build_child_preserving_parent_tools(
             task_index=0, goal=goal, context=None,
             toolsets=list(launch_toolsets) if isinstance(launch_toolsets, list) else None,
@@ -1519,6 +1530,7 @@ class SubagentLifecycleService:
                 list(launch_blocked_tools)
                 if isinstance(launch_blocked_tools, list) else None
             ),
+            worker_interface_contract=retained_interface,
             **overrides,
         )
         _revision, current_policy = _profile_policy_snapshot(cfg, profile, creds, child=child)

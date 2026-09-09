@@ -192,6 +192,7 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "runtime": "agent",
     "session": "general",
     "nous": "agent",
+    "orchestration": "agent",
 }
 
 

@@ -260,7 +260,10 @@ def _all_text(value: Any) -> str:
     return ""
 
 
-def _instrument_interface(parent: Any, store: Any, owner: str) -> tuple[list[dict[str, Any]], Callable[[], None]]:
+def _instrument_interface(
+    parent: Any, store: Any, owner: str,
+    *, accepted_running_guidance: Callable[[], None] | None = None,
+) -> tuple[list[dict[str, Any]], Callable[[], None]]:
     original = getattr(parent, "_dispatch_worker_interface", None)
     if not callable(original):
         raise RuntimeError("AIAgent._dispatch_worker_interface is unavailable; integrate the interface adapter first")
@@ -291,6 +294,13 @@ def _instrument_interface(parent: Any, store: Any, owner: str) -> tuple[list[dic
                 "accepted": not bool(payload.get("error")),
                 "classification": _error_classification(payload.get("error")),
             })
+            if (
+                accepted_running_guidance is not None
+                and event["accepted"]
+                and event["effective_action"] == "message"
+                and event["target_was_running"]
+            ):
+                accepted_running_guidance()
         except Exception as exc:
             event.update({"accepted": False, "classification": _error_classification(exc), "effective_action": "none"})
             events.append(event)
@@ -489,8 +499,10 @@ def _execute_child(packet: Mapping[str, Any]) -> dict[str, Any]:
         )
         prompt = scenario["prompt_template"].format(worker_id=worker_id)
     counts_before = _counts(store, owner)
-    events, restore_interface = _instrument_interface(parent, store, owner)
     gate = threading.Event()
+    events, restore_interface = _instrument_interface(
+        parent, store, owner, accepted_running_guidance=gate.set
+    )
     original_http = AIAgent._interruptible_api_call
     held: set[str] = set()
     held_lock = threading.Lock()
