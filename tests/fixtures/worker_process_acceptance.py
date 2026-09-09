@@ -212,6 +212,10 @@ def _parent(home: Path):
     from hermes_state import SessionDB
 
     db = SessionDB(home / "state.db")
+    # A real parent has a durable session before it delegates. Child session
+    # rows reference it through the existing sessions foreign key.
+    if db.get_session(OWNER) is None:
+        db.create_session(OWNER, source="cli", model="fixture/parent")
     parent = SimpleNamespace(
         session_id=OWNER,
         _session_db=db,
