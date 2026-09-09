@@ -115,6 +115,13 @@ The proposed automatic selection policy is explicit user setting, then a qualifi
 
 ## Implementation and proof boundaries
 
+The interface follow-up is now published as [draft PR #106463](https://github.com/NousResearch/hermes-agent/pull/106463).
+Its [controlled live pilot](orchestration-interface-pilot.md) includes passing and
+failing samples at a recorded source identity. The chart above retains its named
+main/worker baselines; a later draft does not retroactively change those columns.
+Shared discovery, integrated teams and saved workflows still need their own
+implementation and acceptance evidence.
+
 | Stage | Deliverable | Required observable proof |
 | --- | --- | --- |
 | Worker PR #106268 | Profiles, retained workers, messages, limits and receipts | Existing two-provider workflow and recorded recovery/CI tests; see illustrated tour |
