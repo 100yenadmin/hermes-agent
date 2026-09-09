@@ -152,7 +152,7 @@ main/worker baselines above:
 | --- | --- | --- |
 | One selected worker interface per conversation | ✓ #106463 | Deterministic conformance and independent review passed; live pilot has both passes and failures; automatic qualification registry remains empty |
 | Discover permitted workers, runs, Bots, rooms and tasks | ✓ #106647 | Read-only discovery, typed references and action-time checks exercised; room grants permit inspection only |
-| Coordinate dependency tasks, review and retained corrections | ◐ Draft #106696 | Source is published; independent review still blocks acceptance on service authority and review evidence |
+| Coordinate dependency tasks, review and retained corrections | ✓ Draft #106696, tested scope | Nine focused cases and independent review passed; the [controlled team pilot](orchestration-team-pilot.md) passed8/8 on its revised bounded scenario; hosted validation remains separately tracked |
 | Repeat a saved bounded workflow after restart | Planned | Workflow execution acceptance is not yet established |
 
 Discovery answers “what can this parent see and use?” It does not create a room,
