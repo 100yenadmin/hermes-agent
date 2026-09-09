@@ -98,6 +98,50 @@ the same conversation retain the scope; `/new`, cold resume and a new runtime ge
 a fresh scope. Internal room and compute-host sessions receive none. The typed
 reference itself carries no authority and no new ACL database exists.
 
+## Parent-managed Kanban teams
+
+`agent/team_orchestration.py` is a thin coordinator over existing Kanban and
+worker ownership. `kanban_team` is service-gated with the existing Kanban
+orchestrator toolset. The selected worker interface projects it as a canonical
+or styled tool; transport aliases do not grant native capabilities. Schemas are
+bound once per conversation, including collision resolution. Retained pre-team
+catalogs are not silently expanded during a worker's next run.
+
+Kanban tasks gain `execution_mode`, defaulting to `dispatcher`. Team-created
+tasks use `parent`. Dispatcher enumeration and claim CAS both enforce the mode;
+the legacy claim API retains its optional routing predicate. Kanban owns task
+dependencies, review origin, current claims and acceptance. Worker success alone
+does not complete a task. Team acceptance requires a successful attached worker
+on the current review claim. Corrections create a linked run on the original
+implementation worker.
+
+`admit_team_execution` resolves and records an immutable WorkerStore assignment
+without scheduling it. Its owner/board/task/Kanban-run/role-derived identity is
+used to deduplicate admission. `attach_execution_reference` commits an immutable
+reference to that exact Kanban run. Only then does `schedule_team_execution`
+enter the existing worker scheduler and lease machinery. WorkerStore remains
+the sole conversation, run, budget, checkpoint and uncertainty owner. Kanban
+events carry references and contract metadata, never a lifecycle capability
+handle or credential values.
+
+The team service renews exact task claims while execution remains active and
+current session authority holds. Cancellation requests worker-tree cancellation,
+waits for terminal evidence, then fences the Kanban block operation to the
+attached run. Requests, execution terminal state, task acceptance and completion
+acknowledgments remain separate.
+
+Guidance returns per-target outcomes. Bots use the existing canonical Bot Chat
+gate. Hosted rooms require a session-bound explicit `message` grant and reuse
+the existing service send contract, with gateway/epoch/participant checks.
+Inspection grants do not authorize sending or room adoption.
+
+The initial `test_team_orchestration.py` cases cover schema projection, real
+store admission and attachment, a dependency/review/correction sequence, bounded
+cancellation/policy denial, and room-grant checks. The sequence uses a scheduler
+fixture; live transports and process-level recovery require separate evidence.
+See [Parent-managed teams](../user-guide/features/orchestration-teams.md) for
+the model-facing action sequence and proof boundary.
+
 ## Database and recovery protocol
 
 `agent/worker_store.py` uses the existing `SessionDB` transaction and read-context
