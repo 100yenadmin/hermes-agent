@@ -1891,13 +1891,10 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config",
            return_value={"max_spawn_depth": 2})
-    def test_orchestrator_role_keeps_delegation_at_depth_1(
+    def test_orchestrator_role_does_not_expand_parent_tool_authority(
         self, mock_cfg, mock_creds
     ):
-        """role='orchestrator' + depth-0 parent with max_spawn_depth=2 →
-        child at depth 1 gets 'delegation' in enabled_toolsets (can
-        further delegate).  Requires max_spawn_depth>=2 since the new
-        default is 1 (flat)."""
+        """An orchestrator role cannot grant a toolset absent from its parent."""
         mock_creds.return_value = {
             "provider": None, "base_url": None,
             "api_key": None, "api_mode": None, "model": None,
@@ -1909,7 +1906,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             MockAgent.return_value = mock_child
             delegate_task(goal="test", role="orchestrator", parent_agent=parent)
             kwargs = MockAgent.call_args[1]
-            self.assertIn("delegation", kwargs["enabled_toolsets"])
+            self.assertNotIn("delegation", kwargs["enabled_toolsets"])
             self.assertEqual(mock_child._delegate_role, "orchestrator")
 
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -1931,8 +1928,11 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             MockAgent.return_value = mock_child
             delegate_task(goal="test", role="orchestrator", parent_agent=parent)
             kwargs = MockAgent.call_args[1]
-            self.assertNotIn("delegation", kwargs["enabled_toolsets"])
+            # Leaves retain delegate_task for worker controls and messaging;
+            # action-level admission prevents further spawning.
+            self.assertIn("delegation", kwargs["enabled_toolsets"])
             self.assertEqual(mock_child._delegate_role, "leaf")
+            self.assertFalse(mock_child._delegate_spawn_allowed)
 
 
     # ── Role-aware system prompt ────────────────────────────────────────
@@ -1989,6 +1989,7 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
             built_agents.append({
                 "enabled_toolsets": list(kw.get("enabled_toolsets") or []),
                 "is_orchestrator_prompt": is_orchestrator,
+                "agent": m,
             })
 
             if is_orchestrator:
@@ -2045,10 +2046,12 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
         self.assertIn("delegation", built_agents[0]["enabled_toolsets"])
         self.assertTrue(built_agents[0]["is_orchestrator_prompt"])
         # Next two = leaves (grandchildren)
-        self.assertNotIn("delegation", built_agents[1]["enabled_toolsets"])
-        self.assertFalse(built_agents[1]["is_orchestrator_prompt"])
-        self.assertNotIn("delegation", built_agents[2]["enabled_toolsets"])
-        self.assertFalse(built_agents[2]["is_orchestrator_prompt"])
+        for leaf in built_agents[1:]:
+            self.assertIn("delegation", leaf["enabled_toolsets"])
+            self.assertFalse(leaf["is_orchestrator_prompt"])
+            self.assertFalse(leaf["agent"]._delegate_spawn_allowed)
+            blocked = json.loads(delegate_task(goal="blocked", parent_agent=leaf["agent"]))
+            self.assertIn("does not permit spawning", blocked["error"])
 
 
 class TestSubagentApprovalCallback(unittest.TestCase):
