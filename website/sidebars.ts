@@ -98,6 +98,7 @@ const sidebars: SidebarsConfig = {
             'reference/automation-blueprints-catalog',
             'user-guide/features/delegation',
             'user-guide/features/worker-profiles',
+            'user-guide/features/orchestration-interfaces',
             'user-guide/features/worker-orchestration-tour',
             'user-guide/features/orchestration-capability-comparison',
             'user-guide/features/kanban',

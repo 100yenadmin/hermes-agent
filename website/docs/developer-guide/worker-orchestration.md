@@ -38,6 +38,40 @@ overrides; limits are applied after resolution.
 
 ## Cache and conversation boundaries
 
+### Model-facing interfaces
+
+`agent/worker_interfaces.py` selects and binds the model-facing vocabulary.
+The precedence is an explicit `orchestration.interface` setting, a qualified
+automatic provider/model match, then canonical Hermes. The production registry
+starts empty. Entries require recorded live qualification; transport fixtures do
+not establish model usability.
+
+Selection and collision-aware aliases freeze when the agent builds its tool
+catalog. Existing native and MCP names retain their original meaning; colliding
+worker names receive a `hermes_worker_` alias. Refresh, executable-tool admission,
+native dispatch and execute-code/MCP dispatch use that same binding. An alias
+cannot grant an operation denied through the canonical `delegate_task` capability.
+
+`AIAgent._dispatch_worker_interface` translates the advertised request and calls
+`_dispatch_delegate_task`. The adapter owns no worker state or message queue.
+Its receipt records interface version, selection and qualification source,
+advertised name and canonical operation, separately from execution route evidence.
+The legacy dispatcher and plugin lifecycle API remain available.
+
+The shared service distinguishes guidance from `start_turn`. Guidance queues a
+message without waking an idle worker. `start_turn` creates an ordered linked
+run, including when another assignment is active; it does not silently become
+guidance. Exact-run interruption and descendant-tree cancellation are separate.
+Completion acknowledgment and uncertainty reconciliation remain reachable through
+each style. Unsupported transcript forking and graceful process shutdown are
+explicit errors, not inferred vendor behavior.
+
+See [orchestration interfaces](../user-guide/features/orchestration-interfaces.md)
+for configuration and plain-English examples. The adapters provide familiar
+vocabulary over Hermes; they are separate from optional vendor execution backends.
+
+### Discovery and retained conversation
+
 Discovery is an action of the existing delegation tool. The tool schema does not
 grow or change when profile definitions or provider catalogs refresh. The catalog
 reports capability provenance and unknown availability without authenticating or
