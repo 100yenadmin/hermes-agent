@@ -701,6 +701,8 @@ class Task:
     current_run_id: Optional[int] = None
     execution_mode: str = "dispatcher"
     workflow_template_id: Optional[str] = None
+    workflow_template_version: Optional[int] = None
+    workflow_invocation_id: Optional[str] = None
     current_step_key: Optional[str] = None
     skills: Optional[list] = None            # None = defaults only; [] = explicitly none
     model_override: Optional[str] = None
@@ -747,7 +749,8 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "workflow_template_version", "workflow_invocation_id", "current_step_key", "max_retries",
+    "session_id", "completion_contract",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -896,6 +899,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- these when the task is opted into a template but otherwise ignores
     -- them; the dispatcher doesn't consult them for routing yet.
     workflow_template_id TEXT,
+    workflow_template_version INTEGER,
+    workflow_invocation_id TEXT,
     current_step_key     TEXT,
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
@@ -972,6 +977,50 @@ CREATE TABLE IF NOT EXISTS task_events (
     kind       TEXT NOT NULL,
     payload    TEXT,
     created_at INTEGER NOT NULL
+);
+
+-- Saved workflow definitions and controller admission live in the board that
+-- owns their tasks. Template versions are immutable; task execution remains
+-- in tasks/task_runs and the durable worker store.
+CREATE TABLE IF NOT EXISTS workflow_templates (
+    template_id     TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    name            TEXT NOT NULL,
+    definition      TEXT NOT NULL,
+    definition_hash TEXT NOT NULL,
+    created_by      TEXT,
+    created_at      INTEGER NOT NULL,
+    PRIMARY KEY (template_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_invocations (
+    id                  TEXT PRIMARY KEY,
+    template_id         TEXT NOT NULL,
+    template_version    INTEGER NOT NULL,
+    template_hash       TEXT NOT NULL,
+    owner_session_id    TEXT NOT NULL,
+    admission_key       TEXT NOT NULL,
+    input_payload       TEXT NOT NULL,
+    input_hash          TEXT NOT NULL,
+    graph_hash          TEXT NOT NULL,
+    coordinator_task_id TEXT NOT NULL,
+    control_state       TEXT NOT NULL DEFAULT 'active'
+                        CHECK (control_state IN ('active', 'paused', 'cancelling', 'cancelled')),
+    control_version     INTEGER NOT NULL DEFAULT 1,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    completed_at        INTEGER,
+    UNIQUE (owner_session_id, admission_key)
+);
+
+CREATE TABLE IF NOT EXISTS workflow_invocation_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    invocation_id TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    subject_key   TEXT NOT NULL DEFAULT '',
+    payload       TEXT,
+    created_at    INTEGER NOT NULL,
+    UNIQUE (invocation_id, kind, subject_key)
 );
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
@@ -1051,6 +1100,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_owner        ON workflow_invocations(owner_session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_workflow_events       ON workflow_invocation_events(invocation_id, id);
 """
 
 
@@ -2253,15 +2304,25 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
 def _claim_and_open_run(
     conn: sqlite3.Connection, task_id: str, source_status: str, lock: str, expires: int, now: int,
     *, event_extra: Optional[dict] = None, expected_execution_mode: Optional[str] = None,
+    expected_workflow_invocation_id: Optional[str] = None,
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
     if expected_execution_mode is not None and expected_execution_mode not in VALID_EXECUTION_MODES:
         raise ValueError(f"expected_execution_mode must be one of {sorted(VALID_EXECUTION_MODES)}")
     mode_guard = "" if expected_execution_mode is None else " AND execution_mode = ?"
+    workflow_guard = ""
+    if expected_workflow_invocation_id is not None:
+        workflow_guard = (
+            " AND workflow_invocation_id = ? AND EXISTS ("
+            "SELECT 1 FROM workflow_invocations wi "
+            "WHERE wi.id = tasks.workflow_invocation_id AND wi.control_state = 'active')"
+        )
     params: tuple[Any, ...] = (lock, expires, now, task_id)
     if expected_execution_mode is not None:
         params += (expected_execution_mode,)
+    if expected_workflow_invocation_id is not None:
+        params += (expected_workflow_invocation_id,)
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -2273,6 +2334,7 @@ def _claim_and_open_run(
            AND status = '{source_status}'
            AND claim_lock IS NULL
            {mode_guard}
+           {workflow_guard}
         """,
         params,
     )
@@ -2307,6 +2369,7 @@ def _claim_and_open_run(
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None, expected_execution_mode: Optional[str] = None,
+    expected_workflow_invocation_id: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2334,6 +2397,7 @@ def claim_task(
         run_id = _claim_and_open_run(
             conn, task_id, "ready", lock, expires, now,
             expected_execution_mode=expected_execution_mode,
+            expected_workflow_invocation_id=expected_workflow_invocation_id,
         )
         if run_id is None:
             return None
@@ -2345,6 +2409,7 @@ def claim_task(
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None, expected_execution_mode: Optional[str] = None,
+    expected_workflow_invocation_id: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -2368,6 +2433,7 @@ def claim_review_task(
             conn, task_id, "review", lock, expires, now,
             event_extra={"source_status": "review"},
             expected_execution_mode=expected_execution_mode,
+            expected_workflow_invocation_id=expected_workflow_invocation_id,
         )
         if run_id is None:
             return None

@@ -816,6 +816,8 @@ _LATER_TASK_COLUMNS = (
     ("current_run_id", "current_run_id INTEGER"),
     ("execution_mode", "execution_mode TEXT NOT NULL DEFAULT 'dispatcher'"),
     ("workflow_template_id", "workflow_template_id TEXT"),
+    ("workflow_template_version", "workflow_template_version INTEGER"),
+    ("workflow_invocation_id", "workflow_invocation_id TEXT"),
     ("current_step_key", "current_step_key TEXT"),
     # JSON array of skill names the dispatcher force-loads via --skills.
     ("skills", "skills TEXT"),
@@ -894,6 +896,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_workflow "
+        "ON tasks(workflow_invocation_id, current_step_key)"
+    )
 
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).

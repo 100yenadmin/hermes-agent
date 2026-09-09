@@ -124,6 +124,13 @@ class TeamOrchestrationService:
             "accept": ("kanban_complete",),
             "request_changes": ("kanban_request_changes", "delegate_task", "kanban_heartbeat"),
             "cancel": ("delegate_task", "kanban_block"),
+            "workflow_save": ("kanban_create",),
+            "workflow_list": ("kanban_list",),
+            "workflow_inspect": ("kanban_show",),
+            "workflow_invoke": ("kanban_create", "delegate_task", "kanban_heartbeat"),
+            "workflow_pause": ("kanban_block",),
+            "workflow_resume": ("delegate_task", "kanban_heartbeat"),
+            "workflow_cancel": ("delegate_task", "kanban_block"),
         }[action]
         self._require(TEAM_TOOL_NAME, *required)
         self._scope()
@@ -260,6 +267,7 @@ class TeamOrchestrationService:
         claim = kb.claim_review_task if source == "review" else kb.claim_task
         claimed = claim(
             conn, task.id, claimer=claim_lock, expected_execution_mode="parent",
+            expected_workflow_invocation_id=task.workflow_invocation_id,
         )
         if claimed is None:
             raise RuntimeError("Parent execution claim was lost or the task changed")
@@ -574,7 +582,14 @@ class TeamOrchestrationService:
         reviewer = _text(args.get("reviewer"), "reviewer", required=True)
         with self._board() as (_scope, conn):
             from hermes_cli import kanban_db as kb
-            _task, kanban_run, attachment = self._current_attachment(conn, task_id)
+            task, kanban_run, attachment = self._current_attachment(conn, task_id)
+            if task.workflow_invocation_id:
+                from hermes_cli import kanban_db_workflows as workflows
+                policy = workflows.correction_policy(
+                    conn, task_id, owner_session_id=self._owner(),
+                )
+                if policy and policy.get("reviewer") and policy["reviewer"] != reviewer:
+                    raise PermissionError("Reviewer does not match the immutable workflow step")
             evidence = self._review_evidence(attachment)
             if evidence.get("status") != "SUCCEEDED":
                 raise RuntimeError("Worker success is required before requesting review")
@@ -597,7 +612,7 @@ class TeamOrchestrationService:
         task_id = _task_id(args.get("task_ref"))
         with self._board() as (_scope, conn):
             from hermes_cli import kanban_db as kb
-            _task, kanban_run, attachment = self._current_attachment(conn, task_id)
+            task, kanban_run, attachment = self._current_attachment(conn, task_id)
             if kb.run_claim_source(conn, task_id, kanban_run) != "review":
                 raise RuntimeError("Only the current claimed review run may accept the task")
             if self._worker_status(attachment).get("status") != "SUCCEEDED":
@@ -607,18 +622,37 @@ class TeamOrchestrationService:
                 expected_run_id=kanban_run,
             ):
                 raise RuntimeError("Acceptance lost the exact review run fence")
-            return {"task_ref": f"task:{task_id}", "status": "done", "accepted_run_id": kanban_run}
+            workflow_completed = False
+            if task.workflow_invocation_id:
+                from hermes_cli import kanban_db_workflows as workflows
+                workflow_completed = workflows.finalize_completed(
+                    conn, task.workflow_invocation_id, owner_session_id=self._owner(),
+                )
+            return {
+                "task_ref": f"task:{task_id}", "status": "done",
+                "accepted_run_id": kanban_run, "workflow_completed": workflow_completed,
+            }
 
     def _request_changes(self, args: Mapping[str, Any]) -> Mapping[str, Any]:
         task_id = _task_id(args.get("task_ref"))
         reason = _text(args.get("message"), "message", required=True)
         with self._board() as (scope, conn):
             from hermes_cli import kanban_db as kb
-            _task, review_run, reviewer_attachment = self._current_attachment(conn, task_id)
+            task, review_run, reviewer_attachment = self._current_attachment(conn, task_id)
             if kb.run_claim_source(conn, task_id, review_run) != "review":
                 raise RuntimeError("Changes require the current claimed review run")
             if self._worker_status(reviewer_attachment).get("status") != "SUCCEEDED":
                 raise RuntimeError("Reviewer success is required before requesting changes")
+            if task.workflow_invocation_id:
+                from hermes_cli import kanban_db_workflows as workflows
+                policy = workflows.correction_policy(
+                    conn, task_id, owner_session_id=self._owner(),
+                )
+                if policy is not None and not policy["allowed"]:
+                    raise RuntimeError(
+                        "Workflow correction limit reached "
+                        f"({policy['used']}/{policy['limit']})"
+                    )
             implementation = kb.latest_execution_attachment(
                 conn, task_id, roles=("implementer", "correction"),
             )
@@ -691,12 +725,18 @@ class TeamOrchestrationService:
             "cancel": self._cancel,
         }
         handler = handlers.get(action)
-        if handler is None:
+        from agent.workflow_orchestration import WORKFLOW_ACTIONS
+        if handler is None and action not in WORKFLOW_ACTIONS:
             return {"error": f"Unsupported team action '{action}'."}
         try:
             self._guard_action(action, arguments)
+            if action in WORKFLOW_ACTIONS:
+                from agent.workflow_orchestration import WorkflowOrchestrationService
+                payload = WorkflowOrchestrationService(self).dispatch(action, arguments)
+            else:
+                payload = handler(arguments)
             return {
-                **handler(arguments),
+                **payload,
                 "team_service": TEAM_CONTRACT_VERSION,
                 "action": action,
             }

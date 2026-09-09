@@ -158,6 +158,61 @@ transports and process-level restart still require separate evidence.
 See [Parent-managed teams](../user-guide/features/orchestration-teams.md) for
 the model-facing action sequence and proof boundary.
 
+## Saved bounded workflows
+
+`agent/workflow_orchestration.py` adds repeatable finite graphs without adding
+an executor. A model uses the existing `kanban_team` tool, or its frozen
+`team_task`/`TeamTask` projection, with the `workflow_*` actions. The adapter
+stores definitions and control state in the selected Kanban board and delegates
+every step claim, WorkerStore admission, review, correction and acceptance to
+`TeamOrchestrationService`.
+
+Template versions are immutable. A normalized definition digest identifies one
+version; saving identical content at the same template reference returns the
+existing version. An invocation is unique on originating session and admission
+key. `BEGIN IMMEDIATE` covers the invocation row, coordinator, every finite
+step, dependency link and immutable mapping event. A matching retry returns the
+same graph. A changed template or input digest conflicts, and an exception rolls
+back the whole graph.
+
+Workflow tasks carry template version, invocation and step-key fields. Parallel
+branches and joins remain ordinary Kanban dependencies. The coordinator depends
+on every step and is completed only after every step is accepted. Review uses
+the normal task phase and attached reviewer run. The immutable step definition
+supplies its reviewer and maximum correction count; counting persisted
+`changes_requested` events preserves the bound across process restart.
+
+Invocation control is a separate CAS record: `active`, `paused`, `cancelling`
+or `cancelled`, with a monotonically increasing control version. Workflow claims
+pass their invocation identity into the existing Kanban claim update, whose SQL
+also requires `active`. Because pause and claim both use the board's immediate
+write transaction, pause prevents later claims while a claim that linearized
+first may finish. Resume starts only ready/review work or a recorded held run.
+An already running or terminal attached worker is observed rather than replayed.
+
+Cancellation first records exact task, Kanban run, worker and worker-run intent.
+Only a newly recorded intent sends an interrupt. A lost interrupt receipt leaves
+the workflow pending; retry observes the recorded run without sending again.
+After terminal evidence for every active target, one board transaction preserves
+done steps and sticky-blocks every unfinished step and the coordinator. It never
+archives them, because archived Kanban parents satisfy dependencies. A normal
+external dependent therefore remains unclaimable after cancellation.
+
+`workflow_list` and `workflow_inspect` use `connect_existing_readonly`; they do
+not create a board, migrate schema, recover workers or recompute readiness.
+Every action still rechecks the root parent session, frozen profile home, board
+and database path, canonical executable tools, task owner and exact claim.
+Delegated workers and dispatcher-owned children cannot enter the controller.
+
+The focused `test_workflow_orchestration.py` file exercises concurrent identical
+admission, changed-content conflict, rollback, parallel review and retained
+correction, join release, restart-safe resume, pause/claim serialization, exact
+cancellation, uncertain-interrupt no-replay, sticky external dependency and
+read-only/owner/board/interface gates. It uses real temporary Kanban and
+SessionDB/WorkerStore files with provider execution held at the existing
+controlled child boundary. It does not prove live provider execution,
+subprocess restart, installation, release or customer runtime behavior.
+
 ## Database and recovery protocol
 
 `agent/worker_store.py` uses the existing `SessionDB` transaction and read-context

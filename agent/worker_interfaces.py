@@ -177,13 +177,15 @@ def _control_schema(name: str = "worker_control") -> dict[str, Any]:
 def _team_schema(name: str) -> dict[str, Any]:
     return _object_schema(
         name,
-        "Coordinate dependency-linked Kanban tasks through authorized durable workers and review.",
+        "Coordinate dependency-linked Kanban tasks and saved finite workflows through authorized durable workers and review.",
         {
             "action": {
                 "type": "string",
                 "enum": [
                     "create", "start", "guide", "submit_review", "accept",
-                    "request_changes", "cancel",
+                    "request_changes", "cancel", "workflow_save", "workflow_list",
+                    "workflow_inspect", "workflow_invoke", "workflow_pause",
+                    "workflow_resume", "workflow_cancel",
                 ],
             },
             "task_ref": {"type": "string", "description": "Typed task reference."},
@@ -196,6 +198,15 @@ def _team_schema(name: str) -> dict[str, Any]:
             "reviewer": _PROFILE,
             "summary": _TEXT,
             "idempotency_key": _TEXT,
+            "template_ref": {"type": "string", "description": "Immutable saved workflow template version."},
+            "workflow_ref": {"type": "string", "description": "One admitted workflow invocation."},
+            "definition": {
+                "type": "object",
+                "description": "Finite workflow definition with name and dependency-linked steps.",
+            },
+            "input": {"type": "object", "description": "Input copied into this fresh invocation."},
+            "admission_key": {"type": "string", "description": "Stable retry key scoped to the parent session."},
+            "expected_version": {"type": "integer", "minimum": 1},
             "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 60},
         },
         ("action",),
@@ -522,6 +533,8 @@ _CLAUDE_OPERATIONS = {
 _TEAM_ARGUMENTS = frozenset({
     "action", "task_ref", "title", "body", "profile", "parent_refs", "targets",
     "message", "reviewer", "summary", "idempotency_key", "timeout_seconds",
+    "template_ref", "workflow_ref", "definition", "input", "admission_key",
+    "expected_version",
 })
 _CODEX_ARGUMENTS = {
     "worker_capabilities": frozenset({"profile", "reference"}),
