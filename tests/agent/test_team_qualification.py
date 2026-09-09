@@ -133,3 +133,39 @@ def test_child_failure_is_sanitized_and_never_passes():
     assert report["scenario_passed"] is False
     assert report["error_type"] == "RuntimeError@synthetic:1"
     assert all(item["passed"] is False for item in report["assertions"])
+
+
+def test_parent_uses_team_toolset_and_reports_only_observed_wire_identity():
+    packet = {
+        "parent_provider": "parent-provider",
+        "parent_model": "configured-model",
+        "requested_interface": "codex",
+        "routes": [{
+            "profile": "builder", "provider": "provider-a", "model": "model-a",
+            "reasoning_effort": "high",
+        }],
+        "limits": {"max_child_iterations": 3, "max_child_seconds": 90, "max_children": 2},
+    }
+
+    config = runner._build_config(packet)
+    assert list(runner.PARENT_TOOLSETS) == ["delegation", "kanban"]
+    assert config["toolsets"] == list(runner.PARENT_TOOLSETS)
+    assert runner._observed_transport_fields({
+        "model": "wire-model",
+        "reasoning": {"effort": "wire-effort"},
+    }) == {
+        "transmitted_model": "wire-model",
+        "transmitted_reasoning_effort": "wire-effort",
+    }
+    assert runner._observed_transport_fields({
+        "model": "outer-model",
+        "reasoning_effort": "outer-effort",
+        "extra_body": {"model": "wire-override", "reasoning": {"effort": "wire-override-effort"}},
+    }) == {
+        "transmitted_model": "wire-override",
+        "transmitted_reasoning_effort": "wire-override-effort",
+    }
+    assert runner._observed_transport_fields({}) == {
+        "transmitted_model": "unknown",
+        "transmitted_reasoning_effort": "unknown",
+    }

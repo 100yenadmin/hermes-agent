@@ -31,6 +31,7 @@ sys.path[:] = [_root, *(item for item in sys.path if item != _root)]
 FIXTURE_PATH = REPO_ROOT / "tests/fixtures/orchestration/team-qualification-v1.json"
 UNKNOWN = "unknown"
 EXPECTED_TOOLS = {"worker_capabilities", "team_task", "wait_agent", "inspect_agent", "worker_control"}
+PARENT_TOOLSETS = ("delegation", "kanban")
 TERMINAL = {"SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED"}
 SAFE_TOKEN_KEYS = (
     "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens",
@@ -63,6 +64,37 @@ def _safe_tokens(value: Mapping[str, Any] | None) -> dict[str, int | float]:
 
 def _error_class(error: Any) -> str | None:
     return "SERVICE_ERROR" if error else None
+
+
+def _identifier(value: Any) -> str:
+    return value if isinstance(value, str) and 0 < len(value) <= 512 else UNKNOWN
+
+
+def _observed_transport_fields(api_kwargs: Any) -> dict[str, str]:
+    """Extract model and effort only from the post-build transport request."""
+    payload = dict(api_kwargs) if isinstance(api_kwargs, Mapping) else {}
+    extra = payload.pop("extra_body", None)
+    if isinstance(extra, Mapping):
+        payload.update(extra)
+    reasoning = payload.get("reasoning")
+    output_config = payload.get("output_config")
+    effort = (
+        reasoning.get("effort") if isinstance(reasoning, Mapping) else None
+    ) or payload.get("reasoning_effort") or (
+        output_config.get("effort") if isinstance(output_config, Mapping) else None
+    )
+    return {
+        "transmitted_model": _identifier(payload.get("model") or payload.get("modelId")),
+        "transmitted_reasoning_effort": _identifier(effort),
+    }
+
+
+def _reported_model(agent: Any, response: Any) -> str:
+    marker = response.get("_provider_reported_model") if isinstance(response, Mapping) else getattr(response, "_provider_reported_model", None)
+    if getattr(agent, "api_mode", None) in {"codex_responses", "bedrock_converse", "codex_app_server"}:
+        return _identifier(marker)
+    model = response.get("model") if isinstance(response, Mapping) else getattr(response, "model", None)
+    return _identifier(model)
 
 
 def evaluate_assertions(observation: Mapping[str, Any]) -> list[bool]:
@@ -193,6 +225,7 @@ def _profiles_config(packet: Mapping[str, Any]) -> dict[str, Any]:
 def _build_config(packet: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "model": {"provider": packet["parent_provider"], "default": packet["parent_model"]},
+        "toolsets": list(PARENT_TOOLSETS),
         "orchestration": {"interface": "codex"},
         "delegation": {
             "profiles": _profiles_config(packet),
@@ -485,7 +518,7 @@ def _execute_child(packet: dict[str, Any]) -> dict[str, Any]:
     parent = AIAgent(
         **{key: parent_runtime[key] for key in ("provider", "api_key", "base_url", "api_mode")},
         model=packet["parent_model"], session_id=owner, session_db=db,
-        enabled_toolsets=["delegation"], max_iterations=packet["limits"]["max_parent_iterations"],
+        enabled_toolsets=list(PARENT_TOOLSETS), max_iterations=packet["limits"]["max_parent_iterations"],
         max_tokens=packet["limits"]["max_parent_tokens"],
         reasoning_config={"effort": packet["parent_reasoning_effort"]},
         run_budget_seconds=packet["limits"]["max_seconds"], skip_memory=True,
@@ -507,7 +540,7 @@ def _execute_child(packet: dict[str, Any]) -> dict[str, Any]:
                 held_workers.add(worker_id)
             if should_hold and not gate.is_set() and not gate.wait(min(60, packet["limits"]["max_child_seconds"])):
                 raise TimeoutError("Controlled RUNNING-guidance barrier expired")
-        request = args[0] if args and isinstance(args[0], Mapping) else kwargs.get("api_kwargs", {})
+        request = args[0] if args else kwargs.get("api_kwargs")
         if agent is parent:
             packet["parent_route_observed"] = {
                 "requested_provider": packet["parent_provider"],
@@ -517,14 +550,12 @@ def _execute_child(packet: dict[str, Any]) -> dict[str, Any]:
                 "resolved_model": packet["parent_model"],
                 "resolved_reasoning_effort": packet["parent_reasoning_effort"],
                 "transmitted_provider": getattr(agent, "provider", UNKNOWN),
-                "transmitted_model": request.get("model", getattr(agent, "model", UNKNOWN)) if isinstance(request, Mapping) else getattr(agent, "model", UNKNOWN),
-                "transmitted_reasoning_effort": packet["parent_reasoning_effort"],
+                **_observed_transport_fields(request),
                 "provider_reported_model": UNKNOWN,
             }
         response = original_http(agent, *args, **kwargs)
         if agent is parent:
-            reported = getattr(response, "_provider_reported_model", None) or getattr(response, "model", None)
-            packet["parent_route_observed"]["provider_reported_model"] = reported or UNKNOWN
+            packet["parent_route_observed"]["provider_reported_model"] = _reported_model(agent, response)
         return response
 
     AIAgent._interruptible_api_call = instrumented_http
