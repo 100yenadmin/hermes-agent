@@ -1281,6 +1281,13 @@ DEFAULT_CONFIG = {
     # experimental presentation adapters and never alter model routing.
     "orchestration": {
         "interface": "auto",  # auto | hermes | codex | claude
+        # Trusted TUI/Desktop sessions may discover only these existing hosted
+        # rooms. Entries are read-only in this increment; an empty list grants
+        # no room references. Profile configuration is a ceiling, not a token a
+        # model or worker can present to mint authority.
+        "discovery": {
+            "rooms": [],  # [{id: "room-id", actions: ["inspect"], participants: ["profile"]}]
+        },
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.

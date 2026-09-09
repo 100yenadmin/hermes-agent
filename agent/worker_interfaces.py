@@ -148,6 +148,7 @@ def _object_schema(
 _TEXT = {"type": "string"}
 _TARGET = {"type": "string", "description": "Stable worker id returned by spawn or list."}
 _RUN = {"type": "string", "description": "Optional exact run id."}
+_REFERENCE = {"type": "string", "description": "Optional typed reference such as worker:<id>, run:<id>, bot:<id>, room:<id>, or task:<id>."}
 _PROFILE = {"type": "string", "description": "Optional configured Hermes worker profile."}
 _PROVIDER = {"type": "string", "description": "Optional provider override allowed by the selected worker profile."}
 _MODEL = {"type": "string", "description": "Optional model override allowed by the selected worker profile."}
@@ -174,7 +175,7 @@ def _control_schema(name: str = "worker_control") -> dict[str, Any]:
 
 def _codex_schemas() -> tuple[dict[str, Any], ...]:
     return (
-        _object_schema("worker_capabilities", "List configured worker profiles and capabilities.", {"profile": _PROFILE}),
+        _object_schema("worker_capabilities", "List configured worker profiles and permitted shared references.", {"profile": _PROFILE, "reference": _REFERENCE}),
         _object_schema(
             "spawn_agent",
             "Start one durable worker with fresh conversation context. This does not fork parent history.",
@@ -212,7 +213,7 @@ def _codex_schemas() -> tuple[dict[str, Any], ...]:
 
 def _claude_schemas() -> tuple[dict[str, Any], ...]:
     return (
-        _object_schema("TaskCapabilities", "List configured worker profiles and capabilities.", {"profile": _PROFILE}),
+        _object_schema("TaskCapabilities", "List configured worker profiles and permitted shared references.", {"profile": _PROFILE, "reference": _REFERENCE}),
         _object_schema(
             "Agent",
             "Start one durable worker with fresh conversation context. Parent transcript forking is unsupported.",
@@ -427,7 +428,7 @@ _CLAUDE_OPERATIONS = {
     "worker_control": "control",
 }
 _CODEX_ARGUMENTS = {
-    "worker_capabilities": frozenset({"profile"}),
+    "worker_capabilities": frozenset({"profile", "reference"}),
     "spawn_agent": frozenset({"message", "context", "profile", "provider", "model", "reasoning_effort"}),
     "send_message": frozenset({"target", "message"}),
     "followup_task": frozenset({"target", "message"}),
@@ -439,7 +440,7 @@ _CODEX_ARGUMENTS = {
     "worker_control": frozenset({"action", "target", "run_id", "disposition", "note"}),
 }
 _CLAUDE_ARGUMENTS = {
-    "TaskCapabilities": frozenset({"profile"}),
+    "TaskCapabilities": frozenset({"profile", "reference"}),
     "Agent": frozenset({"prompt", "context", "subagent_type", "provider", "model", "reasoning_effort"}),
     "SendMessage": frozenset({"recipient", "content", "if_idle"}),
     "TaskOutput": frozenset({"task_id", "run_id", "block", "timeout_ms"}),
@@ -528,7 +529,7 @@ def normalize_worker_call(
         if unsupported:
             raise ValueError(f"Unsupported {tool_name} arguments: {sorted(unsupported)}")
         mapped = {
-            "worker_capabilities": lambda: {"action": "discover", "profile": args.get("profile")},
+            "worker_capabilities": lambda: {"action": "discover", "profile": args.get("profile"), "reference": args.get("reference")},
             "spawn_agent": lambda: {
                 "goal": args.get("message"), "context": args.get("context"),
                 "profile": args.get("profile"), "provider": args.get("provider"),
@@ -569,7 +570,7 @@ def normalize_worker_call(
     if tool_name == "TaskStop" and args.get("scope", "run") == "tree":
         operation = "cancel_tree"
     mapped = {
-        "TaskCapabilities": lambda: {"action": "discover", "profile": args.get("profile")},
+        "TaskCapabilities": lambda: {"action": "discover", "profile": args.get("profile"), "reference": args.get("reference")},
         "Agent": lambda: {
             "goal": args.get("prompt"), "context": args.get("context"),
             "profile": args.get("subagent_type"), "provider": args.get("provider"),

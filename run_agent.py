@@ -1309,6 +1309,7 @@ class AIAgent(
             worker_id=function_args.get("worker_id"), run_id=function_args.get("run_id"),
             timeout_seconds=function_args.get("timeout_seconds"), profile=function_args.get("profile"),
             reconciliation_disposition=function_args.get("reconciliation_disposition"),
+            reference=function_args.get("reference"),
             model_profile=function_args.get("model_profile"), provider=function_args.get("provider"),
             model=function_args.get("model"), reasoning_effort=function_args.get("reasoning_effort"),
             parent_agent=self,

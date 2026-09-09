@@ -83,6 +83,21 @@ system prefix or inserting synthetic user messages into the middle of a tool rou
 Resume rechecks current authority; it must not silently continue with revoked tools
 or rebuild the old conversation under a different permission contract.
 
+Shared discovery extends this same action with stateless typed coordinates. Each
+state owner supplies an existing-schema-only read path: the worker store never
+calls `ensure_schema()` or lease recovery, hosted rooms open the current schema in
+SQLite read-only mode, and Kanban opens the session-pinned board without migration
+or readiness recomputation. Bot references reuse the native Bot Chat roster gate.
+
+The TUI gateway issues room discovery authority in memory during trusted agent
+construction. It binds the runtime SID, exact live session record and agent,
+resolved profile home, current policy digest, exact hosted-room service object,
+room ID, local authority gateway, authority epoch and configured participant
+scope. Every inspection rechecks all of those facts. Ordinary agent rebuilds in
+the same conversation retain the scope; `/new`, cold resume and a new runtime get
+a fresh scope. Internal room and compute-host sessions receive none. The typed
+reference itself carries no authority and no new ACL database exists.
+
 ## Database and recovery protocol
 
 `agent/worker_store.py` uses the existing `SessionDB` transaction and read-context

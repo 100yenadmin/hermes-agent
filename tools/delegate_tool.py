@@ -669,7 +669,7 @@ def delegate_task(
     profile: Optional[str] = None, model_profile: Optional[str] = None,
     provider: Optional[str] = None, model: Optional[str] = None, reasoning_effort: Optional[str] = None,
     worker_id: Optional[str] = None, run_id: Optional[str] = None, timeout_seconds: Optional[float] = None,
-    reconciliation_disposition: Optional[str] = None,
+    reconciliation_disposition: Optional[str] = None, reference: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -701,7 +701,12 @@ def delegate_task(
                     for item in catalog["profiles"]
                 ],
             }
-        return json.dumps({"success": True, **catalog}, ensure_ascii=False)
+        from agent.shared_discovery import discover_shared_references
+        try:
+            shared = discover_shared_references(parent_agent, reference=reference)
+        except PermissionError as exc:
+            return tool_error(str(exc))
+        return json.dumps({"success": True, **catalog, **shared}, ensure_ascii=False)
     if normalized_action in {
         "status", "inspect", "completions", "message", "wait", "interrupt", "cancel", "reconcile", "resume", "ack",
     }:
@@ -1009,6 +1014,11 @@ DELEGATE_TASK_SCHEMA = {
                 "Profile for every spawned task unless that task sets its own profile; with action='discover', "
                 "returns that profile's full policy and instructions.",
             ),
+            "reference": _p(
+                "string",
+                "Optional typed reference returned by action='discover'. Re-resolves one worker, run, Bot, "
+                "room, or Kanban task under current authority without returning transcripts.",
+            ),
             "provider": _p(
                 "string",
                 "Optional batch route override, accepted only by a dynamic profile and its enabled routes.",
@@ -1094,7 +1104,7 @@ registry.register(
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         worker_id=args.get("worker_id"), run_id=args.get("run_id"), timeout_seconds=args.get("timeout_seconds"),
-        reconciliation_disposition=args.get("reconciliation_disposition"),
+        reconciliation_disposition=args.get("reconciliation_disposition"), reference=args.get("reference"),
         profile=args.get("profile"), provider=args.get("provider"), model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
         parent_agent=kw.get("parent_agent"),

@@ -998,6 +998,86 @@ class SubagentLifecycleService:
                     changed = True
         return [worker["worker_id"] for worker in workers if worker["worker_id"] in selected]
 
+    def discover_readonly(self, reference: Optional[str] = None) -> Mapping[str, Any]:
+        """Resolve visible worker/run references without schema setup or lease recovery."""
+        parent = self._parent_agent_resolver()
+        owner = _owner_session_id_of(parent)
+        db = _session_db_of(parent) if parent is not None else None
+        if not owner or db is None or not callable(getattr(type(db), "_read_ctx", None)):
+            if reference:
+                raise PermissionError("Unknown or unavailable discovery reference.")
+            return {"references": []}
+        from agent.worker_store import WorkerStore
+        store = WorkerStore(db)
+        if not store.schema_present():
+            if reference:
+                raise PermissionError("Unknown or unavailable discovery reference.")
+            return {"references": []}
+        actor_worker_id = getattr(parent, "_worker_id", None)
+        from tools.delegate_tool_config import _load_config
+        allow_siblings = bool((_load_config() or {}).get("allow_sibling_messaging", False))
+
+        def visible(worker: Mapping[str, Any]) -> bool:
+            return self._actor_can_target(
+                store, owner, actor_worker_id, worker,
+                message_only=False, allow_siblings=allow_siblings,
+            )
+
+        def worker_ref(worker: Mapping[str, Any]) -> Mapping[str, Any]:
+            runs = store.list_runs_existing(worker["worker_id"], owner)
+            latest = runs[-1] if runs else None
+            status = latest.get("status") if latest else "IDLE"
+            actions = ["inspect", "message"]
+            if latest is not None:
+                actions.append("wait")
+                if status not in {"SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED"}:
+                    actions.append("stop")
+            if status != "CANCELLED":
+                actions.append("start_turn")
+            return {
+                "reference": f"worker:{worker['worker_id']}", "kind": "worker",
+                "label": worker.get("profile") or "Hermes worker",
+                "availability": "available", "freshness": "stored",
+                "actions": actions, "status": status,
+            }
+
+        def run_ref(run: Mapping[str, Any]) -> Mapping[str, Any]:
+            actions = ["inspect", "wait"]
+            if run.get("status") not in {"SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED"}:
+                actions.append("stop")
+            return {
+                "reference": f"run:{run['run_id']}", "kind": "run",
+                "label": "Worker run", "availability": "available", "freshness": "stored",
+                "actions": actions, "status": run.get("status"),
+            }
+
+        if reference:
+            kind, sep, object_id = reference.partition(":")
+            if not sep or not object_id or kind not in {"worker", "run"}:
+                raise PermissionError("Unknown or unavailable discovery reference.")
+            try:
+                if kind == "worker":
+                    worker = store.get_worker_existing(object_id, owner)
+                    if not visible(worker):
+                        raise PermissionError
+                    runs = store.list_runs_existing(object_id, owner)
+                    return {"reference": worker_ref(worker), "runs": [run_ref(run) for run in runs]}
+                run = store.get_run_existing(object_id, owner)
+                worker = store.get_worker_existing(run["worker_id"], owner)
+                if not visible(worker):
+                    raise PermissionError
+                return {"reference": run_ref(run), "worker": worker_ref(worker)}
+            except (KeyError, PermissionError):
+                raise PermissionError("Unknown or unavailable discovery reference.") from None
+
+        refs = []
+        for worker in store.list_workers_existing(owner):
+            if not visible(worker):
+                continue
+            refs.append(worker_ref(worker))
+            refs.extend(run_ref(run) for run in store.list_runs_existing(worker["worker_id"], owner))
+        return {"references": refs}
+
     def control(
         self,
         action: str,

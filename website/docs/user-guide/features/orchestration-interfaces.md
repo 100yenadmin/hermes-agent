@@ -112,6 +112,38 @@ worker context-file and memory settings still follow the selected profile. A
 follow-up retains the worker's own conversation and rechecks its current execution
 contract before launching.
 
+## Discover shared work safely
+
+The discover operation can also return typed references for workers, runs, local
+Bot teammates, hosted rooms and Kanban tasks. The reference form includes its
+kind, for example `worker:<id>`, `bot:<handle>`, `room:<id>` or `task:<id>`.
+Pass one reference back to the same discovery operation for a compact current
+inspection. This does not grant control or return a transcript.
+
+References appear only when the current session already has the matching native
+access. Worker lineage, the Bot Chat gate and the session's pinned Kanban board
+remain authoritative. A reference is resolved again on every inspection, so a
+removed object, changed board or revoked permission fails without exposing the
+foreign object.
+
+Hosted rooms require an explicit trusted TUI/Desktop session grant. Configure a
+ceiling in the active profile:
+
+```yaml
+orchestration:
+  discovery:
+    rooms:
+      - id: release-room
+        actions: [inspect]
+        participants: [research, reviewer]
+```
+
+Only existing rooms owned by the current gateway can be granted. Room discovery
+is read-only and currently supports `inspect` only. New sessions receive fresh
+grants; policy edits, service replacement, authority epoch changes, participant
+removal and session replacement invalidate earlier references. Delegated workers,
+compute-host sessions and the internal room runner receive no room grant.
+
 ## Read the receipts
 
 Worker results carry an `orchestration_interface` receipt identifying the selected

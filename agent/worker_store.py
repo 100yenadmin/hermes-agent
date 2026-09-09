@@ -139,6 +139,39 @@ class WorkerStore:
                         (row[0], f"legacy-unknown-{index}", "UNKNOWN", time.time()))
         self.db._execute_write(migrate)
 
+    def schema_present(self) -> bool:
+        """Return whether the durable worker schema already exists, without creating it."""
+        required = {
+            "orchestration_workers", "orchestration_runs", "orchestration_messages",
+            "orchestration_parent_messages", "orchestration_tool_effects",
+        }
+        with self.db._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'orchestration_%'"
+            ).fetchall()
+        return required.issubset({str(row[0]) for row in rows})
+
+    def list_workers_existing(self, owner_session_id):
+        """List owner-scoped workers only when the current schema is already present."""
+        if not self.schema_present():
+            return []
+        return self.list_workers(owner_session_id)
+
+    def get_worker_existing(self, worker_id, owner_session_id):
+        if not self.schema_present():
+            raise PermissionError("Unknown reference or unavailable discovery store")
+        return self.get_worker(worker_id, owner_session_id)
+
+    def list_runs_existing(self, worker_id, owner_session_id):
+        if not self.schema_present():
+            return []
+        return self.list_runs(worker_id, owner_session_id)
+
+    def get_run_existing(self, run_id, owner_session_id):
+        if not self.schema_present():
+            raise PermissionError("Unknown reference or unavailable discovery store")
+        return self.get_run(run_id, owner_session_id)
+
     @staticmethod
     def _worker(conn, worker_id, owner_session_id):
         worker = _row(conn.execute("SELECT * FROM orchestration_workers WHERE worker_id=?", (worker_id,)).fetchone())
