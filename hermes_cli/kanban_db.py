@@ -1998,6 +1998,60 @@ def _latest_event(
 _EXECUTION_ATTACHMENT_KEYS = {
     "version", "worker_ref", "run_ref", "admission_hash", "role", "profile",
 }
+_TEAM_INTENT_KINDS = {"review": "team_review_intent", "correction": "team_correction_intent"}
+
+
+def record_team_intent(
+    conn: sqlite3.Connection, task_id: str, run_id: int, *, kind: str,
+    owner_session_id: str, payload: Mapping[str, Any],
+) -> dict:
+    """Persist review/correction intent before the lifecycle transition commits."""
+    event_kind = _TEAM_INTENT_KINDS.get(kind)
+    if event_kind is None:
+        raise ValueError("unsupported team intent kind")
+    value = dict(payload)
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT session_id,status,current_run_id,execution_mode FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        if (
+            task is None or task["execution_mode"] != "parent"
+            or task["session_id"] != owner_session_id or task["status"] != "running"
+            or int(task["current_run_id"] or 0) != int(run_id)
+        ):
+            raise PermissionError("Team intent owner or active run is unavailable")
+        existing = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=? "
+            "ORDER BY id DESC LIMIT 1", (task_id, int(run_id), event_kind),
+        ).fetchone()
+        if existing is not None:
+            prior = json.dumps(_json_dict(existing["payload"]), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            if prior != encoded:
+                raise ValueError("Team intent already exists with different immutable content")
+            return value
+        _append_event(conn, task_id, event_kind, value, run_id=int(run_id))
+    return value
+
+
+def pending_team_intent(
+    conn: sqlite3.Connection, task_id: str, *, kind: str,
+) -> Optional[dict]:
+    event_kind = _TEAM_INTENT_KINDS.get(kind)
+    if event_kind is None:
+        raise ValueError("unsupported team intent kind")
+    row = conn.execute(
+        "SELECT id,payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+        (task_id, event_kind),
+    ).fetchone()
+    if row is None:
+        return None
+    role = "reviewer" if kind == "review" else "correction"
+    consumed = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND kind='execution_attached' "
+        "AND id>? AND json_extract(payload,'$.role')=? LIMIT 1", (task_id, int(row["id"]), role),
+    ).fetchone()
+    return None if consumed else _json_dict(row["payload"])
 
 
 def get_execution_attachment(
@@ -2058,7 +2112,7 @@ def record_execution_cancelled(
 
 def attach_execution_reference(
     conn: sqlite3.Connection, task_id: str, run_id: int, *,
-    claim_lock: str, reference: Mapping[str, Any],
+    claim_lock: str, reference: Mapping[str, Any], owner_session_id: Optional[str] = None,
 ) -> dict:
     """Idempotently bind sanitized WorkerStore coordinates to an exact parent run.
 
@@ -2080,7 +2134,8 @@ def attach_execution_reference(
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     with write_txn(conn):
         task = conn.execute(
-            "SELECT status,current_run_id,claim_lock,execution_mode FROM tasks WHERE id=?",
+            "SELECT status,current_run_id,claim_lock,execution_mode,session_id,claim_expires "
+            "FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
         if (
@@ -2088,6 +2143,8 @@ def attach_execution_reference(
             or task["execution_mode"] != "parent"
             or int(task["current_run_id"] or 0) != int(run_id)
             or not claim_lock or task["claim_lock"] != claim_lock
+            or (owner_session_id is not None and task["session_id"] != owner_session_id)
+            or int(task["claim_expires"] or 0) <= int(time.time())
         ):
             raise PermissionError("Parent execution claim is unavailable or stale")
         existing = get_execution_attachment(conn, task_id, int(run_id))

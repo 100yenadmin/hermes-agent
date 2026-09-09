@@ -4,11 +4,13 @@ from contextvars import ContextVar
 import json
 from types import SimpleNamespace
 import threading
+import time
 
 import pytest
 
 from agent.shared_discovery import build_local_discovery_scope
 from agent.team_orchestration import TeamOrchestrationService
+from agent.subagent_lifecycle import SubagentLaunchRequest, SubagentLifecycleService, SubagentState
 from agent.worker_interfaces import (
     CANONICAL_TEAM_TOOL,
     InterfaceSelection,
@@ -31,47 +33,26 @@ TEAM_TOOLS = {
 }
 
 
-class FakeLifecycle:
-    """Scheduling stub; persistence and task state remain real in these tests."""
+class ControlledExecution:
+    """Real durable lifecycle with only provider execution held at its boundary."""
 
-    def __init__(self):
-        self.admissions = {}
-        self.statuses = {}
-        self.messages = []
-        self.sequence = 0
-
-    def admit_team_execution(self, request, *, worker_id, request_id, previous_run_id=None):
-        immutable = (request.goal, request.context, request.profile, previous_run_id)
-        if request_id in self.admissions:
-            worker, run, expected = self.admissions[request_id]
-            if immutable != expected:
-                raise ValueError("conflicting deterministic admission")
-            return worker, run
-        self.sequence += 1
-        run_id = f"run-synthetic-{self.sequence}"
-        worker = {"worker_id": worker_id, "profile": request.profile}
-        run = {"run_id": run_id, "status": "PENDING"}
-        self.statuses[run_id] = "PENDING"
-        self.admissions[request_id] = (worker, run, immutable)
-        return worker, run
-
-    def schedule_team_execution(self, worker_id, run_id):
-        self.statuses[run_id] = "RUNNING"
-        return {"worker_id": worker_id, "run_id": run_id, "status": "RUNNING"}
-
-    def control(self, action, *, worker_id, run_id=None, **kwargs):
-        if action == "wait":
-            return {"worker_id": worker_id, "run_id": run_id, "status": self.statuses[run_id]}
-        if action == "message":
-            self.messages.append((worker_id, run_id, kwargs["message"]))
-            return {"accepted": True, "delivery": "RUNNING_STEER_PENDING_CHECKPOINT"}
-        if action == "cancel":
-            self.statuses[run_id] = "CANCELLED"
-            return {"cancel_requested": True}
-        raise AssertionError(action)
+    def __init__(self, service, db, records, builds):
+        self.service, self.store = service, WorkerStore(db)
+        self.records, self.builds = records, builds
 
     def succeed(self, run_ref):
-        self.statuses[run_ref.partition(":")[2]] = "SUCCEEDED"
+        run_id = run_ref.partition(":")[2]
+        record = self.records[run_id]
+        self.store.finish_run(
+            run_id, record.owner_session_id, record.lease_token, status="SUCCEEDED",
+            result={"summary": "fixture evidence", "termination": {"status": "SUCCEEDED"}},
+            history=[],
+        )
+        record.state = SubagentState.SUCCEEDED
+
+    def status(self, run_ref):
+        run_id = run_ref.partition(":")[2]
+        return self.store.get_run(run_id, self.records[run_id].owner_session_id)["status"]
 
 
 def _definitions(*extra):
@@ -100,12 +81,95 @@ def _service(tmp_path, monkeypatch, *, tools=TEAM_TOOLS):
     board_db = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(board_db))
+    db = SessionDB(tmp_path / "state.db")
     scope = build_local_discovery_scope()
-    service = TeamOrchestrationService(_agent(scope, tools=tools))
-    lifecycle = FakeLifecycle()
-    service.lifecycle = lifecycle
+    agent = _agent(scope, tools=tools)
+    agent._session_db = db
+    service = TeamOrchestrationService(agent)
+    cfg = {"max_iterations": 10, "max_concurrent_children": 2, "profiles": {}}
+    monkeypatch.setattr("tools.delegate_tool_config._load_config", lambda: cfg)
+    monkeypatch.setattr("tools.delegate_tool_config._get_child_timeout", lambda: None)
+    monkeypatch.setattr("tools.delegate_tool._validate_spawn_admission", lambda *_args: None)
+
+    def credentials(_cfg, _parent, profile=None, **_kwargs):
+        return {
+            "provider": "fixture", "model": f"{profile or 'default'}-model", "base_url": None,
+            "api_key": None, "api_mode": "chat_completions", "request_overrides": {},
+            "command": None, "args": [], "requested_profile": profile,
+            "requested_provider": None, "requested_model": None,
+            "requested_reasoning_effort": None, "resolved_provider": "fixture",
+            "resolved_model": f"{profile or 'default'}-model", "resolved_reasoning_effort": None,
+            "route_provenance": "fixture", "normalization_events": [], "reasoning_config": None,
+            "max_iterations": 10, "execution_limits": SimpleNamespace(
+                max_followups=8, max_tool_calls=20, timeout_seconds=None,
+            ),
+        }
+
+    monkeypatch.setattr("tools.delegate_tool_config._resolve_delegation_credentials", credentials)
+    builds = []
+
+    class Child:
+        def __init__(self, kwargs):
+            self._subagent_id = f"fixture-child-{len(builds)}"
+            self._delegate_role = kwargs.get("role", "leaf")
+            self._delegate_depth = 1
+            self.provider, self.model = "fixture", kwargs.get("model")
+            self.ephemeral_system_prompt = kwargs.get("frozen_system_prompt") or "fixture prompt"
+            self._worker_effective_tool_names = {"read_file"}
+            self._executable_tool_names = {"read_file"}
+            self.valid_tool_names = {"read_file"}
+            self.closed = False
+            self.interrupted = False
+            self.steered = []
+
+        def close(self):
+            self.closed = True
+
+        def steer(self, message):
+            self.steered.append(message)
+            return True
+
+        def hard_interrupt(self, _reason, **_kwargs):
+            self.interrupted = True
+            return True
+
+    def build(**kwargs):
+        child = Child(kwargs)
+        builds.append((child, kwargs))
+        return child
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", build)
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle._profile_policy_snapshot",
+        lambda _cfg, profile, creds, child=None: (
+            "fixture-policy-v1",
+            {
+                "profile_contract": {"name": profile},
+                "effective_tools": sorted(getattr(child, "_worker_effective_tool_names", ())),
+                "worker_interface": {"version": 1, "style": "hermes", "aliases": {}},
+                "route": {
+                    "requested_profile": profile, "requested_provider": None,
+                    "requested_model": None, "requested_reasoning_effort": None,
+                    "resolved_provider": creds["resolved_provider"],
+                    "resolved_model": creds["resolved_model"],
+                    "resolved_reasoning_effort": None,
+                },
+            },
+        ),
+    )
+    records = {}
+
+    def hold(_cls, record):
+        record.state = SubagentState.RUNNING
+        record.conversation_history = list(
+            record.store.get_worker(record.worker_id, record.owner_session_id).get("history") or []
+        )
+        record.agent._worker_lifecycle_record = record
+        records[record.run_id] = record
+
+    monkeypatch.setattr(SubagentLifecycleService, "_start_record", classmethod(hold))
     service._start_monitor = lambda *args, **kwargs: None
-    return service, lifecycle, board_db
+    return service, ControlledExecution(service.lifecycle, db, records, builds), board_db
 
 
 def test_team_schema_projection_is_collision_safe_and_keeps_native_authority(monkeypatch):
@@ -190,10 +254,12 @@ def test_parent_mode_claim_attachment_and_worker_admission_are_immutable(tmp_pat
         worker, run = store.admit_team_run(
             "owner", worker_id="worker-one", request_id="request-one", profile="alpha",
             policy={"role": "leaf"}, frozen_prompt="fixed", goal="Implement", context="Task",
+            admission_ref="admission-one",
         )
         repeated = store.admit_team_run(
             "owner", worker_id="worker-one", request_id="request-one", profile="alpha",
             policy={"role": "leaf"}, frozen_prompt="fixed", goal="Implement", context="Task",
+            admission_ref="admission-one",
         )
         assert repeated[1]["run_id"] == run["run_id"]
         assert worker["worker_id"] == "worker-one"
@@ -201,9 +267,88 @@ def test_parent_mode_claim_attachment_and_worker_admission_are_immutable(tmp_pat
             store.admit_team_run(
                 "owner", worker_id="worker-one", request_id="request-one", profile="alpha",
                 policy={"role": "leaf"}, frozen_prompt="fixed", goal="Changed", context="Task",
+                admission_ref="admission-one",
             )
+        assert store.claim_next_run("worker-one", "owner") is None
+        assert store.claim_run(run["run_id"], "owner") is None
+        leased = store.claim_team_run(
+            run["run_id"], "owner", admission_ref="admission-one",
+        )
+        assert leased is not None and leased["status"] == "RUNNING"
     finally:
         db.close()
+
+
+def test_team_crash_recovery_uses_one_held_run_and_revalidates_claim(tmp_path, monkeypatch):
+    service, lifecycle, _ = _service(tmp_path, monkeypatch)
+    from hermes_cli import kanban_db as kb
+
+    created = service.dispatch({
+        "action": "create", "title": "Crash recovery", "profile": "alpha",
+        "idempotency_key": "crash-recovery",
+    })
+    task_id = created["task_ref"].partition(":")[2]
+    with service._board() as (scope, conn):
+        task, claim_lock, role = service._claim(conn, kb.get_task(conn, task_id))
+        admission_hash, worker_id, request_id = service._admission(
+            scope, task_id, task.current_run_id, role,
+        )
+        request = SubagentLaunchRequest(
+            goal=task.title, context=f"Parent-managed Kanban task reference: task:{task_id}",
+            profile=task.assignee, parent_session_id="owner-synthetic",
+        )
+        worker, held = service.lifecycle.admit_team_execution(
+            request, worker_id=worker_id, request_id=request_id,
+            admission_ref=admission_hash,
+        )
+        assert lifecycle.store.claim_next_run(worker_id, "owner-synthetic") is None
+        assert lifecycle.store.claim_run(held["run_id"], "owner-synthetic") is None
+        assert service.lifecycle.control(
+            "wait", worker_id=worker_id, run_id=held["run_id"], timeout_seconds=0,
+        )["status"] == "PENDING"
+        reference = {
+            "version": "kanban-team-v1", "worker_ref": f"worker:{worker_id}",
+            "run_ref": f"run:{held['run_id']}", "admission_hash": admission_hash,
+            "role": role, "profile": worker.get("profile"),
+        }
+        kb.attach_execution_reference(
+            conn, task_id, task.current_run_id, claim_lock=claim_lock,
+            reference=reference, owner_session_id="owner-synthetic",
+        )
+
+    recovered = service.dispatch({"action": "start", "task_ref": created["task_ref"]})
+    assert recovered["run_ref"] == reference["run_ref"]
+    assert recovered["worker_status"] == "RUNNING"
+    assert len(lifecycle.store.list_runs(worker_id, "owner-synthetic")) == 1
+
+    other = service.dispatch({
+        "action": "create", "title": "Stale claim", "profile": "beta",
+        "idempotency_key": "stale-claim",
+    })
+    other_id = other["task_ref"].partition(":")[2]
+    with service._board() as (scope, conn):
+        task, claim_lock, role = service._claim(conn, kb.get_task(conn, other_id))
+        digest, worker_id, request_id = service._admission(scope, other_id, task.current_run_id, role)
+        request = SubagentLaunchRequest(
+            goal=task.title, context=f"Parent-managed Kanban task reference: task:{other_id}",
+            profile=task.assignee, parent_session_id="owner-synthetic",
+        )
+        worker, held = service.lifecycle.admit_team_execution(
+            request, worker_id=worker_id, request_id=request_id, admission_ref=digest,
+        )
+        reference = {
+            "version": "kanban-team-v1", "worker_ref": f"worker:{worker_id}",
+            "run_ref": f"run:{held['run_id']}", "admission_hash": digest,
+            "role": role, "profile": worker.get("profile"),
+        }
+        kb.attach_execution_reference(
+            conn, other_id, task.current_run_id, claim_lock=claim_lock,
+            reference=reference, owner_session_id="owner-synthetic",
+        )
+        conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (int(time.time()) - 1, other_id))
+    rejected = service.dispatch({"action": "start", "task_ref": other["task_ref"]})
+    assert "stale or mismatched" in rejected["error"]
+    assert lifecycle.store.get_run(held["run_id"], "owner-synthetic")["status"] == "PENDING"
 
 
 def test_two_worker_dependency_review_rejection_retained_correction_and_acceptance(tmp_path, monkeypatch):
@@ -237,24 +382,59 @@ def test_two_worker_dependency_review_rejection_retained_correction_and_acceptan
     reviewer = service.dispatch({"action": "start", "task_ref": first["task_ref"]})
     assert reviewer["profile"] == "beta"
     lifecycle.succeed(reviewer["run_ref"])
-    correction = service.dispatch({
+    blocker = service.dispatch({
+        "action": "create", "title": "Delayed prerequisite", "profile": "alpha",
+        "idempotency_key": "delayed-prerequisite",
+    })
+    conn = kbc.connect()
+    try:
+        kb.link_tasks(
+            conn, blocker["task_ref"].partition(":")[2], first["task_ref"].partition(":")[2],
+        )
+    finally:
+        conn.close()
+    delayed = service.dispatch({
         "action": "request_changes", "task_ref": first["task_ref"],
         "message": "Correct the boundary condition.",
     })
+    assert delayed["status"] == "todo"
+    conn = kbc.connect()
+    try:
+        assert kb.complete_task(
+            conn, blocker["task_ref"].partition(":")[2], summary="Prerequisite supplied.",
+        )
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, first["task_ref"].partition(":")[2]).status == "ready"
+    finally:
+        conn.close()
+    restarted_service = TeamOrchestrationService(service.agent)
+    restarted_service._start_monitor = lambda *_args, **_kwargs: None
+    correction = restarted_service.dispatch({"action": "start", "task_ref": first["task_ref"]})
     assert correction["worker_ref"] == implementation["worker_ref"]
     assert correction["run_ref"] != implementation["run_ref"]
-    correction_admission = next(
-        row for row in lifecycle.admissions.values() if row[1]["run_id"] == correction["run_ref"].partition(":")[2]
+    correction_run = lifecycle.store.get_run(
+        correction["run_ref"].partition(":")[2], "owner-synthetic",
     )
-    assert correction_admission[2][3] == implementation["run_ref"].partition(":")[2]
+    assert correction_run["previous_run_id"] == implementation["run_ref"].partition(":")[2]
+    correction_build = next(
+        kwargs for _child, kwargs in lifecycle.builds
+        if kwargs.get("goal") == "Correct the boundary condition."
+    )
+    assert correction_build["retained_parent_worker_id"] is None
     lifecycle.succeed(correction["run_ref"])
-    assert service.dispatch({
+    assert restarted_service.dispatch({
         "action": "submit_review", "task_ref": first["task_ref"],
         "summary": "Correction complete.", "reviewer": "beta",
     })["status"] == "review"
-    second_review = service.dispatch({"action": "start", "task_ref": first["task_ref"]})
+    second_review = restarted_service.dispatch({"action": "start", "task_ref": first["task_ref"]})
+    reviewer_build = next(
+        kwargs for _child, kwargs in reversed(lifecycle.builds)
+        if str(kwargs.get("goal", "")).startswith("Review task:")
+    )
+    assert "Submitted handoff: Correction complete." in reviewer_build["goal"]
+    assert correction["worker_ref"] in reviewer_build["goal"]
     lifecycle.succeed(second_review["run_ref"])
-    accepted = service.dispatch({
+    accepted = restarted_service.dispatch({
         "action": "accept", "task_ref": first["task_ref"], "summary": "Accepted.",
     })
     assert accepted["status"] == "done"
@@ -272,19 +452,74 @@ def test_two_worker_dependency_review_rejection_retained_correction_and_acceptan
         conn.close()
 
 
-def test_cancel_waits_for_terminal_worker_and_list_only_policy_cannot_mutate(tmp_path, monkeypatch):
+def test_foreign_parent_and_list_only_policy_cannot_mutate(tmp_path, monkeypatch):
     denied, _lifecycle, _ = _service(tmp_path, monkeypatch, tools={"kanban_list"})
     result = denied.dispatch({"action": "create", "title": "Denied", "profile": "alpha"})
     assert "current executable tool policy" in result["error"]
+    selection = bind_worker_interface(
+        InterfaceSelection("codex", "explicit", "experimental_unqualified", "fixture", "fixture"),
+        _definitions(),
+    )
+    denied.agent._worker_interface_selection = selection
+    styled_name = dict(selection.aliases)["team_task"]
+    styled = json.loads(dispatch_worker_interface_call(
+        denied.agent, styled_name,
+        {"action": "create", "title": "Still denied", "profile": "alpha"},
+        lambda _args: pytest.fail("styled team call reached delegate dispatch"),
+    ))
+    assert "current executable tool policy" in styled["error"]
 
-    service, lifecycle, _ = _service(tmp_path / "allowed", monkeypatch)
+    service, lifecycle, _ = _service(tmp_path / "foreign", monkeypatch)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="Foreign", assignee="alpha", initial_status="running",
+            session_id="different-parent", execution_mode="parent",
+        )
+        before = len(kb.list_runs(conn, task_id))
+    finally:
+        conn.close()
+    denied_start = service.dispatch({"action": "start", "task_ref": f"task:{task_id}"})
+    assert "Unknown or unavailable" in denied_start["error"]
+    conn = kbc.connect()
+    try:
+        assert len(kb.list_runs(conn, task_id)) == before
+        assert kb.get_task(conn, task_id).status == "ready"
+        with lifecycle.store.db._read_ctx() as state_conn:
+            assert state_conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='orchestration_workers'"
+            ).fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_exact_cancel_ack_does_not_dispose_task_or_newer_run(tmp_path, monkeypatch):
+    service, lifecycle, _ = _service(tmp_path, monkeypatch)
+
     created = service.dispatch({"action": "create", "title": "Cancel", "profile": "alpha"})
     running = service.dispatch({"action": "start", "task_ref": created["task_ref"]})
     cancelled = service.dispatch({
         "action": "cancel", "task_ref": created["task_ref"], "timeout_seconds": 0,
     })
-    assert lifecycle.statuses[running["run_ref"].partition(":")[2]] == "CANCELLED"
-    assert cancelled["status"] == "blocked"
+    assert lifecycle.status(running["run_ref"]) == "RUNNING"
+    assert cancelled["task_disposition"] == "pending_terminal_worker_evidence"
+    assert cancelled["interrupt_requested"] is True
+
+    lifecycle.succeed(running["run_ref"])
+    worker_id = running["worker_ref"].partition(":")[2]
+    old_run = running["run_ref"].partition(":")[2]
+    newer = lifecycle.store.enqueue_run(
+        worker_id, "owner-synthetic", goal="later authorized run",
+        previous_run_id=old_run,
+    )
+    assert lifecycle.store.claim_run(newer["run_id"], "owner-synthetic") is not None
+    repeated = service.dispatch({
+        "action": "cancel", "task_ref": created["task_ref"], "timeout_seconds": 0,
+    })
+    assert repeated["task_disposition"] == "pending_terminal_worker_evidence"
+    assert lifecycle.store.get_run(newer["run_id"], "owner-synthetic")["status"] == "RUNNING"
 
 
 def test_room_guidance_requires_current_message_grant(tmp_path, monkeypatch):
@@ -320,15 +555,27 @@ def test_room_guidance_requires_current_message_grant(tmp_path, monkeypatch):
     server._sessions["sid-one"] = record
     token = current.set(record)
     try:
-        result = scope.room_provider.send(
-            agent, "room:room-one", event_id="team-event", payload={"text": "Coordinate."},
-        )
-        assert result["event_id"] == "team-event"
+        coordinator = TeamOrchestrationService(agent)
+        coordinator._start_monitor = lambda *_args, **_kwargs: None
+        result = coordinator.dispatch({
+            "action": "guide", "targets": ["room:room-one"], "message": "Coordinate.",
+            "idempotency_key": "room-guide",
+        })
+        assert result["outcomes"][0]["status"] == "accepted"
         assert sent[0]["room_id"] == "room-one"
+        service.send = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("receipt lost"))
+        uncertain = coordinator.dispatch({
+            "action": "guide", "targets": ["room:room-one"], "message": "Retry safely.",
+            "idempotency_key": "room-uncertain",
+        })["outcomes"][0]
+        assert uncertain["status"] == "delivery_uncertain"
+        assert uncertain["delivery_id"].startswith("team-")
+        assert uncertain["reconciliation_ref"] == f"room_event:{uncertain['delivery_id']}"
         cfg["orchestration"]["discovery"]["rooms"][0]["actions"] = ["inspect"]
-        with pytest.raises(PermissionError, match="Unknown or unavailable"):
-            scope.room_provider.send(
-                agent, "room:room-one", event_id="other", payload={"text": "Denied."},
-            )
+        denied = coordinator.dispatch({
+            "action": "guide", "targets": ["room:room-one"], "message": "Denied.",
+        })["outcomes"][0]
+        assert denied["status"] == "not_delivered"
+        assert "delivery_id" not in denied
     finally:
         current.reset(token)

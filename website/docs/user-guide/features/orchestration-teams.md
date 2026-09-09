@@ -11,11 +11,12 @@ request a correction from the original worker, and accept the reviewed result.
 You choose the worker profiles and their providers, models, thinking levels and
 tool restrictions. There are no built-in mandatory roles or model families.
 
-This is a draft implementation. Its initial five focused tests use temporary
-Kanban and WorkerStore databases with a deterministic scheduler fixture. They
-do not establish live provider execution, live Bot/room delivery, installation
-or release. The [comparison](orchestration-capability-comparison.md) records the
-separate worker, interface, discovery and planned workflow evidence.
+This is a draft implementation. Its focused tests use temporary Kanban and
+WorkerStore databases and the real lifecycle admission and lease path, while
+holding child execution at a synthetic provider boundary. They do not establish
+live provider execution, live Bot/room delivery, installation or release. The
+[comparison](orchestration-capability-comparison.md) records the separate worker,
+interface, discovery and planned workflow evidence.
 
 ## Enable the parent's capabilities
 
@@ -105,13 +106,17 @@ Parent-managed tasks use `execution_mode: parent`; existing tasks keep the
 dispatcher default. The dispatcher checks that routing mode during selection
 and the claim itself.
 
-Team admission prepares an identified pending worker assignment, attaches its
-reference to the exact Kanban run, and then schedules it. A matching retry can
-reuse the record; changed content must fail. An already-running assignment is
-observed. An uncertain tool effect must be reconciled through the existing
-worker controls before continuation; a reference is never permission to replay.
+Team admission prepares an identified held worker assignment, attaches its
+reference to the exact Kanban run, and then schedules it through a trusted entry.
+Ordinary FIFO and exact-run scheduling cannot lease a held assignment. The team
+entry rechecks the parent, current unexpired claim, immutable attachment and
+native executable permissions before and after lease acquisition. A matching
+retry can reuse the record; changed content must fail. An already-running
+assignment is observed. An uncertain tool effect must be reconciled through the
+existing worker controls before continuation; a reference is never permission
+to replay.
 
-Cancellation targets the attached execution and owned descendants. A request
+Cancellation interrupts only the exact attached worker run. A request
 acknowledgment is not proof that they stopped. `pending_terminal_worker_evidence`
 means the parent should wait and inspect before treating the task as cancelled.
 The current team `cancel` action targets an attached active task; it is not yet

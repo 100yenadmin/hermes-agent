@@ -117,28 +117,33 @@ implementation worker.
 
 `admit_team_execution` resolves and records an immutable WorkerStore assignment
 without scheduling it. Its owner/board/task/Kanban-run/role-derived identity is
-used to deduplicate admission. `attach_execution_reference` commits an immutable
-reference to that exact Kanban run. Only then does `schedule_team_execution`
-enter the existing worker scheduler and lease machinery. WorkerStore remains
+used to deduplicate admission. The run is marked as a held team admission, so
+ordinary FIFO, wait and exact-run scheduler paths cannot lease it.
+`attach_execution_reference` commits an immutable reference to that exact
+Kanban run. Only then does `schedule_team_execution` enter a trusted team lease
+path that validates the parent, unexpired claim, attachment and native executable
+permissions immediately before and after lease acquisition. WorkerStore remains
 the sole conversation, run, budget, checkpoint and uncertainty owner. Kanban
 events carry references and contract metadata, never a lifecycle capability
 handle or credential values.
 
 The team service renews exact task claims while execution remains active and
-current session authority holds. Cancellation requests worker-tree cancellation,
+current session authority holds. Cancellation requests exact-run interruption,
 waits for terminal evidence, then fences the Kanban block operation to the
-attached run. Requests, execution terminal state, task acceptance and completion
-acknowledgments remain separate.
+attached run. It cannot cancel a newer retained run. Requests, execution terminal
+state, task acceptance and completion acknowledgments remain separate.
 
 Guidance returns per-target outcomes. Bots use the existing canonical Bot Chat
 gate. Hosted rooms require a session-bound explicit `message` grant and reuse
 the existing service send contract, with gateway/epoch/participant checks.
 Inspection grants do not authorize sending or room adoption.
 
-The initial `test_team_orchestration.py` cases cover schema projection, real
-store admission and attachment, a dependency/review/correction sequence, bounded
-cancellation/policy denial, and room-grant checks. The sequence uses a scheduler
-fixture; live transports and process-level recovery require separate evidence.
+The focused `test_team_orchestration.py` cases cover schema projection, real
+store admission and attachment, held-run scheduler exclusion, crash-boundary
+recovery, a dependency/review/retained-correction sequence, exact cancellation,
+policy/foreign-parent denial and room-grant outcomes. They use the real lifecycle
+and stores with provider execution held at a controlled child boundary; live
+transports and process-level restart still require separate evidence.
 See [Parent-managed teams](../user-guide/features/orchestration-teams.md) for
 the model-facing action sequence and proof boundary.
 

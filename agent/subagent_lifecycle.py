@@ -827,7 +827,7 @@ class SubagentLifecycleService:
 
     def admit_team_execution(
         self, request: SubagentLaunchRequest, *, worker_id: str, request_id: str,
-        previous_run_id: Optional[str] = None,
+        previous_run_id: Optional[str] = None, admission_ref: str,
     ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
         """Durably admit a parent-managed run without scheduling it.
 
@@ -933,10 +933,11 @@ class SubagentLifecycleService:
                 else None
             ),
             budget_limits=_tree_budget_limits(cfg, creds, DEFAULT_MAX_ITERATIONS),
+            admission_ref=admission_ref,
         )
 
     def schedule_team_execution(
-        self, worker_id: str, run_id: str,
+        self, worker_id: str, run_id: str, *, admission: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         """Schedule one already-attached PENDING run under current authority."""
         parent = self._parent_agent_resolver()
@@ -950,8 +951,13 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError("Team execution coordinates do not match.")
         if worker.get("uncertain_side_effect") or run.get("uncertain_side_effect"):
             raise SubagentLifecycleError("Reconcile uncertain worker effects before scheduling.")
+        from agent.team_orchestration import validate_team_execution_admission
+        validate_team_execution_admission(parent, admission, worker_id, run_id)
         if run["status"] == "PENDING":
-            self._schedule_owner(store, owner, parent, worker_id=worker_id, run_id=run_id)
+            self._schedule_owner(
+                store, owner, parent, worker_id=worker_id, run_id=run_id,
+                team_admission=admission,
+            )
             run = store.get_run(run_id, owner)
         return self._safe_run_snapshot(run)
 
@@ -1822,6 +1828,7 @@ class SubagentLifecycleService:
     def _schedule_owner(
         cls, store: Any, owner_session_id: str, parent_agent: Any = None,
         *, worker_id: Optional[str] = None, run_id: Optional[str] = None,
+        team_admission: Optional[Mapping[str, Any]] = None,
     ) -> None:
         """Just-in-time admission for the exact durable FIFO run(s)."""
         from tools.delegate_tool_config import _load_config
@@ -1838,6 +1845,14 @@ class SubagentLifecycleService:
             if worker_id is not None and pending["worker_id"] != worker_id:
                 continue
             if target_sequence is not None and int(pending["sequence"]) > target_sequence:
+                continue
+            is_team = pending.get("admission_kind") == "team"
+            if is_team and team_admission is None:
+                continue
+            if team_admission is not None and (
+                not is_team or pending["run_id"] != run_id
+                or pending.get("admission_ref") != (team_admission.get("reference") or {}).get("admission_hash")
+            ):
                 continue
             worker = store.get_worker(pending["worker_id"], owner_session_id)
             authority = cls._retained_parent_authority(
@@ -1856,12 +1871,20 @@ class SubagentLifecycleService:
                 continue
             role = str((worker.get("policy") or {}).get("role") or "leaf")
             service = cls(lambda authority=authority: authority)
+            if is_team:
+                from agent.team_orchestration import validate_team_execution_admission
+                validate_team_execution_admission(
+                    authority, team_admission, pending["worker_id"], pending["run_id"],
+                )
             try:
                 child, creds, cfg, _policy = service._build_revalidated_child(
                     worker, goal=pending["goal"], role=role)
             except Exception as exc:
-                claimed = store.claim_run(
-                    pending["run_id"], owner_session_id, max_concurrent=max_concurrent)
+                claim = store.claim_team_run if is_team else store.claim_run
+                kwargs = {"admission_ref": pending["admission_ref"]} if is_team else {}
+                claimed = claim(
+                    pending["run_id"], owner_session_id,
+                    max_concurrent=max_concurrent, **kwargs)
                 if claimed is not None:
                     failed = store.finish_run(
                         pending["run_id"], owner_session_id, claimed["lease_token"],
@@ -1889,8 +1912,17 @@ class SubagentLifecycleService:
                         )
                 continue
             max_concurrent = _concurrency_limit(cfg)
-            claimed = store.claim_run(
-                pending["run_id"], owner_session_id, max_concurrent=max_concurrent)
+            if is_team:
+                validate_team_execution_admission(
+                    authority, team_admission, pending["worker_id"], pending["run_id"],
+                )
+                claimed = store.claim_team_run(
+                    pending["run_id"], owner_session_id,
+                    admission_ref=pending["admission_ref"], max_concurrent=max_concurrent,
+                )
+            else:
+                claimed = store.claim_run(
+                    pending["run_id"], owner_session_id, max_concurrent=max_concurrent)
             if claimed is None:
                 with contextlib.suppress(Exception):
                     child.close()
@@ -1929,6 +1961,26 @@ class SubagentLifecycleService:
             record.max_concurrent = max_concurrent
             record.goal = pending["goal"]
             record.budget_epoch_id = pending.get("budget_epoch_id")
+            if is_team:
+                try:
+                    validate_team_execution_admission(
+                        authority, team_admission, pending["worker_id"], pending["run_id"],
+                    )
+                except Exception:
+                    store.finish_run(
+                        pending["run_id"], owner_session_id, claimed["lease_token"],
+                        status="FAILED",
+                        result={
+                            "summary": None,
+                            "error_classification": "TEAM_ADMISSION_REVALIDATION_FAILED",
+                            "error_message": "Team execution authority changed after lease admission.",
+                            "termination": {"status": "FAILED", "reason": "team_admission_revalidation_failed"},
+                        },
+                        history=list(worker.get("history") or []),
+                    )
+                    with contextlib.suppress(Exception):
+                        child.close()
+                    raise
             cls._start_record(record)
 
     @staticmethod

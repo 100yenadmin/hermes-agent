@@ -50,6 +50,44 @@ def _typed_targets(value: Any) -> list[str]:
     return targets
 
 
+def validate_team_execution_admission(
+    agent: Any, admission: Mapping[str, Any], worker_id: str, run_id: str,
+) -> Mapping[str, Any]:
+    """Recheck the exact Kanban claim/attachment before a held worker lease."""
+    service = TeamOrchestrationService(agent)
+    service._require(TEAM_TOOL_NAME, "delegate_task", "kanban_heartbeat")
+    scope = service._scope()
+    owner = service._owner()
+    task_id = _text(admission.get("task_id"), required=True)
+    kanban_run_id = int(admission.get("kanban_run_id") or 0)
+    claim_lock = _text(admission.get("claim_lock"), required=True)
+    reference = admission.get("reference")
+    if not isinstance(reference, Mapping):
+        raise PermissionError(_UNKNOWN)
+    attached_worker, attached_run = service._attachment_ids(reference)
+    if attached_worker != worker_id or attached_run != run_id:
+        raise PermissionError(_UNKNOWN)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect(board=scope.kanban_board)
+    try:
+        task = service._authorize_task(kb.get_task(conn, task_id))
+        current = kb.get_execution_attachment(conn, task_id, kanban_run_id)
+        if (
+            task.status != "running" or int(task.current_run_id or 0) != kanban_run_id
+            or task.claim_lock != claim_lock or int(task.claim_expires or 0) <= int(time.time())
+            or current != dict(reference)
+            or reference.get("admission_hash") != service._admission(
+                scope, task_id, kanban_run_id, _text(reference.get("role"), required=True)
+            )[0]
+            or owner != task.session_id
+        ):
+            raise PermissionError("Team execution admission is stale or mismatched")
+        return dict(reference)
+    finally:
+        conn.close()
+
+
 class TeamOrchestrationService:
     """Thin coordinator; Kanban, WorkerStore, Bot Mode and rooms keep authority."""
 
@@ -69,6 +107,30 @@ class TeamOrchestrationService:
             raise PermissionError(
                 "Team action is unavailable under the current executable tool policy."
             )
+
+    def _guard_action(self, action: str, args: Mapping[str, Any]) -> None:
+        """Enforce canonical service authority even for direct/styled dispatch."""
+        required = {
+            "create": ("kanban_create",),
+            "start": ("delegate_task", "kanban_heartbeat"),
+            "guide": (),
+            "submit_review": ("kanban_request_review",),
+            "accept": ("kanban_complete",),
+            "request_changes": ("kanban_request_changes", "delegate_task", "kanban_heartbeat"),
+            "cancel": ("delegate_task", "kanban_block"),
+        }[action]
+        self._require(TEAM_TOOL_NAME, *required)
+        self._scope()
+        self._owner()
+        if action == "guide":
+            for target in _typed_targets(args.get("targets")):
+                kind = target.partition(":")[0]
+                if kind == "task":
+                    self._require("delegate_task")
+                elif kind == "bot":
+                    self._require("message_agent")
+                elif kind != "room":
+                    raise PermissionError(_UNKNOWN)
 
     def _scope(self):
         from agent.shared_discovery import SharedDiscoveryScope, build_local_discovery_scope
@@ -107,6 +169,14 @@ class TeamOrchestrationService:
             raise PermissionError("Team execution requires a stable parent session.")
         return owner
 
+    def _authorize_task(self, task: Any) -> Any:
+        if (
+            task is None or task.execution_mode != "parent"
+            or not task.session_id or task.session_id != self._owner()
+        ):
+            raise PermissionError(_UNKNOWN)
+        return task
+
     @staticmethod
     def _digest(parts: Iterable[Any]) -> str:
         encoded = json.dumps(list(parts), ensure_ascii=False, separators=(",", ":"))
@@ -134,6 +204,7 @@ class TeamOrchestrationService:
 
     def _claim(self, conn: Any, task: Any) -> tuple[Any, str, str]:
         from hermes_cli import kanban_db as kb
+        task = self._authorize_task(task)
         source = str(task.status)
         if source not in {"ready", "review"}:
             raise ValueError("Parent-managed task must be ready or in review before start")
@@ -150,9 +221,39 @@ class TeamOrchestrationService:
             raise RuntimeError("Parent execution claim was lost or the task changed")
         return claimed, claim_lock, "reviewer" if source == "review" else "implementer"
 
+    def _execution_plan(self, conn: Any, task: Any, role: str) -> tuple[str, str, Optional[tuple[str, str]]]:
+        """Recover durable review/correction intent before worker admission."""
+        from hermes_cli import kanban_db as kb
+        if role == "reviewer":
+            intent = kb.pending_team_intent(conn, task.id, kind="review")
+            if not intent:
+                raise RuntimeError("Durable review assignment is unavailable")
+            if _text(intent.get("reviewer"), required=True) != _text(task.assignee, required=True):
+                raise PermissionError("Review assignment changed after the durable handoff")
+            evidence = intent.get("implementation") or {}
+            goal = (
+                f"Review task:{task.id}. Submitted handoff: {_text(intent.get('summary'))}. "
+                f"Inspect the exact implementation references "
+                f"{_text(evidence.get('worker_ref'))} and {_text(evidence.get('run_ref'))}; "
+                "report concrete acceptance evidence or request changes."
+            )
+            return goal, "Reviewer assignment for the submitted implementation handoff.", None
+        correction = kb.pending_team_intent(conn, task.id, kind="correction")
+        if correction:
+            implementation = correction.get("implementation") or {}
+            worker_id, previous_run_id = self._attachment_ids(implementation)
+            return (
+                _text(correction.get("message"), required=True),
+                f"Retained correction for task:{task.id}; preserve the prior worker conversation.",
+                (worker_id, previous_run_id),
+            )
+        goal = "\n\n".join(part for part in (_text(task.title), _text(task.body)) if part)
+        return goal, f"Parent-managed Kanban task reference: task:{task.id}", None
+
     def _admit_attach_schedule(
         self, scope: Any, conn: Any, task: Any, claim_lock: str, role: str, *,
         previous: Optional[tuple[str, str]] = None, message: Optional[str] = None,
+        context: Optional[str] = None,
     ) -> Mapping[str, Any]:
         from hermes_cli import kanban_db as kb
         run_id = int(task.current_run_id or 0)
@@ -168,7 +269,7 @@ class TeamOrchestrationService:
         )
         request = SubagentLaunchRequest(
             goal=goal,
-            context=f"Parent-managed Kanban task reference: task:{task.id}",
+            context=_text(context) or f"Parent-managed Kanban task reference: task:{task.id}",
             profile=task.assignee,
             role="leaf",
             parent_session_id=self._owner(),
@@ -178,6 +279,7 @@ class TeamOrchestrationService:
             worker_id=worker_id,
             request_id=request_id,
             previous_run_id=previous_run_id,
+            admission_ref=admission_hash,
         )
         reference = {
             "version": TEAM_CONTRACT_VERSION,
@@ -189,6 +291,7 @@ class TeamOrchestrationService:
         }
         kb.attach_execution_reference(
             conn, task.id, run_id, claim_lock=claim_lock, reference=reference,
+            owner_session_id=self._owner(),
         )
         # Attachment validation is the final authorization check before the
         # worker lease may be claimed.
@@ -198,7 +301,13 @@ class TeamOrchestrationService:
             or current.claim_lock != claim_lock or current.execution_mode != "parent"
         ):
             raise PermissionError("Parent execution claim changed before scheduling")
-        scheduled = self.lifecycle.schedule_team_execution(worker["worker_id"], run["run_id"])
+        admission = {
+            "task_id": task.id, "kanban_run_id": run_id, "claim_lock": claim_lock,
+            "reference": reference,
+        }
+        scheduled = self.lifecycle.schedule_team_execution(
+            worker["worker_id"], run["run_id"], admission=admission,
+        )
         self._start_monitor(scope, task.id, run_id, claim_lock, worker["worker_id"], run["run_id"])
         return {
             "task_ref": f"task:{task.id}",
@@ -261,8 +370,8 @@ class TeamOrchestrationService:
         parents = [_task_id(item) for item in parent_refs]
         with self._board() as (scope, conn):
             from hermes_cli import kanban_db as kb
-            if any(kb.get_task(conn, parent) is None for parent in parents):
-                raise PermissionError(_UNKNOWN)
+            for parent in parents:
+                self._authorize_task(kb.get_task(conn, parent))
             key = _text(args.get("idempotency_key"))
             durable_key = self._digest((self._owner(), key)) if key else None
             task_id = kb.create_task(
@@ -287,13 +396,10 @@ class TeamOrchestrationService:
             }
 
     def _start(self, args: Mapping[str, Any]) -> Mapping[str, Any]:
-        self._require(TEAM_TOOL_NAME, "delegate_task", "kanban_heartbeat")
         task_id = _task_id(args.get("task_ref"))
         with self._board() as (scope, conn):
             from hermes_cli import kanban_db as kb
-            task = kb.get_task(conn, task_id)
-            if task is None or task.execution_mode != "parent":
-                raise PermissionError(_UNKNOWN)
+            task = self._authorize_task(kb.get_task(conn, task_id))
             requested_profile = _text(args.get("profile"))
             if requested_profile and requested_profile != task.assignee:
                 raise PermissionError("Requested profile does not match the task assignment")
@@ -301,7 +407,13 @@ class TeamOrchestrationService:
                 attachment = kb.get_execution_attachment(conn, task_id, task.current_run_id)
                 if attachment is not None:
                     worker_id, run_id = self._attachment_ids(attachment)
-                    status = self.lifecycle.schedule_team_execution(worker_id, run_id)
+                    admission = {
+                        "task_id": task.id, "kanban_run_id": int(task.current_run_id),
+                        "claim_lock": task.claim_lock, "reference": attachment,
+                    }
+                    status = self.lifecycle.schedule_team_execution(
+                        worker_id, run_id, admission=admission,
+                    )
                     self._start_monitor(
                         scope, task_id, task.current_run_id, task.claim_lock,
                         worker_id, run_id,
@@ -314,11 +426,21 @@ class TeamOrchestrationService:
                         "recovered": True,
                     }
                 role = "reviewer" if kb.run_claim_source(conn, task_id, task.current_run_id) == "review" else "implementer"
+                if role == "implementer" and kb.pending_team_intent(conn, task_id, kind="correction"):
+                    role = "correction"
+                goal, context, previous = self._execution_plan(conn, task, role)
                 return self._admit_attach_schedule(
                     scope, conn, task, task.claim_lock, role,
+                    previous=previous, message=goal, context=context,
                 )
             claimed, claim_lock, role = self._claim(conn, task)
-            return self._admit_attach_schedule(scope, conn, claimed, claim_lock, role)
+            if role == "implementer" and kb.pending_team_intent(conn, task_id, kind="correction"):
+                role = "correction"
+            goal, context, previous = self._execution_plan(conn, claimed, role)
+            return self._admit_attach_schedule(
+                scope, conn, claimed, claim_lock, role,
+                previous=previous, message=goal, context=context,
+            )
 
     def _current_attachment(self, conn: Any, task_id: str) -> tuple[Any, int, Mapping[str, Any]]:
         from hermes_cli import kanban_db as kb
@@ -328,6 +450,7 @@ class TeamOrchestrationService:
             or not task.current_run_id
         ):
             raise PermissionError(_UNKNOWN)
+        self._authorize_task(task)
         reference = kb.get_execution_attachment(conn, task_id, task.current_run_id)
         if reference is None:
             raise PermissionError(_UNKNOWN)
@@ -351,10 +474,12 @@ class TeamOrchestrationService:
                 return {"target": target, **result, "task_status": task.status}
         if kind == "bot":
             from tools.bot_mode_dm import message_agent_authorized, message_agent_tool
-            if not message_agent_authorized(self.agent) or "message_agent" not in getattr(self.agent, "valid_tool_names", set()):
+            if not message_agent_authorized(self.agent):
                 raise PermissionError("Bot guidance is unavailable in this session")
             raw = message_agent_tool(target=target.partition(":")[2], message=message, agent=self.agent)
             result = json.loads(raw)
+            if result.get("error") and "status" not in result:
+                result["status"] = "not_delivered"
             return {"target": target, **result}
         if kind == "room":
             scope = self._scope()
@@ -376,13 +501,21 @@ class TeamOrchestrationService:
         outcomes = []
         for target in targets:
             try:
-                outcomes.append(self._guide_one(target, message, key))
+                outcomes.append({"status": "accepted", **self._guide_one(target, message, key)})
             except Exception as exc:
+                from tui_gateway.session_discovery import RoomDeliveryUncertain
+                if isinstance(exc, RoomDeliveryUncertain):
+                    outcomes.append({
+                        "target": target, "status": "delivery_uncertain",
+                        "delivery_id": exc.event_id,
+                        "reconciliation_ref": exc.reconciliation_ref,
+                        "error": str(exc),
+                    })
+                    continue
                 outcomes.append({"target": target, "error": str(exc), "status": "not_delivered"})
         return {"outcomes": outcomes, "idempotency_key": key}
 
     def _submit_review(self, args: Mapping[str, Any]) -> Mapping[str, Any]:
-        self._require(TEAM_TOOL_NAME, "kanban_request_review")
         task_id = _task_id(args.get("task_ref"))
         summary = _text(args.get("summary"), "summary", required=True)
         reviewer = _text(args.get("reviewer"), "reviewer", required=True)
@@ -391,6 +524,10 @@ class TeamOrchestrationService:
             _task, kanban_run, attachment = self._current_attachment(conn, task_id)
             if self._worker_status(attachment).get("status") != "SUCCEEDED":
                 raise RuntimeError("Worker success is required before requesting review")
+            kb.record_team_intent(
+                conn, task_id, kanban_run, kind="review", owner_session_id=self._owner(),
+                payload={"summary": summary, "reviewer": reviewer, "implementation": dict(attachment)},
+            )
             ok, reason = kb.request_review(
                 conn, task_id, summary=summary, reviewer=reviewer,
                 expected_run_id=kanban_run, with_reason=True,
@@ -400,7 +537,6 @@ class TeamOrchestrationService:
             return {"task_ref": f"task:{task_id}", "status": "review", "submitted_run_id": kanban_run}
 
     def _accept(self, args: Mapping[str, Any]) -> Mapping[str, Any]:
-        self._require(TEAM_TOOL_NAME, "kanban_complete")
         task_id = _task_id(args.get("task_ref"))
         with self._board() as (_scope, conn):
             from hermes_cli import kanban_db as kb
@@ -417,9 +553,6 @@ class TeamOrchestrationService:
             return {"task_ref": f"task:{task_id}", "status": "done", "accepted_run_id": kanban_run}
 
     def _request_changes(self, args: Mapping[str, Any]) -> Mapping[str, Any]:
-        self._require(
-            TEAM_TOOL_NAME, "kanban_request_changes", "delegate_task", "kanban_heartbeat",
-        )
         task_id = _task_id(args.get("task_ref"))
         reason = _text(args.get("message"), "message", required=True)
         with self._board() as (scope, conn):
@@ -436,6 +569,13 @@ class TeamOrchestrationService:
                 raise RuntimeError("Original implementation execution is unavailable")
             _implementation_kanban_run, implementation_ref = implementation
             worker_id, previous_run_id = self._attachment_ids(implementation_ref)
+            kb.record_team_intent(
+                conn, task_id, review_run, kind="correction", owner_session_id=self._owner(),
+                payload={
+                    "message": reason, "implementation": dict(implementation_ref),
+                    "reviewer": dict(reviewer_attachment), "review_run_id": review_run,
+                },
+            )
             ok, detail = kb.request_changes(
                 conn, task_id, reason=reason, expected_run_id=review_run,
             )
@@ -445,28 +585,28 @@ class TeamOrchestrationService:
             if task is None or task.status != "ready":
                 return {"task_ref": f"task:{task_id}", "status": task.status if task else "unknown"}
             claimed, claim_lock, _role = self._claim(conn, task)
+            goal, context, previous = self._execution_plan(conn, claimed, "correction")
             result = self._admit_attach_schedule(
                 scope, conn, claimed, claim_lock, "correction",
-                previous=(worker_id, previous_run_id), message=reason,
+                previous=previous or (worker_id, previous_run_id), message=goal, context=context,
             )
             return {**result, "changes_requested_from_run_id": review_run}
 
     def _cancel(self, args: Mapping[str, Any]) -> Mapping[str, Any]:
-        self._require(TEAM_TOOL_NAME, "delegate_task", "kanban_block")
         task_id = _task_id(args.get("task_ref"))
         timeout = min(60.0, max(0.0, float(args.get("timeout_seconds") or 0)))
         with self._board() as (_scope, conn):
             from hermes_cli import kanban_db as kb
             _task, kanban_run, attachment = self._current_attachment(conn, task_id)
             worker_id, run_id = self._attachment_ids(attachment)
-            result = self.lifecycle.control("cancel", worker_id=worker_id, run_id=run_id)
+            result = self.lifecycle.control("interrupt", worker_id=worker_id, run_id=run_id)
             status = self.lifecycle.control(
                 "wait", worker_id=worker_id, run_id=run_id, timeout_seconds=timeout,
             )
             if status.get("status") not in {"CANCELLED", "INTERRUPTED"}:
                 return {
                     "task_ref": f"task:{task_id}", "kanban_run_id": kanban_run,
-                    "worker_status": status.get("status"), "cancel_requested": result.get("cancel_requested"),
+                    "worker_status": status.get("status"), "interrupt_requested": result.get("interrupt_requested"),
                     "task_disposition": "pending_terminal_worker_evidence",
                 }
             if not kb.block_task(
@@ -497,6 +637,7 @@ class TeamOrchestrationService:
         if handler is None:
             return {"error": f"Unsupported team action '{action}'."}
         try:
+            self._guard_action(action, arguments)
             return {
                 **handler(arguments),
                 "team_service": TEAM_CONTRACT_VERSION,

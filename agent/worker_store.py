@@ -26,6 +26,7 @@ _SCHEMA = (
         request_id TEXT NOT NULL, previous_run_id TEXT,
         goal TEXT NOT NULL, context TEXT NOT NULL, status TEXT NOT NULL,
         capability_digest TEXT NOT NULL DEFAULT '',
+        admission_kind TEXT NOT NULL DEFAULT 'ordinary', admission_ref TEXT,
         budget_epoch_id TEXT,
         lease_token TEXT, lease_expires_at REAL, tool_inflight INTEGER NOT NULL DEFAULT 0,
         tool_inflight_count INTEGER NOT NULL DEFAULT 0,
@@ -127,6 +128,11 @@ class WorkerStore:
                     "ALTER TABLE orchestration_runs ADD COLUMN capability_digest TEXT NOT NULL DEFAULT ''")
             if "budget_epoch_id" not in run_columns:
                 conn.execute("ALTER TABLE orchestration_runs ADD COLUMN budget_epoch_id TEXT")
+            if "admission_kind" not in run_columns:
+                conn.execute(
+                    "ALTER TABLE orchestration_runs ADD COLUMN admission_kind TEXT NOT NULL DEFAULT 'ordinary'")
+            if "admission_ref" not in run_columns:
+                conn.execute("ALTER TABLE orchestration_runs ADD COLUMN admission_ref TEXT")
             # Older boolean/count checkpoints have no call identity. Preserve
             # them as explicit unknown effects so recovery stays fail-closed.
             legacy = conn.execute("""SELECT run_id,tool_inflight_count FROM orchestration_runs r
@@ -221,7 +227,7 @@ class WorkerStore:
         self, owner_session_id, *, worker_id, request_id, profile=None,
         config_revision="", policy=None, frozen_prompt="", goal, context="",
         previous_run_id=None, capability_digest="", budget_epoch_id=None,
-        budget_limits=None,
+        budget_limits=None, admission_ref=None,
     ):
         """Atomically admit one deterministic parent-managed worker/run pair.
 
@@ -241,6 +247,8 @@ class WorkerStore:
             raise ValueError("A run needs a nonempty goal and text context")
         if not isinstance(capability_digest, str):
             raise ValueError("capability_digest must be text")
+        if not isinstance(admission_ref, str) or not admission_ref.strip():
+            raise ValueError("Team admission needs a stable admission_ref")
         policy_value = policy or {}
         policy_text = _policy_json(policy_value)
         prompt_hash = hashlib.sha256(frozen_prompt.encode()).hexdigest()
@@ -280,8 +288,9 @@ class WorkerStore:
             ).fetchone())
             if existing is not None:
                 if (
-                    existing["goal"], existing["context"], existing["previous_run_id"]
-                ) != (goal, context, previous_run_id):
+                    existing["goal"], existing["context"], existing["previous_run_id"],
+                    existing.get("admission_kind"), existing.get("admission_ref"),
+                ) != (goal, context, previous_run_id, "team", admission_ref):
                     raise ValueError("Team run admission conflicts with the existing immutable request")
                 return worker, existing
             if worker["uncertain_side_effect"]:
@@ -328,11 +337,11 @@ class WorkerStore:
             conn.execute(
                 """INSERT INTO orchestration_runs
                 (run_id,worker_id,request_id,previous_run_id,goal,context,status,
-                 capability_digest,budget_epoch_id,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,'PENDING',?,?,?,?)""",
+                 capability_digest,admission_kind,admission_ref,budget_epoch_id,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,'PENDING',?,'team',?,?,?,?)""",
                 (
                     run_id, worker_id, request_id, previous_run_id, goal, context,
-                    capability_digest, epoch_id, now, now,
+                    capability_digest, admission_ref, epoch_id, now, now,
                 ),
             )
             return worker, self._run(conn, run_id, owner_session_id)
@@ -532,12 +541,14 @@ class WorkerStore:
                 (owner_session_id,)).fetchone()[0]
             if active or count >= max_concurrent:
                 return None
-            run = conn.execute("""SELECT pending.run_id FROM orchestration_runs pending
+            run = conn.execute("""SELECT pending.run_id,pending.admission_kind FROM orchestration_runs pending
                 LEFT JOIN orchestration_runs previous ON previous.run_id=pending.previous_run_id
                 WHERE pending.worker_id=? AND pending.status='PENDING'
                 AND (pending.previous_run_id IS NULL OR previous.status IN ('SUCCEEDED','FAILED','INTERRUPTED','CANCELLED'))
                 ORDER BY pending.sequence LIMIT 1""", (worker_id,)).fetchone()
             if run is None:
+                return None
+            if run["admission_kind"] != "ordinary":
                 return None
             now = time.time()
             conn.execute("UPDATE orchestration_runs SET status='RUNNING',lease_token=?,lease_expires_at=?,updated_at=? WHERE run_id=?",
@@ -545,7 +556,10 @@ class WorkerStore:
             return self._run(conn, run[0], owner_session_id)
         return self.db._execute_write(claim)
 
-    def claim_run(self, run_id, owner_session_id, *, lease_seconds=60, max_concurrent=10):
+    def claim_run(
+        self, run_id, owner_session_id, *, lease_seconds=60, max_concurrent=10,
+        _admission_kind="ordinary", _admission_ref=None,
+    ):
         """Claim this exact FIFO-eligible run or return None without leasing a peer."""
         _positive(lease_seconds, "lease_seconds")
         if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int) or max_concurrent < 1:
@@ -554,7 +568,11 @@ class WorkerStore:
         def claim(conn):
             run = self._run(conn, run_id, owner_session_id)
             worker = self._worker(conn, run["worker_id"], owner_session_id)
-            if run["status"] != "PENDING" or worker["uncertain_side_effect"]:
+            if (
+                run["status"] != "PENDING" or worker["uncertain_side_effect"]
+                or run.get("admission_kind") != _admission_kind
+                or (_admission_ref is not None and run.get("admission_ref") != _admission_ref)
+            ):
                 return None
             active = conn.execute(
                 "SELECT 1 FROM orchestration_runs WHERE worker_id=? AND status='RUNNING'",
@@ -575,6 +593,15 @@ class WorkerStore:
                 WHERE run_id=? AND status='PENDING'""", (token, now + lease_seconds, now, run_id))
             return self._run(conn, run_id, owner_session_id)
         return self.db._execute_write(claim)
+
+    def claim_team_run(
+        self, run_id, owner_session_id, *, admission_ref, lease_seconds=60, max_concurrent=10,
+    ):
+        """Lease one held team run after its external admission was revalidated."""
+        return self.claim_run(
+            run_id, owner_session_id, lease_seconds=lease_seconds, max_concurrent=max_concurrent,
+            _admission_kind="team", _admission_ref=admission_ref,
+        )
 
     def heartbeat_run(self, run_id, owner_session_id, lease_token, *, lease_seconds=60):
         _positive(lease_seconds, "lease_seconds")

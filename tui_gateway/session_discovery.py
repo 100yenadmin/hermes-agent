@@ -16,6 +16,16 @@ _UNKNOWN = "Unknown or unavailable discovery reference."
 _ROOM_ACTIONS = frozenset({"inspect", "message"})
 
 
+class RoomDeliveryUncertain(RuntimeError):
+    """The room service accepted an event identity but did not return a receipt."""
+
+    def __init__(self, event_id: str, cause: Exception) -> None:
+        super().__init__("Room delivery outcome is uncertain; reconcile by delivery_id.")
+        self.event_id = event_id
+        self.reconciliation_ref = f"room_event:{event_id}"
+        self.__cause__ = cause
+
+
 @dataclass(frozen=True)
 class RoomReferencePin:
     room_id: str
@@ -162,7 +172,10 @@ class GatewayRoomDiscoveryProvider:
         if pin is None:
             raise PermissionError(_UNKNOWN)
         self._validate(agent, pin)
-        return self.service.send(room_id=room_id, event_id=event_id, payload=dict(payload))
+        try:
+            return self.service.send(room_id=room_id, event_id=event_id, payload=dict(payload))
+        except Exception as exc:
+            raise RoomDeliveryUncertain(event_id, exc) from exc
 
 
 def build_gateway_discovery_scope(
