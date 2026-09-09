@@ -119,17 +119,38 @@ The interface follow-up is now published as [draft PR #106463](https://github.co
 Its [controlled live pilot](orchestration-interface-pilot.md) includes passing and
 failing samples at a recorded source identity. The chart above retains its named
 main/worker baselines; a later draft does not retroactively change those columns.
-Shared discovery, integrated teams and saved workflows still need their own
-implementation and acceptance evidence.
+Shared discovery is published as [draft PR #106647](https://github.com/NousResearch/hermes-agent/pull/106647).
+At `a90eb6202b6a0090aaa68ad981e196e9370c3fb3`, its six focused acceptance
+cases passed, independent review passed, and [hosted CI](https://github.com/NousResearch/hermes-agent/actions/runs/34366948971),
+[Docker](https://github.com/NousResearch/hermes-agent/actions/runs/34366947969)
+and [Nix](https://github.com/NousResearch/hermes-agent/actions/runs/34366947927)
+passed. These tests exercise real temporary profile databases and trusted-session
+fixtures; they do not establish delivery to a live Bot or room.
+
+For a quick view of the follow-up work, read this table alongside the fixed
+main/worker baselines above:
+
+| Capability added by follow-up | Draft implementation | Evidence and remaining limit |
+| --- | --- | --- |
+| One selected worker interface per conversation | ✓ #106463 | Deterministic conformance and independent review passed; live pilot has both passes and failures; automatic qualification registry remains empty |
+| Discover permitted workers, runs, Bots, rooms and tasks | ✓ #106647 | Read-only discovery, typed references and action-time checks exercised; room grants permit inspection only |
+| Coordinate dependency tasks, review and retained corrections | Planned | Integrated-team acceptance is not yet established |
+| Repeat a saved bounded workflow after restart | Planned | Workflow execution acceptance is not yet established |
+
+Discovery answers “what can this parent see and use?” It does not create a room,
+assign a task, wake a Bot, or recover a worker. A discovered run points back to
+its owning worker. Every later control request still has to pass the owning
+service's permission checks. Integrated teams and saved workflows still need
+their own implementation and acceptance evidence.
 
 | Stage | Deliverable | Required observable proof |
 | --- | --- | --- |
 | Worker PR #106268 | Profiles, retained workers, messages, limits and receipts | Existing two-provider workflow and recorded recovery/CI tests; see illustrated tour |
-| Follow-up 1 | Model-appropriate interfaces | Equivalent authorized worker events and route receipts across interfaces |
-| Follow-up 2 | Shared discovery and references | Read-only discovery; eligible actions succeed and unauthorized controls fail |
+| [Follow-up 1: #106463](https://github.com/NousResearch/hermes-agent/pull/106463) | Model-appropriate interfaces | Deterministic authorized event/receipt conformance passed; live qualification remains limited as recorded in the pilot |
+| [Follow-up 2: #106647](https://github.com/NousResearch/hermes-agent/pull/106647) | Shared discovery and references | Read-only discovery, authorization, owner relationships and no-write identity handling passed at the head recorded above |
 | Follow-up 3 | Integrated teams | Dependency/review/correction workflow with guidance, retained context and restart |
 | Follow-up 4 | Saved bounded workflows | Repeat with new input; pause/restart/collect/cancel without duplicate owned execution |
 
-Follow-up rows remain planned until linked implementation and acceptance evidence establish otherwise. Compare each model against itself when qualifying interfaces. Measure task completion, invalid tool calls, corrections, tokens and latency; do not claim that familiar naming necessarily improves performance.
+Unproven follow-up rows remain planned. A draft implementation and its tests do not change what is available on main. Compare each model against itself when qualifying interfaces. Measure task completion, invalid tool calls, corrections, tokens and latency; do not claim that familiar naming necessarily improves performance.
 
 The worker PR's [recorded CI run](https://github.com/NousResearch/hermes-agent/actions/runs/34315825965) and controlled OpenAI-Codex/ZAI smoke cover the recorded candidate, not these planned additions or every provider. Source/CI evidence does not establish installation, release, customer readiness or market superiority. The useful target is a broad, testable set of workflows that users can configure themselves.
