@@ -421,8 +421,9 @@ def apply_retry_restarts(
         return _verdict("break")
 
     if _retry.restart_with_compressed_messages:
-        api_call_count -= 1
-        agent.iteration_budget.refund()
+        if not _retry.restart_after_completed_generation:
+            api_call_count -= 1
+            agent.iteration_budget.refund()
         # Compression restarts count toward the retry limit so a compression that
         # shrinks messages but not enough can't loop forever.
         retry_count += 1
@@ -460,7 +461,7 @@ def apply_retry_restarts(
         _preflight_compression_blocked = False
         return _verdict("continue")
 
-    if _retry.restart_with_tool_retry:
+    if _retry.restart_after_completed_generation:
         # The previous generation consumed budget. Do not refund it or retry
         # inside the API-error loop; retain the existing output-cap adjustment.
         return _verdict("continue")

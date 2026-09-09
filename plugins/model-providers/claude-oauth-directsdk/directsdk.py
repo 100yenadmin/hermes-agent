@@ -537,7 +537,11 @@ class Client:
                                     'completion_tokens_details': {'reasoning_tokens': usage.get('output_tokens_details', {}).get('thinking_tokens', 0)},
                                     'native_cost': {'total_cost_usd': final.get('total_cost_usd'), 'modelUsage': final.get('modelUsage')}}
                 normalized_usage['native_admission'] = {'upstream_requests': int(admission.used), 'blocked_requests': admission.denied, 'request_id': admission.request_id}
-                finish = 'length' if partial_arguments else ('tool_calls' if calls else ('length' if any(a.get('stop_reason') in ('max_tokens', 'model_context_window_exceeded') for a in assistants) else 'stop'))
+                # Context pressure is not output exhaustion. Preserve this stop
+                # so Hermes compresses canonical history rather than appending
+                # output-continuation prompts to an already-full context.
+                context_exhausted = any(a.get('stop_reason') == 'model_context_window_exceeded' for a in assistants)
+                finish = 'model_context_window_exceeded' if context_exhausted else ('length' if partial_arguments else ('tool_calls' if calls else ('length' if any(a.get('stop_reason') == 'max_tokens' for a in assistants) else 'stop')))
                 response = obj({'id': assistants[-1].get('id', 'claude-native'), 'model': kwargs['model'], 'object': 'chat.completion', 'choices': [{'index': 0, 'finish_reason': finish, 'message': message}], 'usage': normalized_usage})
                 chunk = self._chunk(kwargs['model'], {'content': None, 'tool_calls': [dict(tc, index=i) for i, tc in enumerate(calls)] or None, 'reasoning_details': carriers}, finish, normalized_usage)
                 chunk._response = response

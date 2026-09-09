@@ -13,6 +13,7 @@ introduce another relay, or qualify the old standalone plugin release.
 | Denied continuation | The loop rejects admission but the finalizer sends a separate summary request | Preserve the already-received partial answer when the tail is a length-continuation scaffold; leave unrelated summary policy unchanged |
 | Canonical whitespace | A whitespace-only edit still restores old signed text because both projections are stripped | Compare exact visible text, including old carriers' actual native text; preserve unchanged signed prefixes and rebuild edited visible history |
 | Cancellation teardown | Darwin returned `EPERM` during repeated cancellation of an exited subprocess | Recheck the owned child's exit state; a permission error for a live child still propagates |
+| Context-window exhaustion | Native context stop was translated to output `length`, so ordinary Hermes never invoked compression | Preserve the stop, save partial output/usage, route through existing Hermes overflow recovery, and require a new admission without refunding the completed generation |
 
 All native/subscription authentication remains CLI-owned. The existing request-scoped
 relay and Hermes tool executor remain in place. There are no Claude-specific core types,
@@ -37,6 +38,11 @@ hooks, request counts and the assembled continuation.
   Both text and cut-off-tool fixtures pass allow/deny/cancel (six cases); no tool executes.
 - A usage fold confirming compression recovery clears the existing preflight latch
   before truncation restarts, as it does for a complete response.
+- Context overflow: the actual host-loop fixture invokes existing overflow routing,
+  saves partial output before compression, and sends only compressed canonical history
+  on the next admitted generation. Allow/deny/cancel pass (three cases). The compressor
+  algorithm itself is stubbed to verify routing, not requalified by this test; cancellation
+  before recovery prevents both compression and the next generation.
 - Whitespace edit and legacy stripped carrier: canonical visible text replaces stale
   native blocks; unchanged prefixes retain their original blocks.
 
@@ -78,8 +84,8 @@ account access. No vendor request is needed for the offline reproduction.
 ## Still required; do not infer qualification
 
 - Exact contribution-head remote CI and changed-surface independent semantic review.
-- Context-window overflow must reach Hermes compression rather than be confused with
-  output exhaustion. The inherited `length` mapping is not evidence for that gate.
+- Independent review and real-native affected-case readback of context-overflow routing;
+  existing compressor algorithm evidence remains separate from the new routing fixture.
 - Complete imported/edit/resume/persistence and request-accounting readback, then the
   separately authorized visible installed subscription canary.
 - Upstream PR #105863's OSV job currently fails during SARIF upload on a GitHub

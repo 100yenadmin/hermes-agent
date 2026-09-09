@@ -292,7 +292,7 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any, _retry: TurnRetrySta
             "_length_continuation_nudge": True,
         })
         agent._session_messages = st.messages
-        _retry.restart_with_tool_retry = True
+        _retry.restart_after_completed_generation = True
         return st.done("break")
     agent._flush_status_buffer()
     if st.is_stub:

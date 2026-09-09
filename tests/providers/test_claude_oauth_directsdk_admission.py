@@ -67,7 +67,7 @@ def test_first_response_owns_usage_and_stops_recovery(tmp_path, stop, partial_to
         result=client.create(model='sonnet',messages=[{'role':'user','content':'fixture'}], tools=[{'type': 'function', 'function': {'name': 'read_file', 'description': 'Fixture', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}}}}}])
         assert len(calls)==1
         assert result.choices[0].message.content=='FIRST'
-        assert result.choices[0].finish_reason==('stop' if stop=='end_turn' else 'length')
+        assert result.choices[0].finish_reason==('stop' if stop=='end_turn' else ('model_context_window_exceeded' if stop=='model_context_window_exceeded' else 'length'))
         assert result.usage.prompt_tokens==0
         if partial_tool:
             assert result.choices[0].message.tool_calls[0].function.arguments == '{"path":"'
@@ -108,14 +108,17 @@ def test_cancel_closes_the_active_upstream_socket(tmp_path):
 
 
 @pytest.mark.parametrize('continuation', ['allow', 'budget_denied', 'cancelled'])
-@pytest.mark.parametrize('partial_tool', [False, True])
-def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuation, partial_tool):
+@pytest.mark.parametrize('response_kind', ['text', 'tool', 'context'])
+def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuation, response_kind):
     """Real host loop + real relay; only the native process and HTTPS peer are fixtures."""
     from unittest.mock import patch
     from run_agent import AIAgent
     from agent.iteration_budget import IterationBudget
 
+    partial_tool = response_kind == 'tool'
+    context_overflow = response_kind == 'context'
     calls, order, receipts, requests = [], [], [], []
+    compressions, saved = [], []
 
     class Peer(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -127,6 +130,8 @@ def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuat
             order.append('upstream')
             part = 'Part 1 ' if len(calls) == 1 else 'Part 2'
             stop = 'max_tokens' if len(calls) == 1 else 'end_turn'
+            if context_overflow and len(calls) == 1:
+                stop = 'model_context_window_exceeded'
             usage = {'input_tokens': 10, 'output_tokens': 3}
             events = [
                 {'type': 'message_start', 'message': {'id': f'msg_{len(calls)}', 'role': 'assistant', 'model': 'claude-sonnet-4-6', 'content': [], 'usage': usage}},
@@ -195,6 +200,20 @@ def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuat
         # Exercise the host's distinct truncated-tool path; streaming recovery
         # may discard the malformed call and select plain-text continuation.
         agent._disable_streaming = partial_tool
+        history = None
+        if context_overflow:
+            agent.compression_enabled = True
+            history = [{'role': 'user', 'content': 'old fixture ' * 1000},
+                       {'role': 'assistant', 'content': 'old answer'}]
+
+            def compress(messages, *args, **kwargs):
+                compressions.append(copy.deepcopy(messages))
+                order.append('compress')
+                # Verify routing, not the already-existing summarizer algorithm.
+                return copy.deepcopy(messages[2:]), 'compressed fixture system'
+
+            monkeypatch.setattr(agent, '_compress_context', compress)
+            monkeypatch.setattr(agent, '_persist_session', lambda messages, *_: saved.append(copy.deepcopy(messages)))
         agent.step_callback = lambda *_: order.append('step')
         consume = IterationBudget.consume
 
@@ -221,12 +240,17 @@ def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuat
         monkeypatch.setattr('hermes_cli.lifecycle.has_hook', lambda name: name in ('pre_api_request', 'post_api_request'))
         monkeypatch.setattr('hermes_cli.lifecycle.invoke_hook', hook)
         with patch.object(agent, '_cleanup_task_resources'):
-            result = agent.run_conversation('Complete the fixture response.')
+            result = agent.run_conversation('Complete the fixture response.', conversation_history=history)
 
         expected = 2 if continuation == 'allow' else 1
+        if context_overflow:
+            assert len(compressions) == (0 if continuation == 'cancelled' else 1)
+            assert any(any(m.get('content') == 'Part 1 ' for m in rows) for rows in saved)
         assert len(calls) == len(requests) == len(receipts) == expected
         assert all(row['upstream_requests'] == 1 and row['blocked_requests'] == 1 for row in receipts)
         expected_order = ['budget', 'step', 'pre_api_request', 'upstream', 'post_api_request'] * expected
+        if context_overflow and continuation != 'cancelled':
+            expected_order.insert(5, 'compress')
         if continuation == 'budget_denied':
             expected_order.append('denied')
         assert order == expected_order, order
@@ -236,11 +260,14 @@ def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuat
         assert not any(m.get('tool_calls') or m.get('role') == 'tool' for m in result['messages'])
         if continuation == 'allow':
             assert result['completed'] is True
-            assert result['final_response'] == ('Part 2' if partial_tool else 'Part 1 Part 2')
+            assert result['final_response'] == ('Part 2' if partial_tool or context_overflow else 'Part 1 Part 2')
             assert result['api_calls'] == 2
-            if partial_tool:
+            if partial_tool or context_overflow:
                 assert sum(m.get('content') == 'Part 1 ' for m in result['messages']) == 1
                 assert not any(m.get('tool_calls') for m in requests[1]['messages'])
+                if context_overflow:
+                    assert not any('old fixture' in (m.get('content') or '') for m in requests[1]['messages'])
+                    assert not any('truncated by the output length limit' in (m.get('content') or '') for m in requests[1]['messages'])
             else:
                 assert requests[1]['messages'][-1]['role'] == 'user'
                 assert 'truncated by the output length limit' in requests[1]['messages'][-1]['content']
