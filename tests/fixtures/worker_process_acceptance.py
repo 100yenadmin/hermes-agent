@@ -248,11 +248,17 @@ def _parent(home: Path):
     return parent, db
 
 
-def _expire_prior_leases() -> None:
+def _expire_prior_leases(store) -> None:
     import agent.worker_store as worker_store
 
-    wall_clock = time.time
-    worker_store.time = SimpleNamespace(time=lambda: wall_clock() + 120)
+    # Advance only the recovery read. New runs must receive real-time leases;
+    # retaining the offset would make the next process's clock move backwards.
+    prior_clock = worker_store.time
+    worker_store.time = SimpleNamespace(time=lambda: time.time() + 120)
+    try:
+        store.recover_expired_runs(OWNER)
+    finally:
+        worker_store.time = prior_clock
 
 
 def _emit(value: dict) -> None:
@@ -297,10 +303,11 @@ def _control(args) -> None:
     from tools.delegate_tool import delegate_task
 
     _install_boundaries()
-    if args.expire_leases:
-        _expire_prior_leases()
     parent, db = _parent(args.home)
     try:
+        if args.expire_leases:
+            from agent.worker_store import WorkerStore
+            _expire_prior_leases(WorkerStore(db))
         payload = json.loads(delegate_task(
             action=args.action,
             worker_id=args.worker_id,
@@ -338,14 +345,12 @@ def _control(args) -> None:
 def _snapshot(args) -> None:
     from agent.worker_store import WorkerStore
 
-    if args.expire_leases:
-        _expire_prior_leases()
     parent, db = _parent(args.home)
     try:
         store = WorkerStore(db)
         store.ensure_schema()
         if args.expire_leases:
-            store.recover_expired_runs(OWNER)
+            _expire_prior_leases(store)
         worker = store.get_worker(args.worker_id, OWNER)
         history = list(worker.get("history") or [])
         serialized = json.dumps(history, sort_keys=True)
