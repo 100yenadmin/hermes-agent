@@ -1,4 +1,5 @@
 """One upstream admission and first-response authority over native recovery."""
+import copy
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -33,8 +34,8 @@ print(json.dumps({'type':'result','subtype':'success','usage':{'input_tokens':0,
 '''
 
 
-@pytest.mark.parametrize('stop', ['end_turn', 'max_tokens', 'model_context_window_exceeded'])
-def test_first_response_owns_usage_and_stops_recovery(tmp_path, stop):
+@pytest.mark.parametrize('stop,partial_tool', [('end_turn', False), ('max_tokens', False), ('model_context_window_exceeded', False), ('max_tokens', True)])
+def test_first_response_owns_usage_and_stops_recovery(tmp_path, stop, partial_tool):
     calls = []
     usage = {'input_tokens':0, 'output_tokens':0, 'cache_read_input_tokens':0, 'cache_creation_input_tokens':0}
     class Peer(BaseHTTPRequestHandler):
@@ -51,18 +52,28 @@ def test_first_response_owns_usage_and_stops_recovery(tmp_path, stop):
                 {'type':'message_delta','delta':{'stop_reason':stop},'usage':usage},
                 {'type':'message_stop'},
             ]
+            if partial_tool:
+                events[4:4] = [
+                    {'type': 'content_block_start', 'index': 1, 'content_block': {'type': 'tool_use', 'id': 'cut', 'name': 'mcp__hermes__read_file', 'input': {}}},
+                    {'type': 'content_block_delta', 'index': 1, 'delta': {'type': 'input_json_delta', 'partial_json': '{"path":"'}},
+                    {'type': 'content_block_stop', 'index': 1},
+                ]
             self.wfile.write(''.join('data: '+json.dumps(e)+'\n\n' for e in events).encode())
     peer=ThreadingHTTPServer(('127.0.0.1',0),Peer)
     thread=threading.Thread(target=peer.serve_forever,daemon=True); thread.start()
     native=tmp_path/'native.py'; native.write_text(NATIVE)
     client=directsdk.Client(command=[sys.executable,str(native)],env={'PATH':os.defpath,'HOME':str(tmp_path),'ANTHROPIC_BASE_URL':f'http://127.0.0.1:{peer.server_port}'})
     try:
-        result=client.create(model='sonnet',messages=[{'role':'user','content':'fixture'}])
+        result=client.create(model='sonnet',messages=[{'role':'user','content':'fixture'}], tools=[{'type': 'function', 'function': {'name': 'read_file', 'description': 'Fixture', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}}}}}])
         assert len(calls)==1
         assert result.choices[0].message.content=='FIRST'
         assert result.choices[0].finish_reason==('stop' if stop=='end_turn' else 'length')
         assert result.usage.prompt_tokens==0
-        assert result.choices[0].message.reasoning_details[0]['messages'][0]['stop_reason']==stop
+        if partial_tool:
+            assert result.choices[0].message.tool_calls[0].function.arguments == '{"path":"'
+            assert not result.choices[0].message.reasoning_details
+        else:
+            assert result.choices[0].message.reasoning_details[0]['messages'][0]['stop_reason']==stop
     finally:
         client.close(); peer.shutdown(); thread.join(); peer.server_close()
 
@@ -94,3 +105,137 @@ def test_cancel_closes_the_active_upstream_socket(tmp_path):
             assert disconnected.wait(2)
     finally:
         client.close(); peer.shutdown(); thread.join(); peer.server_close()
+
+
+@pytest.mark.parametrize('continuation', ['allow', 'budget_denied', 'cancelled'])
+def test_ordinary_hermes_loop_owns_continuation(tmp_path, monkeypatch, continuation):
+    """Real host loop + real relay; only the native process and HTTPS peer are fixtures."""
+    from unittest.mock import patch
+    from run_agent import AIAgent
+    from agent.iteration_budget import IterationBudget
+
+    calls, order, receipts, requests = [], [], [], []
+
+    class Peer(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            calls.append(self.path)
+            order.append('upstream')
+            part = 'Part 1 ' if len(calls) == 1 else 'Part 2'
+            stop = 'max_tokens' if len(calls) == 1 else 'end_turn'
+            usage = {'input_tokens': 10, 'output_tokens': 3}
+            events = [
+                {'type': 'message_start', 'message': {'id': f'msg_{len(calls)}', 'role': 'assistant', 'model': 'claude-sonnet-4-6', 'content': [], 'usage': usage}},
+                {'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}},
+                {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': part}},
+                {'type': 'content_block_stop', 'index': 0},
+                {'type': 'message_delta', 'delta': {'stop_reason': stop}, 'usage': usage},
+                {'type': 'message_stop'},
+            ]
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.end_headers()
+            self.wfile.write(''.join('data: ' + json.dumps(e) + '\n\n' for e in events).encode())
+
+    peer = ThreadingHTTPServer(('127.0.0.1', 0), Peer)
+    thread = threading.Thread(target=peer.serve_forever, daemon=True)
+    thread.start()
+    native = tmp_path / 'native.py'
+    native.write_text(NATIVE)
+    native_env = {
+        'PATH': os.defpath, 'HOME': str(tmp_path),
+        'ANTHROPIC_BASE_URL': f'http://127.0.0.1:{peer.server_port}',
+    }
+    clients = []
+
+    class RecordingClient(directsdk.Client):
+        def create(self, **kwargs):
+            requests.append(copy.deepcopy(kwargs))
+            result = super().create(**kwargs)
+            if not kwargs.get('stream'):
+                receipts.append(result.usage.model_dump()['native_admission'])
+                return result
+
+            def stream():
+                try:
+                    for chunk in result:
+                        if hasattr(chunk, '_response'):
+                            receipts.append(chunk._response.usage.model_dump()['native_admission'])
+                        yield chunk
+                finally:
+                    result.close()
+            return stream()
+
+    def fixture_client(**_):
+        client = RecordingClient(command=[sys.executable, str(native)], env=native_env)
+        clients.append(client)
+        return client
+
+    from providers import get_provider_profile
+    monkeypatch.setattr(get_provider_profile('claude-oauth-directsdk'), 'create_client', fixture_client)
+    try:
+        with patch('model_tools.get_tool_definitions', return_value=[]), patch('model_tools.check_toolset_requirements', return_value={}):
+            agent = AIAgent(provider='claude-oauth-directsdk', model='claude-sonnet-4-6',
+                            api_key='external-process', base_url='process://claude-oauth-directsdk',
+                            quiet_mode=True, skip_context_files=True, skip_memory=True,
+                            save_trajectories=False, max_iterations=4)
+        agent._cached_system_prompt = 'You are helpful.'
+        agent.compression_enabled = False
+        agent.step_callback = lambda *_: order.append('step')
+        consume = IterationBudget.consume
+
+        def admitted(budget):
+            if continuation == 'budget_denied' and budget.used == 1:
+                # Race-shaped hard denial at the atomic consume boundary, not the
+                # separate, intentionally admitted budget-exhaustion grace call.
+                while consume(budget):
+                    pass
+            result = consume(budget)
+            order.append('budget' if result else 'denied')
+            return result
+
+        monkeypatch.setattr(IterationBudget, 'consume', admitted)
+
+        def hook(name, **_):
+            if name not in ('pre_api_request', 'post_api_request'):
+                return []
+            order.append(name)
+            if name == 'post_api_request' and len(calls) == 1:
+                if continuation == 'cancelled':
+                    agent.interrupt()
+
+        monkeypatch.setattr('hermes_cli.lifecycle.has_hook', lambda name: name in ('pre_api_request', 'post_api_request'))
+        monkeypatch.setattr('hermes_cli.lifecycle.invoke_hook', hook)
+        with patch.object(agent, '_cleanup_task_resources'):
+            result = agent.run_conversation('Complete the fixture response.')
+
+        expected = 2 if continuation == 'allow' else 1
+        assert len(calls) == len(requests) == len(receipts) == expected
+        assert all(row['upstream_requests'] == 1 and row['blocked_requests'] == 1 for row in receipts)
+        expected_order = ['budget', 'step', 'pre_api_request', 'upstream', 'post_api_request'] * expected
+        if continuation == 'budget_denied':
+            expected_order.append('denied')
+        assert order == expected_order, order
+        assert all(request['model'] == 'claude-sonnet-4-6' for request in requests)
+        if continuation == 'allow':
+            assert result['completed'] is True
+            assert result['final_response'] == 'Part 1 Part 2'
+            assert result['api_calls'] == 2
+            assert requests[1]['messages'][-1]['role'] == 'user'
+            assert 'truncated by the output length limit' in requests[1]['messages'][-1]['content']
+        elif continuation == 'cancelled':
+            assert result['interrupted'] is True
+        else:
+            assert result['completed'] is False
+            assert result['final_response'] == 'Part 1'
+            assert sum(m.get('content') == 'Part 1' for m in result['messages']) == 1
+            assert not any(m.get('_length_continuation_nudge') for m in result['messages'])
+    finally:
+        for client in clients:
+            client.close()
+        peer.shutdown()
+        thread.join()
+        peer.server_close()

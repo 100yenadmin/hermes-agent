@@ -140,6 +140,23 @@ def _resolve_budget_fallback(
             if _pending_verification_response_previewed:
                 agent._response_was_previewed = True
             preserved_verification_fallback = True
+        elif messages and messages[-1].get("_length_continuation_nudge"):
+            # The next generation was not admitted. A response already exists:
+            # retain its partial text instead of bypassing the budget via the
+            # separate summary call. Remove only this tail's continuation scaffold.
+            from agent.conversation_loop import _join_truncated_parts
+
+            start = len(messages)
+            while start and (
+                messages[start - 1].get("_length_continuation_fragment")
+                or messages[start - 1].get("_length_continuation_nudge")
+            ):
+                start -= 1
+            fragments = [m.get("content") or "" for m in messages[start:]
+                         if m.get("_length_continuation_fragment")]
+            final_response = agent._strip_think_blocks(_join_truncated_parts(fragments)).strip()
+            final_response = final_response or "Response truncated; iteration budget exhausted."
+            messages[start:] = [{"role": "assistant", "content": final_response, "finish_reason": "length"}]
         else:
             # _handle_max_iterations makes one extra toolless request for a summary.
             agent._emit_status(

@@ -161,6 +161,25 @@ def check_api_response(
         return _verdict("break")
 
     if finish_reason == "length":
+        # Truncation restarts the outer loop before normal response intake. Record
+        # this admitted generation once, including its hook and usage, rather than
+        # silently dropping the partial step from observers and accounting.
+        from agent.turn_response_intake import _fire_post_api_request_hook
+        from agent.turn_truncation import normalize_response_for_agent
+
+        _fire_post_api_request_hook(
+            agent, response, normalize_response_for_agent(agent, response), finish_reason,
+            api_messages=api_messages, api_call_count=api_call_count,
+            api_duration=api_duration, api_start_time=api_start_time,
+            api_request_id=api_request_id, effective_task_id=effective_task_id,
+            turn_id=turn_id,
+        )
+        _usage_outcome = record_response_usage(
+            agent, response, messages=messages, api_call_count=api_call_count,
+            api_duration=api_duration, compression_attempts=compression_attempts,
+            max_compression_attempts=max_compression_attempts,
+        )
+        compression_attempts = _usage_outcome.compression_attempts
         _tv = recover_from_truncation(
             agent, response, finish_reason, _retry, messages=messages,
             conversation_history=conversation_history, api_kwargs=api_kwargs,
