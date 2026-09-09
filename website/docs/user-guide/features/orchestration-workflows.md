@@ -95,6 +95,10 @@ succeeds, submit it to the reviewer named in the definition, start the review,
 then use `accept` or `request_changes`. A rejected review returns to the original
 implementation worker with retained context. Once the maximum correction count
 is used, another rejection is refused; restarting Hermes does not reset it.
+The same immutable correction bound applies to the native
+`kanban_request_changes` transition. A reviewed workflow step reaches `done`
+only from its exact reviewer claim after Hermes has recorded successful
+WorkerStore evidence, so native `kanban_complete` cannot skip the review.
 
 Call `workflow_resume` after accepted prerequisites release another step. It
 also restores recorded held work after restart. Hermes schedules a pending held
@@ -120,8 +124,10 @@ the next returned version:
 migrate it, recover a worker or promote a task. Inspection reports task status
 separately from invocation control status.
 
-Cancellation records the exact active task and run references before requesting
-interrupts. If the interrupt result is uncertain, the workflow remains
+Cancellation records every exact attached execution for unfinished steps before
+requesting interrupts, even when a native block or stale-claim recovery already
+changed the Kanban task status. Hermes first observes each attachment and sends
+an interrupt only while it remains nonterminal. If the interrupt result is uncertain, the workflow remains
 `cancelling`; retry with the current control version observes the recorded run
 without sending a second interrupt. Once all exact runs have terminal evidence,
 Hermes keeps accepted tasks done and sticky-blocks unfinished tasks and the

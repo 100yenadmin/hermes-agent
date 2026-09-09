@@ -180,7 +180,12 @@ branches and joins remain ordinary Kanban dependencies. The coordinator depends
 on every step and is completed only after every step is accepted. Review uses
 the normal task phase and attached reviewer run. The immutable step definition
 supplies its reviewer and maximum correction count; counting persisted
-`changes_requested` events preserves the bound across process restart.
+`changes_requested` events preserves the bound across process restart. The
+shared Kanban transition enforces that bound for both team actions and native
+`kanban_request_changes`. For a step with an immutable reviewer, team acceptance
+records the exact successful reviewer attachment before `complete_task`; the
+shared completion transition refuses implementation claims, missing evidence
+and mismatched runs, including native `kanban_complete` calls.
 
 Invocation control is a separate CAS record: `active`, `paused`, `cancelling`
 or `cancelled`, with a monotonically increasing control version. Workflow claims
@@ -190,11 +195,15 @@ write transaction, pause prevents later claims while a claim that linearized
 first may finish. Resume starts only ready/review work or a recorded held run.
 An already running or terminal attached worker is observed rather than replayed.
 
-Cancellation first records exact task, Kanban run, worker and worker-run intent.
-Only a newly recorded intent sends an interrupt. A lost interrupt receipt leaves
-the workflow pending; retry observes the recorded run without sending again.
-After terminal evidence for every active target, one board transaction preserves
-done steps and sticky-blocks every unfinished step and the coordinator. It never
+Cancellation discovers persisted `execution_attached` events for every
+unfinished step independently of current task status, then records each exact
+task, Kanban run, worker and worker-run intent. It observes an attachment before
+sending a first interrupt. A lost interrupt receipt leaves the workflow pending;
+retry observes the recorded run without sending again. Native-blocked and
+stale-recovered tasks therefore remain cancellation targets while their attached
+workers are nonterminal. After terminal evidence for every exact attachment, one
+board transaction preserves done steps and sticky-blocks every unfinished step
+and the coordinator. It never
 archives them, because archived Kanban parents satisfy dependencies. A normal
 external dependent therefore remains unclaimable after cancellation.
 
@@ -204,11 +213,13 @@ Every action still rechecks the root parent session, frozen profile home, board
 and database path, canonical executable tools, task owner and exact claim.
 Delegated workers and dispatcher-owned children cannot enter the controller.
 
-The focused `test_workflow_orchestration.py` file exercises concurrent identical
-admission, changed-content conflict, rollback, parallel review and retained
-correction, join release, restart-safe resume, pause/claim serialization, exact
-cancellation, uncertain-interrupt no-replay, sticky external dependency and
-read-only/owner/board/interface gates. It uses real temporary Kanban and
+The focused `test_workflow_orchestration.py` file exercises immutable template
+version advance, concurrent identical admission, changed-input new-key admission,
+changed-content conflict, rollback, parallel review and retained correction,
+native transition guards, join release, restart-safe resume, pause/claim
+serialization, native-blocked and stale-recovered cancellation, uncertain
+interrupt no-replay, sticky external dependency and Hermes/Codex/Claude interface
+gates. It uses real temporary Kanban and
 SessionDB/WorkerStore files with provider execution held at the existing
 controlled child boundary. It does not prove live provider execution,
 subprocess restart, installation, release or customer runtime behavior.

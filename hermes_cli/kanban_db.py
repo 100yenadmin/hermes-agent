@@ -2808,6 +2808,11 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        from hermes_cli import kanban_db_workflows as workflows
+        if not workflows.completion_allowed(
+            conn, task_id, expected_run_id=expected_run_id,
+        ):
+            return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         prior_status = _task_status(conn, task_id)
@@ -3366,7 +3371,8 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status,assignee,current_run_id,workflow_invocation_id,session_id "
+            "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if task_row is None:
             return False, "task not found"
@@ -3380,6 +3386,17 @@ def request_changes(
         claimed_payload = _json_dict(_row_get(claimed_event, "payload"))
         if claimed_payload.get("source_status") != "review":
             return False, "active run was not claimed from review"
+
+        if task_row["workflow_invocation_id"]:
+            from hermes_cli import kanban_db_workflows as workflows
+            policy = workflows.correction_policy(
+                conn, task_id, owner_session_id=task_row["session_id"],
+            )
+            if policy is not None and not policy["allowed"]:
+                return False, (
+                    "Workflow correction limit reached "
+                    f"({policy['used']}/{policy['limit']})"
+                )
 
         requested_event = _latest_event(conn, task_id, "review_requested")
         if requested_event is None:

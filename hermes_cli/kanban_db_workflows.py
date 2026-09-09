@@ -463,6 +463,94 @@ def correction_policy(
     }
 
 
+def record_acceptance_evidence(
+    conn: sqlite3.Connection, task_id: str, *, owner_session_id: str,
+    kanban_run_id: int, worker_status: str,
+) -> dict[str, Any]:
+    """Persist the exact successful reviewer execution before acceptance."""
+    from hermes_cli import kanban_db as kb
+
+    if worker_status != "SUCCEEDED":
+        raise ValueError("Reviewer success is required before acceptance")
+    with kb.write_txn(conn):
+        policy = correction_policy(conn, task_id, owner_session_id=owner_session_id)
+        if policy is None or not policy["reviewer"]:
+            raise RuntimeError("Workflow step does not require reviewer acceptance")
+        task = conn.execute(
+            "SELECT status,current_run_id FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        if (
+            task is None or task["status"] != "running"
+            or int(task["current_run_id"] or 0) != int(kanban_run_id)
+            or kb.run_claim_source(conn, task_id, int(kanban_run_id)) != "review"
+        ):
+            raise RuntimeError("Acceptance evidence does not match the active review run")
+        attachment = kb.get_execution_attachment(conn, task_id, int(kanban_run_id))
+        if attachment is None or attachment.get("role") != "reviewer":
+            raise RuntimeError("Acceptance evidence has no exact reviewer execution")
+        payload = {
+            "kanban_run_id": int(kanban_run_id),
+            "worker_ref": attachment["worker_ref"],
+            "run_ref": attachment["run_ref"],
+            "worker_status": worker_status,
+        }
+        prior = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='workflow_acceptance_evidence' ORDER BY id DESC LIMIT 1",
+            (task_id, int(kanban_run_id)),
+        ).fetchone()
+        if prior is not None:
+            if json.loads(prior["payload"]) != payload:
+                raise RuntimeError("Acceptance evidence changed for the exact review run")
+            return payload
+        kb._append_event(
+            conn, task_id, "workflow_acceptance_evidence", payload,
+            run_id=int(kanban_run_id),
+        )
+        return payload
+
+
+def completion_allowed(
+    conn: sqlite3.Connection, task_id: str, *, expected_run_id: Optional[int],
+) -> bool:
+    """Require immutable review and recorded worker success for workflow steps."""
+    from hermes_cli import kanban_db as kb
+
+    task = conn.execute(
+        "SELECT workflow_invocation_id,session_id,status,current_run_id,current_step_key "
+        "FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
+    if task is None or not task["workflow_invocation_id"]:
+        return True
+    if task["current_step_key"] == "__coordinator__":
+        return False
+    policy = correction_policy(conn, task_id, owner_session_id=task["session_id"])
+    if policy is None or not policy["reviewer"]:
+        return True
+    run_id = int(task["current_run_id"] or 0)
+    if (
+        task["status"] != "running" or run_id == 0 or expected_run_id is None
+        or run_id != int(expected_run_id)
+        or kb.run_claim_source(conn, task_id, run_id) != "review"
+    ):
+        return False
+    attachment = kb.get_execution_attachment(conn, task_id, run_id)
+    if attachment is None or attachment.get("role") != "reviewer":
+        return False
+    evidence = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='workflow_acceptance_evidence' ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    value = json.loads(evidence["payload"]) if evidence is not None else {}
+    return (
+        int(value.get("kanban_run_id") or 0) == run_id
+        and value.get("worker_ref") == attachment.get("worker_ref")
+        and value.get("run_ref") == attachment.get("run_ref")
+        and value.get("worker_status") == "SUCCEEDED"
+    )
+
+
 def finalize_completed(
     conn: sqlite3.Connection, invocation_id: str, *, owner_session_id: str,
 ) -> bool:
@@ -518,6 +606,42 @@ def finalize_completed(
     return True
 
 
+def _unfinished_execution_attachments(
+    conn: sqlite3.Connection, invocation_id: str,
+) -> list[dict[str, Any]]:
+    """Return every exact attached execution for unfinished workflow steps."""
+    rows = conn.execute(
+        "SELECT t.id AS task_id,e.run_id,e.payload FROM tasks t "
+        "JOIN task_events e ON e.task_id=t.id AND e.kind='execution_attached' "
+        "WHERE t.workflow_invocation_id=? AND t.status!='done' "
+        "AND t.current_step_key!='__coordinator__' ORDER BY t.id,e.run_id,e.id",
+        (invocation_id,),
+    ).fetchall()
+    attachments: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for row in rows:
+        task_id = str(row["task_id"])
+        run_id = int(row["run_id"] or 0)
+        key = (task_id, run_id)
+        if run_id < 1 or key in seen:
+            continue
+        value = json.loads(row["payload"] or "{}")
+        if not isinstance(value, dict) or not value.get("worker_ref") or not value.get("run_ref"):
+            raise RuntimeError("Workflow execution attachment is incomplete")
+        seen.add(key)
+        attachments.append({
+            "task_ref": f"task:{task_id}",
+            "kanban_run_id": run_id,
+            "worker_ref": value["worker_ref"],
+            "run_ref": value["run_ref"],
+        })
+    return attachments
+
+
+def _cancel_subject(target: Mapping[str, Any]) -> str:
+    return f"{target['task_ref'].partition(':')[2]}:{int(target['kanban_run_id'])}"
+
+
 def cancellation_targets(
     conn: sqlite3.Connection, invocation_id: str, *, owner_session_id: str,
 ) -> list[dict[str, Any]]:
@@ -530,30 +654,29 @@ def cancellation_targets(
         row = _owned_invocation(conn, invocation_id, owner_session_id)
         if row["control_state"] != "cancelling":
             raise RuntimeError("Workflow is not cancelling")
-        running = conn.execute(
-            "SELECT id,current_run_id FROM tasks WHERE workflow_invocation_id=? "
-            "AND status='running' ORDER BY id", (invocation_id,),
-        ).fetchall()
-        for task in running:
-            run_id = int(task["current_run_id"] or 0)
-            attachment = kb.get_execution_attachment(conn, task["id"], run_id) if run_id else None
-            if not attachment:
-                raise RuntimeError("Cancelling workflow has an unattached active task; recover its team admission first")
-            payload = {
-                "task_ref": f"task:{task['id']}", "kanban_run_id": run_id,
-                "worker_ref": attachment["worker_ref"], "run_ref": attachment["run_ref"],
-            }
+        for payload in _unfinished_execution_attachments(conn, invocation_id):
+            subject = _cancel_subject(payload)
+            terminal = conn.execute(
+                "SELECT payload FROM workflow_invocation_events "
+                "WHERE invocation_id=? AND kind='cancel_terminal' AND subject_key=?",
+                (invocation_id, subject),
+            ).fetchone()
+            if terminal is not None:
+                value = json.loads(terminal["payload"] or "{}")
+                if int(value.get("kanban_run_id") or 0) != int(payload["kanban_run_id"]):
+                    raise RuntimeError("Workflow cancel terminal evidence changed identity")
+                continue
             prior = conn.execute(
                 "SELECT payload FROM workflow_invocation_events "
                 "WHERE invocation_id=? AND kind='cancel_requested' AND subject_key=?",
-                (invocation_id, task["id"]),
+                (invocation_id, subject),
             ).fetchone()
             is_new = prior is None
             if prior is None:
                 conn.execute(
                     "INSERT INTO workflow_invocation_events "
                     "(invocation_id,kind,subject_key,payload,created_at) VALUES (?,?,?,?,?)",
-                    (invocation_id, "cancel_requested", task["id"], _canonical(payload), now),
+                    (invocation_id, "cancel_requested", subject, _canonical(payload), now),
                 )
             elif json.loads(prior["payload"]) != payload:
                 raise RuntimeError("Workflow cancel intent no longer matches the exact task execution")
@@ -571,9 +694,10 @@ def record_cancel_terminal(
         raise ValueError("worker_status is not terminal")
     with write_txn(conn):
         _owned_invocation(conn, invocation_id, owner_session_id)
+        subject = f"{task_id}:{int(kanban_run_id)}"
         intent = conn.execute(
             "SELECT payload FROM workflow_invocation_events WHERE invocation_id=? "
-            "AND kind='cancel_requested' AND subject_key=?", (invocation_id, task_id),
+            "AND kind='cancel_requested' AND subject_key=?", (invocation_id, subject),
         ).fetchone()
         payload = json.loads(intent["payload"]) if intent is not None else {}
         if int(payload.get("kanban_run_id") or 0) != int(kanban_run_id):
@@ -581,10 +705,47 @@ def record_cancel_terminal(
         conn.execute(
             "INSERT OR IGNORE INTO workflow_invocation_events "
             "(invocation_id,kind,subject_key,payload,created_at) VALUES (?,?,?,?,?)",
-            (invocation_id, "cancel_terminal", task_id, _canonical({
+            (invocation_id, "cancel_terminal", subject, _canonical({
                 "kanban_run_id": int(kanban_run_id), "worker_status": worker_status,
             }), int(time.time())),
         )
+
+
+def begin_cancel_interrupt(
+    conn: sqlite3.Connection, invocation_id: str, *, owner_session_id: str,
+    task_id: str, kanban_run_id: int,
+) -> bool:
+    """Record the send boundary once; return true only to its first caller."""
+    from hermes_cli.kanban_db import write_txn
+
+    subject = f"{task_id}:{int(kanban_run_id)}"
+    now = int(time.time())
+    with write_txn(conn):
+        _owned_invocation(conn, invocation_id, owner_session_id)
+        intent = conn.execute(
+            "SELECT payload FROM workflow_invocation_events WHERE invocation_id=? "
+            "AND kind='cancel_requested' AND subject_key=?",
+            (invocation_id, subject),
+        ).fetchone()
+        value = json.loads(intent["payload"]) if intent is not None else {}
+        if int(value.get("kanban_run_id") or 0) != int(kanban_run_id):
+            raise RuntimeError("Interrupt attempt does not match the cancel intent")
+        prior = conn.execute(
+            "SELECT 1 FROM workflow_invocation_events WHERE invocation_id=? "
+            "AND kind='cancel_interrupt_attempted' AND subject_key=?",
+            (invocation_id, subject),
+        ).fetchone()
+        if prior is not None:
+            return False
+        conn.execute(
+            "INSERT INTO workflow_invocation_events "
+            "(invocation_id,kind,subject_key,payload,created_at) VALUES (?,?,?,?,?)",
+            (invocation_id, "cancel_interrupt_attempted", subject, _canonical({
+                "task_ref": f"task:{task_id}", "kanban_run_id": int(kanban_run_id),
+                "worker_ref": value.get("worker_ref"), "run_ref": value.get("run_ref"),
+            }), now),
+        )
+        return True
 
 
 def finalize_cancelled(
@@ -600,21 +761,20 @@ def finalize_cancelled(
             return invocation_detail(conn, invocation_id, owner_session_id=owner_session_id)
         if row["control_state"] != "cancelling":
             raise RuntimeError("Workflow is not cancelling")
+        attachments = _unfinished_execution_attachments(conn, invocation_id)
+        for attachment in attachments:
+            terminal = conn.execute(
+                "SELECT payload FROM workflow_invocation_events WHERE invocation_id=? "
+                "AND kind='cancel_terminal' AND subject_key=?",
+                (invocation_id, _cancel_subject(attachment)),
+            ).fetchone()
+            value = json.loads(terminal["payload"]) if terminal is not None else {}
+            if int(value.get("kanban_run_id") or 0) != int(attachment["kanban_run_id"]):
+                raise RuntimeError("Workflow cancellation is waiting for exact terminal worker evidence")
         tasks = conn.execute(
             "SELECT id,status,current_run_id,current_step_key FROM tasks "
             "WHERE workflow_invocation_id=? ORDER BY id", (invocation_id,),
         ).fetchall()
-        for task in tasks:
-            if task["status"] != "running":
-                continue
-            terminal = conn.execute(
-                "SELECT payload FROM workflow_invocation_events WHERE invocation_id=? "
-                "AND kind='cancel_terminal' AND subject_key=?",
-                (invocation_id, task["id"]),
-            ).fetchone()
-            value = json.loads(terminal["payload"]) if terminal is not None else {}
-            if int(value.get("kanban_run_id") or 0) != int(task["current_run_id"] or 0):
-                raise RuntimeError("Workflow cancellation is waiting for exact terminal worker evidence")
         for task in tasks:
             if task["status"] == "done":
                 continue

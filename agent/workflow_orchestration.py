@@ -229,16 +229,30 @@ class WorkflowOrchestrationService:
         for target in targets:
             worker_id, run_id = self.team._attachment_ids(target)
             outcome = dict(target)
+            interrupt_attempted = False
             try:
-                if target["request_new"]:
-                    requested = self.team.lifecycle.control(
-                        "interrupt", worker_id=worker_id, run_id=run_id,
-                    )
-                    outcome["interrupt_requested"] = requested.get("interrupt_requested")
                 observed = self.team.lifecycle.control(
-                    "wait", worker_id=worker_id, run_id=run_id, timeout_seconds=timeout,
+                    "wait", worker_id=worker_id, run_id=run_id, timeout_seconds=0,
                 )
                 worker_status = str(observed.get("status") or "UNKNOWN")
+                if worker_status not in _TERMINAL_WORKER:
+                    with self.team._board() as (_scope, conn):
+                        interrupt_attempted = workflows.begin_cancel_interrupt(
+                            conn,
+                            invocation_id,
+                            owner_session_id=owner,
+                            task_id=target["task_ref"].partition(":")[2],
+                            kanban_run_id=int(target["kanban_run_id"]),
+                        )
+                    if interrupt_attempted:
+                        requested = self.team.lifecycle.control(
+                            "interrupt", worker_id=worker_id, run_id=run_id,
+                        )
+                        outcome["interrupt_requested"] = requested.get("interrupt_requested")
+                    observed = self.team.lifecycle.control(
+                        "wait", worker_id=worker_id, run_id=run_id, timeout_seconds=timeout,
+                    )
+                    worker_status = str(observed.get("status") or "UNKNOWN")
                 outcome["worker_status"] = worker_status
                 if worker_status in _TERMINAL_WORKER:
                     with self.team._board() as (_scope, conn):
@@ -251,7 +265,7 @@ class WorkflowOrchestrationService:
                             worker_status=worker_status,
                         )
             except Exception as exc:
-                outcome["status"] = "effect_uncertain" if target["request_new"] else "pending"
+                outcome["status"] = "effect_uncertain" if interrupt_attempted else "pending"
                 outcome["error"] = str(exc)
             outcomes.append(outcome)
 

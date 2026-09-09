@@ -5,6 +5,7 @@ import json
 import sqlite3
 from types import SimpleNamespace
 import threading
+import time
 
 import pytest
 
@@ -286,6 +287,17 @@ def test_atomic_identical_admission_conflict_and_partial_graph_rollback(tmp_path
         conn, PARALLEL_WORKFLOW, created_by="fixture", template_id=saved["template_id"],
     )
     assert repeated_save["template_ref"] == saved["template_ref"]
+    advanced = workflows.save_template(
+        conn,
+        {**PARALLEL_WORKFLOW, "name": "Compare and combine v2"},
+        created_by="fixture",
+        template_id=saved["template_id"],
+    )
+    assert advanced["version"] == 2
+    assert advanced["template_ref"] != saved["template_ref"]
+    assert workflows.template_detail(
+        conn, saved["template_id"], saved["version"],
+    )["name"] == PARALLEL_WORKFLOW["name"]
     conn.close()
 
     barrier = threading.Barrier(2)
@@ -324,6 +336,16 @@ def test_atomic_identical_admission_conflict_and_partial_graph_rollback(tmp_path
                 input_payload={"sample": 2},
                 created_by="fixture",
             )
+        changed = workflows.invoke_workflow(
+            conn,
+            saved["template_ref"],
+            owner_session_id="owner-synthetic",
+            admission_key="changed-input-key",
+            input_payload={"sample": 2},
+            created_by="fixture",
+        )
+        assert changed["workflow_ref"] != results[0]["workflow_ref"]
+        assert changed["graph_hash"] != results[0]["graph_hash"]
         before_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         original_create = kb.create_task
         calls = 0
@@ -435,6 +457,105 @@ def test_parallel_review_correction_join_and_restart_safe_resume(tmp_path, monke
     assert {step["status"] for step in inspected["steps"]} == {"done"}
 
 
+def test_native_request_changes_respects_workflow_correction_bound(tmp_path, monkeypatch):
+    service, execution, _board_db = _service(tmp_path, monkeypatch)
+    saved = _save(service, {
+        "name": "No corrections",
+        "steps": [{
+            "key": "only", "title": "Only", "profile": "alpha",
+            "reviewer": "checker", "max_corrections": 0,
+        }],
+    })
+    invoked = service.dispatch({
+        "action": "workflow_invoke",
+        "template_ref": saved["template_ref"],
+        "admission_key": "native-correction-bound",
+    })
+    task_ref = _step_refs(invoked)["only"]
+    implementation = _outcome_for(invoked, task_ref)
+    execution.finish(implementation["run_ref"])
+    assert service.dispatch({
+        "action": "submit_review",
+        "task_ref": task_ref,
+        "summary": "Ready for review.",
+        "reviewer": "checker",
+    })["status"] == "review"
+    reviewer = service.dispatch({"action": "start", "task_ref": task_ref})
+    execution.finish(reviewer["run_ref"])
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        task_id = task_ref.partition(":")[2]
+        review_run = kb.get_task(conn, task_id).current_run_id
+        ok, reason = kb.request_changes(
+            conn, task_id, reason="Native transition must honor the immutable bound.",
+            expected_run_id=review_run,
+        )
+        assert ok is False
+        assert reason == "Workflow correction limit reached (0/0)"
+        assert kb.get_task(conn, task_id).status == "running"
+    finally:
+        conn.close()
+
+
+def test_native_complete_cannot_bypass_required_workflow_review_or_success(tmp_path, monkeypatch):
+    service, execution, _board_db = _service(tmp_path, monkeypatch)
+    saved = _save(service, {
+        "name": "Required review",
+        "steps": [{
+            "key": "only", "title": "Only", "profile": "alpha",
+            "reviewer": "checker", "max_corrections": 1,
+        }],
+    })
+    invoked = service.dispatch({
+        "action": "workflow_invoke",
+        "template_ref": saved["template_ref"],
+        "admission_key": "native-complete-boundary",
+    })
+    task_ref = _step_refs(invoked)["only"]
+    implementation = _outcome_for(invoked, task_ref)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    task_id = task_ref.partition(":")[2]
+    try:
+        implementation_run = kb.get_task(conn, task_id).current_run_id
+        assert kb.complete_task(
+            conn, task_id, summary="Native implementation completion bypass.",
+            expected_run_id=implementation_run,
+        ) is False
+    finally:
+        conn.close()
+
+    execution.finish(implementation["run_ref"])
+    assert service.dispatch({
+        "action": "submit_review",
+        "task_ref": task_ref,
+        "summary": "Ready for review.",
+        "reviewer": "checker",
+    })["status"] == "review"
+    reviewer = service.dispatch({"action": "start", "task_ref": task_ref})
+    conn = kbc.connect()
+    try:
+        review_run = kb.get_task(conn, task_id).current_run_id
+        assert kb.complete_task(
+            conn, task_id, summary="Native reviewer completion without worker evidence.",
+            expected_run_id=review_run,
+        ) is False
+    finally:
+        conn.close()
+
+    execution.finish(reviewer["run_ref"])
+    assert service.dispatch({
+        "action": "accept", "task_ref": task_ref, "summary": "Accepted evidence.",
+    })["status"] == "done"
+
+
 def test_pause_and_claim_share_one_board_serialization_point(tmp_path, monkeypatch):
     service, _execution, _board_db = _service(tmp_path, monkeypatch)
     saved = _save(service, {
@@ -522,7 +643,11 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
         "steps": [
             {"key": "keep", "title": "Keep", "profile": "alpha", "reviewer": "checker"},
             {"key": "stop", "title": "Stop", "profile": "beta", "reviewer": "checker"},
-            {"key": "join", "title": "Join", "profile": "alpha", "depends_on": ["keep", "stop"]},
+            {"key": "stale", "title": "Stale", "profile": "beta", "reviewer": "checker"},
+            {
+                "key": "join", "title": "Join", "profile": "alpha",
+                "depends_on": ["keep", "stop", "stale"],
+            },
         ],
     })
     invoked = service.dispatch({
@@ -533,6 +658,7 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
     refs = _step_refs(invoked)
     keep = _outcome_for(invoked, refs["keep"])
     stop = _outcome_for(invoked, refs["stop"])
+    stale = _outcome_for(invoked, refs["stale"])
     _review_and_accept(service, execution, refs["keep"], keep)
 
     from hermes_cli import kanban_db as kb
@@ -540,6 +666,19 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
 
     conn = kbc.connect()
     try:
+        stop_id = refs["stop"].partition(":")[2]
+        stale_id = refs["stale"].partition(":")[2]
+        assert kb.block_task(
+            conn, stop_id, reason="Native block left the worker execution live.",
+            expected_run_id=kb.get_task(conn, stop_id).current_run_id,
+        ) is True
+        conn.execute(
+            "UPDATE tasks SET claim_expires=? WHERE id=?",
+            (int(time.time()) - 1, stale_id),
+        )
+        conn.commit()
+        assert kb.release_stale_claims(conn) == 1
+        assert kb.get_task(conn, stale_id).status == "ready"
         inspected = service.dispatch({
             "action": "workflow_inspect", "workflow_ref": invoked["workflow_ref"],
         })
@@ -557,12 +696,13 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
 
     stop_run_id = stop["run_ref"].partition(":")[2]
     stop_child = execution.records[stop_run_id].agent
+    stale_child = execution.records[stale["run_ref"].partition(":")[2]].agent
     real_control = service.lifecycle.control
     lost_receipt = True
 
     def uncertain_control(action, **kwargs):
         nonlocal lost_receipt
-        if action == "interrupt" and lost_receipt:
+        if action == "interrupt" and kwargs.get("run_id") == stop_run_id and lost_receipt:
             lost_receipt = False
             real_control(action, **kwargs)
             raise RuntimeError("synthetic interrupt receipt loss")
@@ -575,10 +715,13 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
         "expected_version": 1,
     })
     assert first["task_disposition"] == "pending_terminal_worker_evidence"
-    assert first["outcomes"][0]["status"] == "effect_uncertain"
+    stop_outcome = next(item for item in first["outcomes"] if item["task_ref"] == refs["stop"])
+    assert stop_outcome["status"] == "effect_uncertain"
     assert stop_child.interruptions == 1
+    assert stale_child.interruptions == 1
 
     execution.finish(stop["run_ref"], status="CANCELLED")
+    execution.finish(stale["run_ref"], status="CANCELLED")
     service.lifecycle.control = real_control
     second = service.dispatch({
         "action": "workflow_cancel",
@@ -587,11 +730,13 @@ def test_exact_cancel_is_sticky_and_does_not_replay_uncertain_interrupt(tmp_path
     })
     assert second["task_disposition"] == "cancelled"
     assert stop_child.interruptions == 1
+    assert stale_child.interruptions == 1
 
     conn = kbc.connect()
     try:
         assert kb.get_task(conn, refs["keep"].partition(":")[2]).status == "done"
         assert kb.get_task(conn, refs["stop"].partition(":")[2]).status == "blocked"
+        assert kb.get_task(conn, refs["stale"].partition(":")[2]).status == "blocked"
         assert kb.get_task(conn, refs["join"].partition(":")[2]).status == "blocked"
         assert kb.get_task(conn, coordinator_id).status == "blocked"
         kb.recompute_ready(conn)
@@ -639,6 +784,28 @@ def test_readonly_and_styled_paths_preserve_owner_board_and_capability(tmp_path,
         lambda _args: pytest.fail("styled workflow call reached worker dispatch"),
     ))
     assert payload["routed"] == "workflow_list"
+
+    claude = bind_worker_interface(
+        InterfaceSelection("claude", "explicit", "experimental_unqualified", "fixture", "fixture"),
+        [
+            {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+            for name in ("delegate_task", "kanban_team")
+        ],
+    )
+    claude_projected = project_worker_tool_definitions(
+        [{"type": "function", "function": {"name": "kanban_team", "parameters": {"type": "object"}}}],
+        claude,
+    )
+    claude_tool = next(item for item in claude_projected if item["function"]["name"] == "TeamTask")
+    assert "workflow_invoke" in claude_tool["function"]["parameters"]["properties"]["action"]["enum"]
+    service.agent._worker_interface_selection = claude
+    claude_payload = json.loads(dispatch_worker_interface_call(
+        service.agent,
+        "TeamTask",
+        {"action": "workflow_list"},
+        lambda _args: pytest.fail("Claude-style workflow call reached worker dispatch"),
+    ))
+    assert claude_payload["routed"] == "workflow_list"
 
     monkeypatch.undo()
     service, _execution, board_db = _service(tmp_path / "scope", monkeypatch)

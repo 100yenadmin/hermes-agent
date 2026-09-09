@@ -615,8 +615,16 @@ class TeamOrchestrationService:
             task, kanban_run, attachment = self._current_attachment(conn, task_id)
             if kb.run_claim_source(conn, task_id, kanban_run) != "review":
                 raise RuntimeError("Only the current claimed review run may accept the task")
-            if self._worker_status(attachment).get("status") != "SUCCEEDED":
+            evidence = self._worker_status(attachment)
+            if evidence.get("status") != "SUCCEEDED":
                 raise RuntimeError("Reviewer success is required before acceptance")
+            if task.workflow_invocation_id:
+                from hermes_cli import kanban_db_workflows as workflows
+                workflows.record_acceptance_evidence(
+                    conn, task_id, owner_session_id=self._owner(),
+                    kanban_run_id=kanban_run,
+                    worker_status=str(evidence.get("status")),
+                )
             if not kb.complete_task(
                 conn, task_id, summary=_text(args.get("summary")) or "Review accepted",
                 expected_run_id=kanban_run,
