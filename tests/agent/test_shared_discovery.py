@@ -62,7 +62,14 @@ def test_worker_and_run_references_keep_owner_and_style_boundaries(tmp_path, mon
     refs = discover_shared_references(parent)["references"]
     names = {item["reference"] for item in refs}
     assert names == {f"worker:{worker['worker_id']}", f"run:{run['run_id']}"}
-    assert discover_shared_references(parent, f"run:{run['run_id']}")["reference_detail"]["status"] == "PENDING"
+    run_ref = next(item for item in refs if item["kind"] == "run")
+    assert run_ref["worker"] == f"worker:{worker['worker_id']}"
+    assert run_ref["scope"] == {"kind": "worker", "reference": f"worker:{worker['worker_id']}"}
+    resolved_run = discover_shared_references(parent, f"run:{run['run_id']}")
+    assert resolved_run["reference_detail"]["status"] == "PENDING"
+    assert resolved_run["worker"]["reference"] == f"worker:{worker['worker_id']}"
+    resolved_worker = discover_shared_references(parent, f"worker:{worker['worker_id']}")
+    assert resolved_worker["runs"][0]["reference"] == f"run:{run['run_id']}"
     with pytest.raises(PermissionError, match="Unknown or unavailable"):
         discover_shared_references(parent, f"worker:{foreign['worker_id']}")
 
@@ -112,8 +119,12 @@ def test_bot_and_task_references_revalidate_native_gates_and_pinned_board(tmp_pa
     names = {item["reference"] for item in refs}
     assert "bot:research" in names
     assert f"task:{task_id}" in names
-    assert discover_shared_references(parent, "bot:research")["reference_detail"]["actions"] == ["message"]
-    assert discover_shared_references(parent, f"task:{task_id}")["reference_detail"]["status"] == "ready"
+    bot = discover_shared_references(parent, "bot:research")["reference_detail"]
+    task = discover_shared_references(parent, f"task:{task_id}")["reference_detail"]
+    assert bot["actions"] == ["message"]
+    assert bot["scope"] == {"kind": "profile_roster", "profile": "default"}
+    assert task["status"] == "ready"
+    assert task["scope"] == {"kind": "kanban_board", "board": "default"}
 
     parent._session_title_hint = "Other"
     with pytest.raises(PermissionError, match="Unknown or unavailable"):
@@ -133,7 +144,9 @@ def test_room_grant_rechecks_session_policy_service_authority_and_participants(t
         members=[{"profile": "research", "handle": "research"}],
         authority_gateway_id="gateway-synthetic",
     )
-    monkeypatch.setattr(hosted_rooms, "local_authority_gateway_id", lambda: "gateway-synthetic")
+    current_gateway = {"id": "gateway-synthetic"}
+    monkeypatch.setattr(
+        hosted_rooms, "local_authority_gateway_id_existing", lambda: current_gateway["id"])
     service = SimpleNamespace(
         db_path=room_db,
         runtime=SimpleNamespace(status=lambda: {"running": True, "stopping": False}),
@@ -158,6 +171,14 @@ def test_room_grant_rechecks_session_policy_service_authority_and_participants(t
         detail = discover_shared_references(agent, "room:room-synthetic")["reference_detail"]
         assert detail["participants"] == ["research"]
         assert detail["authority_epoch"] == 1
+        assert detail["scope"] == {"kind": "gateway_room_grant"}
+
+        hosted_rooms.create_room(
+            room_db, room_id="room-foreign", name="Foreign room", members=[],
+            authority_gateway_id="gateway-synthetic",
+        )
+        with pytest.raises(PermissionError, match="Unknown or unavailable"):
+            discover_shared_references(agent, "room:room-foreign")
 
         cfg["orchestration"]["discovery"]["rooms"][0]["participants"] = []
         with pytest.raises(PermissionError, match="Unknown or unavailable"):
@@ -171,6 +192,41 @@ def test_room_grant_rechecks_session_policy_service_authority_and_participants(t
         with pytest.raises(PermissionError, match="Unknown or unavailable"):
             discover_shared_references(agent, "room:room-synthetic")
         methods_groups._service = service
+
+        with sqlite3.connect(room_db) as conn:
+            conn.execute("UPDATE hosted_rooms SET members_json='[]' WHERE room_id='room-synthetic'")
+            conn.commit()
+        with pytest.raises(PermissionError, match="Unknown or unavailable"):
+            discover_shared_references(agent, "room:room-synthetic")
+        with sqlite3.connect(room_db) as conn:
+            conn.execute(
+                "UPDATE hosted_rooms SET members_json=? WHERE room_id='room-synthetic'",
+                (json.dumps([{"profile": "research", "handle": "research"}]),),
+            )
+            conn.commit()
+
+        current_gateway["id"] = "gateway-away"
+        with pytest.raises(PermissionError, match="Unknown or unavailable"):
+            discover_shared_references(agent, "room:room-synthetic")
+        current_gateway["id"] = "gateway-synthetic"
+        assert discover_shared_references(
+            agent, "room:room-synthetic")["reference_detail"]["availability"] == "available"
+
+        replacement_agent = SimpleNamespace()
+        replacement_scope = build_gateway_discovery_scope(
+            server, sid="runtime-1", cfg=cfg, source="tui")
+        replacement_agent._shared_discovery_scope = replacement_scope
+        replacement_record = {
+            "agent": replacement_agent, "discovery_scope": replacement_scope, "source": "tui",
+        }
+        server._sessions["runtime-1"] = replacement_record
+        replacement_token = runtime_record.set(replacement_record)
+        try:
+            with pytest.raises(PermissionError, match="Unknown or unavailable"):
+                discover_shared_references(agent, "room:room-synthetic")
+        finally:
+            runtime_record.reset(replacement_token)
+            server._sessions["runtime-1"] = record
 
         with sqlite3.connect(room_db) as conn:
             conn.execute("UPDATE hosted_rooms SET authority_epoch=2 WHERE room_id='room-synthetic'")
@@ -187,6 +243,47 @@ def test_room_grant_rechecks_session_policy_service_authority_and_participants(t
     server._sessions["compute"] = {"_compute_host_active": True, "source": "tui"}
     compute = build_gateway_discovery_scope(server, sid="compute", cfg=cfg, source="tui")
     assert compute.room_provider is None
+
+
+def test_room_identity_reads_never_mint_or_repair_install_identity(tmp_path, monkeypatch):
+    room_db = tmp_path / "rooms.db"
+    authority = "install:" + "a" * 32
+    hosted_rooms.create_room(
+        room_db, room_id="room-synthetic", name="Synthetic room", members=[],
+        authority_gateway_id=authority,
+    )
+    service = SimpleNamespace(db_path=room_db)
+    from tui_gateway import methods_groups
+    monkeypatch.setattr(methods_groups, "_service", service)
+    cfg = {"orchestration": {"discovery": {"rooms": [{
+        "id": "room-synthetic", "actions": ["inspect"], "participants": [],
+    }]}}}
+    server = SimpleNamespace(_sessions={}, _sessions_lock=threading.RLock())
+
+    missing_home = tmp_path / "missing-home"
+    monkeypatch.setenv("HERMES_HOME", str(missing_home))
+    assert build_gateway_discovery_scope(
+        server, sid="missing", cfg=cfg, source="tui").room_provider is None
+    assert not missing_home.exists()
+
+    malformed_home = tmp_path / "malformed-home"
+    malformed_home.mkdir()
+    malformed_identity = malformed_home / "install_id"
+    malformed_identity.write_text("not-an-install-id\n", encoding="utf-8")
+    malformed_before = (set(malformed_home.iterdir()), malformed_identity.read_bytes())
+    monkeypatch.setenv("HERMES_HOME", str(malformed_home))
+    assert build_gateway_discovery_scope(
+        server, sid="malformed", cfg=cfg, source="tui").room_provider is None
+    assert (set(malformed_home.iterdir()), malformed_identity.read_bytes()) == malformed_before
+
+    unreadable_home = tmp_path / "unreadable-home"
+    unreadable_home.mkdir()
+    (unreadable_home / "install_id").mkdir()
+    unreadable_before = set(unreadable_home.iterdir())
+    monkeypatch.setenv("HERMES_HOME", str(unreadable_home))
+    assert build_gateway_discovery_scope(
+        server, sid="unreadable", cfg=cfg, source="tui").room_provider is None
+    assert set(unreadable_home.iterdir()) == unreadable_before
 
 
 def test_existing_readonly_helpers_leave_missing_paths_absent(tmp_path):

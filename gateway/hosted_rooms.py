@@ -411,6 +411,13 @@ def local_authority_gateway_id() -> str:
     return _actor_id(f"install:{install_id}", "authority_gateway_id")
 
 
+def local_authority_gateway_id_existing() -> str | None:
+    """Return current local authority without minting install identity."""
+    from hermes_cli.install_identity import read_existing_install_id
+    install_id = read_existing_install_id()
+    return _actor_id(f"install:{install_id}", "authority_gateway_id") if install_id else None
+
+
 _connect = partial(
     connect, db_label="state.db (hosted_rooms)", ready=_schema_is_current,
     initialize=lambda conn: _initialize_schema(conn), lock_retries=_JOURNAL_MODE_LOCK_RETRIES)

@@ -1039,16 +1039,20 @@ class SubagentLifecycleService:
                 "label": worker.get("profile") or "Hermes worker",
                 "availability": "available", "freshness": "stored",
                 "actions": actions, "status": status,
+                "scope": {"kind": "owner_session"},
             }
 
         def run_ref(run: Mapping[str, Any]) -> Mapping[str, Any]:
             actions = ["inspect", "wait"]
             if run.get("status") not in {"SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED"}:
                 actions.append("stop")
+            worker_reference = f"worker:{run['worker_id']}"
             return {
                 "reference": f"run:{run['run_id']}", "kind": "run",
                 "label": "Worker run", "availability": "available", "freshness": "stored",
                 "actions": actions, "status": run.get("status"),
+                "worker": worker_reference,
+                "scope": {"kind": "worker", "reference": worker_reference},
             }
 
         if reference:

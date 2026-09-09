@@ -112,13 +112,13 @@ class GatewayRoomDiscoveryProvider:
             raise PermissionError(_UNKNOWN)
         if str(Path(getattr(self.service, "db_path", "")).resolve()) != self.db_path:
             raise PermissionError(_UNKNOWN)
-        from gateway.hosted_rooms import local_authority_gateway_id, room_state_existing
+        from gateway.hosted_rooms import local_authority_gateway_id_existing, room_state_existing
         room = room_state_existing(self.db_path, room_id=pin.room_id)
         if room is None:
             raise PermissionError(_UNKNOWN)
         if (str(room.get("authority_gateway_id")) != pin.authority_gateway_id
                 or int(room.get("authority_epoch") or 0) != pin.authority_epoch
-                or local_authority_gateway_id() != pin.authority_gateway_id):
+                or local_authority_gateway_id_existing() != pin.authority_gateway_id):
             raise PermissionError(_UNKNOWN)
         if not set(pin.participants).issubset(_participant_names(room)):
             raise PermissionError(_UNKNOWN)
@@ -130,6 +130,7 @@ class GatewayRoomDiscoveryProvider:
             "reference": f"room:{pin.room_id}", "kind": "room", "label": str(room.get("name") or "Room"),
             "availability": "available", "freshness": "live", "actions": list(pin.actions),
             "authority_epoch": pin.authority_epoch, "participants": list(pin.participants),
+            "scope": {"kind": "gateway_room_grant"},
         }
 
     def resolve(self, agent: Any, reference: str | None) -> Mapping[str, Any]:
@@ -165,9 +166,11 @@ def build_gateway_discovery_scope(
     service = get_hosted_room_service()
     if service is None:
         return base
-    from gateway.hosted_rooms import list_rooms_existing, local_authority_gateway_id
+    from gateway.hosted_rooms import list_rooms_existing, local_authority_gateway_id_existing
     db_path = str(Path(service.db_path).resolve())
-    gateway_id = local_authority_gateway_id()
+    gateway_id = local_authority_gateway_id_existing()
+    if not gateway_id:
+        return base
     rooms = {room["room_id"]: room for room in list_rooms_existing(db_path, room_ids=tuple(row["id"] for row in rows))}
     pins = []
     for row in rows:

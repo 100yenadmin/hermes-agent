@@ -81,6 +81,7 @@ def _bot_references(agent: Any, reference: Optional[str]) -> Mapping[str, Any]:
             "reference": f"bot:{handle}", "kind": "bot", "label": f"@{handle}",
             "availability": "available", "freshness": "live",
             "actions": ["message"],
+            "scope": {"kind": "profile_roster", "profile": _scope(agent).profile_name},
         }
 
     if reference:
@@ -126,6 +127,7 @@ def _task_references(agent: Any, reference: Optional[str]) -> Mapping[str, Any]:
             "reference": f"task:{task.id}", "kind": "task", "label": str(task.title),
             "availability": "available", "freshness": "stored", "actions": actions,
             "status": str(task.status), "assignee": task.assignee,
+            "scope": {"kind": "kanban_board", "board": scope.kanban_board},
         }
 
     try:
@@ -173,7 +175,11 @@ def discover_shared_references(agent: Any, reference: Optional[str] = None) -> M
         if not sep or not object_id or resolver is None:
             raise PermissionError(_UNKNOWN)
         try:
-            return {"reference_detail": resolver(agent, str(reference))["reference"]}
+            resolved = resolver(agent, str(reference))
+            return {
+                "reference_detail": resolved["reference"],
+                **{key: value for key, value in resolved.items() if key != "reference"},
+            }
         except (KeyError, PermissionError, ValueError):
             raise PermissionError(_UNKNOWN) from None
 
