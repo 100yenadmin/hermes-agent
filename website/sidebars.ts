@@ -99,6 +99,7 @@ const sidebars: SidebarsConfig = {
             'user-guide/features/delegation',
             'user-guide/features/worker-profiles',
             'user-guide/features/worker-orchestration-tour',
+            'user-guide/features/orchestration-capability-comparison',
             'user-guide/features/kanban',
             'user-guide/features/codex-app-server-runtime',
             'user-guide/features/kanban-tutorial',

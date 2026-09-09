@@ -9,7 +9,7 @@ An **orchestrator** is the main agent that divides a task, assigns the pieces, c
 
 For example, ask Hermes to compare three proposals. It can give one worker the job of extracting the facts and another the job of checking contradictions. While they work, the parent can add guidance, wait for their answers, and ask the same worker a follow-up. You choose the worker definitions and which models they use.
 
-This page explains the changes in [PR #106268](https://github.com/NousResearch/hermes-agent/pull/106268). It is a feature guide, not a claim that every provider or deployment has passed the same tests. For copyable configuration, start with [Worker profiles](worker-profiles.md).
+This page explains the changes in [PR #106268](https://github.com/NousResearch/hermes-agent/pull/106268). It is a feature guide, not a claim that every provider or deployment has passed the same tests. For copyable configuration, start with [Worker profiles](worker-profiles.md). For Codex, Claude Code, OpenClaw, Bot Mode and Kanban coverage, see the [capability comparison](orchestration-capability-comparison.md).
 
 ## The whole system at a glance
 
@@ -23,7 +23,7 @@ Read the diagram from top to bottom:
 4. **Hermes manages the shared rules and records.** The parent tool and plugin API use the same worker service. The service tracks ownership, run order, budgets, messages and recovery state.
 5. **The parent receives evidence as well as answers.** A receipt records what was requested, what was sent, and what the provider reported. These are separate facts.
 
-A powerful model alone does not provide this machinery. Selecting an OpenAI Codex model in Hermes still runs it inside the Hermes harness—the software that supplies tools, permissions and the execution loop. This PR does not launch the Codex CLI or app-server as a worker backend.
+A powerful model alone does not provide this machinery. Selecting an OpenAI Codex model in Hermes's default runtime still uses the Hermes harness—the software that supplies tools, permissions and the execution loop. Hermes also has an [optional Codex app-server runtime](codex-app-server-runtime.md), with different supported callbacks. This PR does not add or expand that backend integration.
 
 ## Codex, existing Hermes, and this change
 
