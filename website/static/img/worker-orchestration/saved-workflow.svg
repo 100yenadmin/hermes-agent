@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1160" role="img" aria-labelledby="title desc">
-<title id="title">Save the workflow; retain each task's evidence</title><desc id="desc">Planned saved workflows run independent tasks in parallel, join only accepted results, and bound corrections. Pause blocks new claims. Restart reads recorded identities. Cancellation blocks unfinished work without releasing dependants.</desc>
+<title id="title">Save the workflow; retain each task's evidence</title><desc id="desc">Draft saved workflows run independent tasks in parallel, join only accepted results, and bound corrections. Pause blocks new claims. Restart reads recorded identities. Cancellation blocks unfinished work without releasing dependants.</desc>
 <defs><style>text{font-family:Arial,Helvetica,sans-serif;fill:#e2e8f0}.h{font-size:21px;font-weight:700}.b{font-size:18px}.s{font-size:16px;fill:#cbd5e1}.m{font-size:16px;fill:#94a3b8}</style><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#1e293b" stroke-width=".6"/></pattern><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="#94a3b8"/></marker></defs>
 <rect width="1200" height="1160" fill="#0f172a"/><rect width="1200" height="1160" fill="url(#grid)"/>
 <text x="40" y="48" font-size="29" font-weight="700">Save the workflow; retain each task's evidence</text>
-<text x="40" y="80" class="m">PLANNED INCREMENT FOUR · a reusable recipe over existing Hermes services</text>
+<text x="40" y="80" class="m">DRAFT INCREMENT FOUR · a reusable recipe over existing Hermes services</text>
 <g fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"><path d="M410 245V300H210V335"/><path d="M410 300H610V335"/><path d="M210 450V495H410V535"/><path d="M610 450V495H410"/><path d="M410 650V730"/><path d="M410 845V925"/></g>
 <rect x="50" y="135" width="720" height="110" rx="12" fill="#172235" stroke="#22d3ee" stroke-width="2"/>
 <text x="70" y="169" class="h">1  Save a version; start with new input</text>
@@ -56,4 +56,4 @@
 <text x="845" y="960" class="b">Do not release dependent work.</text>
 <line x1="40" y1="1080" x2="1160" y2="1080" stroke="#334155"/>
 <text x="50" y="1114" class="s">Kanban owns tasks and acceptance. WorkerStore owns conversations and runs. The workflow records control.</text>
-<text x="50" y="1140" class="m">Design illustration only: implementation, restart and live workflow acceptance remain separate proof gates.</text></svg>
+<text x="50" y="1140" class="m">Draft implementation: see the capability guide for exact test evidence and remaining proof gaps.</text></svg>
