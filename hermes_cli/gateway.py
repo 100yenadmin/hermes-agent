@@ -3559,7 +3559,11 @@ def _launchctl_bootstrap(domain: str, plist_path, label: str, *, timeout: int = 
         if exc.returncode != _LAUNCHCTL_BOOTSTRAP_EIO:
             raise
         # Stale registration — bootout the leftover label and bootstrap once more.
-        subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], check=False, timeout=timeout)
+        # Captured: the bootout is best-effort (a drained job may already be
+        # unloaded), so its expected 3/113/125 stderr must not leak to the terminal.
+        subprocess.run(
+            ["launchctl", "bootout", f"{domain}/{label}"],
+            check=False, timeout=timeout, **_CAPTURE_TEXT)
         subprocess.run(bootstrap, check=True, timeout=timeout)
 
 
@@ -3941,7 +3945,8 @@ def refresh_launchd_plist_if_needed() -> bool:
 
     # Bootout/bootstrap so launchd reads the new definition; bootstrap can fail silently under load
     # during a drain, and KeepAlive can't revive an unregistered job.
-    subprocess.run(["launchctl", "bootout", target], check=False, timeout=90)
+    # Captured: best-effort (the job may already be unloaded), keep expected noise off the terminal.
+    subprocess.run(["launchctl", "bootout", target], check=False, timeout=90, **_CAPTURE_TEXT)
     _reload_budget = _launchd_reload_budget()
     # Wait out the old gateway's drain first so the budget isn't burned on guaranteed EIO ("already loaded").
     if gateway_pid is not None and not _wait_for_pid_exit(gateway_pid, _reload_budget):
@@ -4001,7 +4006,10 @@ def launchd_install(force: bool = False):
 
 def launchd_uninstall():
     plist_path = get_launchd_plist_path()
-    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{get_launchd_label()}"], check=False, timeout=90)
+    # Captured: uninstalling an already-unloaded job is fine — don't print Boot-out failed: 3.
+    subprocess.run(
+        ["launchctl", "bootout", f"{_launchd_domain()}/{get_launchd_label()}"],
+        check=False, timeout=90, **_CAPTURE_TEXT)
     if plist_path.exists():
         plist_path.unlink()
         print(f"✓ Removed {plist_path}")
@@ -4063,9 +4071,10 @@ def launchd_stop():
     _mark_planned_stop()
     # bootout unloads the definition so KeepAlive doesn't respawn; `hermes gateway start` re-bootstraps.
     try:
-        subprocess.run(["launchctl", "bootout", target], check=True, timeout=90)
+        # Captured: an already-unloaded job (3/113/125) is handled below, so launchctl's own
+        # "Boot-out failed: 3" must not print around the ✓ line; e.stderr stays on the raised error.
+        subprocess.run(["launchctl", "bootout", target], check=True, timeout=90, **_CAPTURE_TEXT)
     except subprocess.CalledProcessError as e:
-        # Job already unloaded (3/113/125) or domain unmanageable (5/125): fall through to the PID-based kill.
         # Job already unloaded (3/113/125), or the domain can't be managed at all (5/125, macOS 26+
         # detached-fallback process, issue #23387) — in both cases just fall through to the PID-based kill
         # below.
@@ -4158,7 +4167,9 @@ def launchd_restart():
                 print("⚠ launchd did not revive the gateway after its graceful exit — forcing restart")
             else:
                 print(f"⚠ Gateway drain timed out after {wait_budget:.0f}s — forcing launchd restart")
-        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+        # Captured: an unloaded job (3/113/125) is the expected case below, which
+        # prints its own ↻ line — and e.stderr feeds the update_cmd failure diagnostic.
+        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90, **_CAPTURE_TEXT)
         _launchd_ok("✓ Service restarted")
     except subprocess.CalledProcessError as e:
         if not _launchd_error_indicates_unloaded(e):
@@ -4168,7 +4179,9 @@ def launchd_restart():
         print("↻ launchd job was unloaded; reloading")
         try:
             # After a drain the job is usually still registered (bootstrap would hit EIO): boot it out first.
-            subprocess.run(["launchctl", "bootout", target], check=False, timeout=90)
+            # Captured: best-effort (the job may already be unloaded after the drain),
+            # so an expected Boot-out failed: 3 must not leak past the ↻ line below.
+            subprocess.run(["launchctl", "bootout", target], check=False, timeout=90, **_CAPTURE_TEXT)
             plist_path = str(get_launchd_plist_path())
             subprocess.run(["launchctl", "bootstrap", _launchd_domain(), plist_path], check=True, timeout=30)
             subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)

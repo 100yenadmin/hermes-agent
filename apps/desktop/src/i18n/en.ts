@@ -2439,6 +2439,7 @@ export const en: Translations = {
     projects: {
       sectionLabel: 'Projects',
       home: 'Home',
+      autoDiscovered: 'Auto-discovered',
       newButton: 'New project',
       createTitle: 'New project',
       createDesc: 'Name a workspace and add one or more folders.',
@@ -3575,6 +3576,7 @@ export const en: Translations = {
         streaming: 'Streaming connection error'
       },
       errorRetry: 'Retry',
+      errorStartNewSession: 'Start new session',
       errorSwitchProvider: 'Switch provider',
       errorOpenLogs: 'Open logs',
       errorOpenLogsFailed: 'Could not open the logs folder',

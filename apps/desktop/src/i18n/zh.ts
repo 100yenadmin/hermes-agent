@@ -2603,6 +2603,7 @@ export const zh: Translations = {
     projects: {
       sectionLabel: '项目',
       home: '主页',
+      autoDiscovered: '自动发现',
       newButton: '新建项目',
       createTitle: '新建项目',
       createDesc: '为工作区命名并添加一个或多个文件夹。',
@@ -3716,6 +3717,7 @@ export const zh: Translations = {
         streaming: '流式连接错误'
       },
       errorRetry: '重试',
+      errorStartNewSession: '开始新会话',
       errorSwitchProvider: '切换服务商',
       errorOpenLogs: '打开日志',
       errorOpenLogsFailed: '无法打开日志文件夹',
