@@ -2246,15 +2246,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                worker_max_tool_calls=(
-                    __import__("agent.subagent_lifecycle", fromlist=["worker_tool_calls_remaining"])
-                    .worker_tool_calls_remaining(agent)
-                ),
                 skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
+            worker_max_tool_calls = (
+                __import__("agent.subagent_lifecycle", fromlist=["worker_tool_calls_remaining"])
+                .worker_tool_calls_remaining(agent)
+            )
+            if worker_max_tool_calls is not None:
+                dispatch_kwargs["worker_max_tool_calls"] = worker_max_tool_calls
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
             import model_tools

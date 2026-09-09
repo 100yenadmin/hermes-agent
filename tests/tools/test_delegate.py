@@ -221,7 +221,7 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertIn("delegate_task", names)
         self.assertTrue((DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names))
 
-    def test_orchestrator_composite_regains_only_delegate_task(self):
+    def test_orchestrator_composite_respects_explicit_delegation_deny(self):
         import model_tools
 
         parent = _make_mock_parent()
@@ -248,7 +248,7 @@ class TestStripBlockedTools(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         disabled = kwargs["disabled_toolsets"]
-        self.assertNotIn("delegation", disabled)
+        self.assertIn("delegation", disabled)
         definitions = model_tools.get_tool_definitions(
             enabled_toolsets=kwargs["enabled_toolsets"],
             disabled_toolsets=disabled,
@@ -256,10 +256,8 @@ class TestStripBlockedTools(unittest.TestCase):
             skip_tool_search_assembly=True,
         )
         names = {item["function"]["name"] for item in definitions}
-        self.assertIn("delegate_task", names)
-        self.assertTrue(
-            (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
-        )
+        self.assertNotIn("delegate_task", names)
+        self.assertTrue(DELEGATE_BLOCKED_TOOLS.isdisjoint(names))
 
 
 class TestDelegateTask(unittest.TestCase):

@@ -525,6 +525,11 @@ def test_public_nested_launch_uses_shared_tree_admission_and_lineage(tmp_path, m
     store = WorkerStore(db)
     store.ensure_schema()
     root_worker = store.create_worker("tree-public", worker_id="tree-public-root")
+    root_run = store.enqueue_run(
+        root_worker["worker_id"], "tree-public", goal="root",
+        budget_limits={"max_iterations": 5, "max_tool_calls": None, "timeout_seconds": None},
+    )
+    root_run = store.claim_next_run(root_worker["worker_id"], "tree-public")
     parent = SimpleNamespace(
         session_id="child-session",
         _worker_owner_session_id="tree-public",
@@ -534,6 +539,13 @@ def test_public_nested_launch_uses_shared_tree_admission_and_lineage(tmp_path, m
         enabled_toolsets=["file"],
         valid_tool_names={"read_file", "delegate_task"},
         _session_db=db,
+    )
+    from agent.subagent_lifecycle import _Record
+    parent._worker_lifecycle_record = _Record(
+        None, SubagentState.RUNNING, time.time(), store=store,
+        owner_session_id="tree-public", worker_id=root_worker["worker_id"],
+        run_id=root_run["run_id"], lease_token=root_run["lease_token"],
+        budget_epoch_id=root_run["budget_epoch_id"],
     )
     cfg = {
         "max_concurrent_children": 2,

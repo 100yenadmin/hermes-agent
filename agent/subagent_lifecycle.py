@@ -296,8 +296,19 @@ def _handle_is_well_formed(handle: Any) -> bool:
 
 
 def _session_db_of(parent: Any) -> Any:
-    db = getattr(parent, "_session_db", None) or getattr(parent, "session_db", None)
-    return getattr(db, "_db", db)
+    # Read only attributes that are really present.  Dynamic proxy/test-double
+    # ``__getattr__`` values are not durable database authority, and an
+    # explicitly disabled ``_session_db = None`` must not fall through to a
+    # fabricated public attribute.
+    import inspect
+    missing = object()
+    db = inspect.getattr_static(parent, "_session_db", missing)
+    if db is missing:
+        db = inspect.getattr_static(parent, "session_db", None)
+    if db is None:
+        return None
+    inner = inspect.getattr_static(db, "_db", missing)
+    return getattr(db, "_db") if inner is not missing else db
 
 
 def _persistent_store(parent: Any) -> Any:
@@ -305,7 +316,8 @@ def _persistent_store(parent: Any) -> Any:
     if isinstance(retained, _Record) and retained.store is not None:
         return retained.store
     db = _session_db_of(parent)
-    if db is None or not hasattr(db, "_execute_write") or not hasattr(db, "_read_ctx"):
+    if db is None or not callable(getattr(type(db), "_execute_write", None)) \
+            or not callable(getattr(type(db), "_read_ctx", None)):
         return None
     from agent.worker_store import WorkerStore
     store = WorkerStore(db)
@@ -1347,8 +1359,11 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError(
                 "The retained worker's parent authority is unavailable; its queued work remains pending.")
         validation_service = type(self)(lambda: authority)
-        child, current_creds, cfg, stored_policy = validation_service._build_revalidated_child(
-            worker, goal=request.goal, role=request.role)
+        try:
+            child, current_creds, cfg, stored_policy = validation_service._build_revalidated_child(
+                worker, goal=request.goal, role=request.role)
+        except (RuntimeError, ValueError) as exc:
+            raise SubagentLifecycleError(f"Worker resume admission failed: {exc}") from exc
         with contextlib.suppress(Exception):
             child.close()
         followup_limit = ((stored_policy.get("profile_contract") or {}).get("execution_limits") or {}).get("max_followups")

@@ -380,10 +380,13 @@ def _build_child_agent(
     child._worker_max_followups = getattr(profile_execution_limits, "max_followups", None)
     child._worker_max_tool_calls = getattr(profile_execution_limits, "max_tool_calls", None)
     child._delegate_spawn_allowed = effective_role == "orchestrator"
-    child._delegate_parent_worker_id = (
+    parent_worker_id = (
         retained_parent_worker_id
         if retained_parent_worker_id is not None
         else getattr(parent_agent, "_worker_id", None)
+    )
+    child._delegate_parent_worker_id = (
+        parent_worker_id if isinstance(parent_worker_id, str) and parent_worker_id else None
     )
     child._delegate_outbound_messages = []
 
@@ -435,6 +438,15 @@ def _build_child_agent(
         )
     return child
 
+
+def _stable_worker_identity(child: Any) -> Optional[tuple[str, str]]:
+    """Return only durable scalar worker identity, never proxy metadata."""
+    worker_id = getattr(child, "_worker_id", None)
+    run_id = getattr(child, "_worker_run_id", None)
+    if isinstance(worker_id, str) and worker_id and isinstance(run_id, str) and run_id:
+        return worker_id, run_id
+    return None
+
 def _run_single_child(
     task_index: int, goal: str, child=None, parent_agent=None, *, owner_session_id: Optional[str] = None,
     owner_transport: Any = None, owner_session_record: Any = None, **_kwargs,
@@ -474,9 +486,9 @@ def _run_single_child(
         result, failure_entry, _child_close_deferred = run.await_child()
         if failure_entry is not None:
             from agent.subagent_lifecycle import SubagentLifecycleService
-            if getattr(child, "_worker_id", None):
-                failure_entry["worker_id"] = child._worker_id
-                failure_entry["run_id"] = child._worker_run_id
+            worker_identity = _stable_worker_identity(child)
+            if worker_identity:
+                failure_entry["worker_id"], failure_entry["run_id"] = worker_identity
             SubagentLifecycleService.complete_adopted_child(child, failure_entry)
             return failure_entry
 
@@ -495,9 +507,9 @@ def _run_single_child(
         run.account_background_processes(entry)
         run.emit_complete(result, entry, duration)
         entry = run.attach_worktree(entry)
-        if getattr(child, "_worker_id", None):
-            entry["worker_id"] = child._worker_id
-            entry["run_id"] = child._worker_run_id
+        worker_identity = _stable_worker_identity(child)
+        if worker_identity:
+            entry["worker_id"], entry["run_id"] = worker_identity
         outbound = list(getattr(child, "_delegate_outbound_messages", None) or [])
         if outbound:
             entry["messages_to_parent"] = outbound
@@ -513,9 +525,9 @@ def _run_single_child(
             _fabricated_entry(task_index, "error", str(exc), child, run.elapsed()), _late_pending_steer,
             preview=str(exc), summary=str(exc), status="failed",
         )
-        if getattr(child, "_worker_id", None):
-            entry["worker_id"] = child._worker_id
-            entry["run_id"] = child._worker_run_id
+        worker_identity = _stable_worker_identity(child)
+        if worker_identity:
+            entry["worker_id"], entry["run_id"] = worker_identity
         outbound = list(getattr(child, "_delegate_outbound_messages", None) or [])
         if outbound:
             entry["messages_to_parent"] = outbound
@@ -752,20 +764,36 @@ def delegate_task(
     selected_profile = str(profile or model_profile or "").strip() or None
     if profile and model_profile and str(profile).strip() != str(model_profile).strip():
         return tool_error("profile and legacy model_profile disagree; provide only one worker profile.")
-    try:
-        creds = _resolve_delegation_credentials(
-            routing_cfg, parent_agent, selected_profile,
-            requested_provider=provider, requested_model=model, requested_reasoning_effort=reasoning_effort,
-        )
-    except ValueError as exc:
-        # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
-        # spawn loudly (#80450).
-        return tool_error(str(exc))
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if err:
         return tool_error(err)
+    # A batch may select its profile per item without a top-level/default
+    # profile.  Resolve those item routes first instead of rejecting or
+    # initializing an unrelated inherited runtime.
+    item_profile_only = not selected_profile and bool(task_list) and all(
+        str(task.get("profile") or task.get("model_profile") or "").strip()
+        for task in task_list
+    )
+    creds = None
+    if not item_profile_only:
+        try:
+            route_overrides = (provider, model, reasoning_effort)
+            if selected_profile is None and all(value is None for value in route_overrides):
+                creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+            elif all(value is None for value in route_overrides):
+                creds = _resolve_delegation_credentials(routing_cfg, parent_agent, selected_profile)
+            else:
+                creds = _resolve_delegation_credentials(
+                    routing_cfg, parent_agent, selected_profile,
+                    requested_provider=provider, requested_model=model,
+                    requested_reasoning_effort=reasoning_effort,
+                )
+        except ValueError as exc:
+            # Explicit-pin preflight failures refuse the entire batch before
+            # any child is built.
+            return tool_error(str(exc))
     task_creds, err = _resolve_task_credentials(
         task_list,
         creds,
@@ -778,6 +806,8 @@ def delegate_task(
     )
     if err:
         return tool_error(err)
+    if creds is None:
+        creds = task_creds[0]
 
     try:
         _validate_spawn_admission(parent_agent, len(task_list))
