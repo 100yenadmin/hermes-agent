@@ -155,6 +155,9 @@ def _apply_exact_tool_policy(
     schemas.  ``tools``/``valid_tool_names`` are only the model-visible projection;
     ``_worker_effective_tool_names`` is the exact dispatch authority.
     """
+    from agent.worker_interfaces import canonical_worker_capability
+    selection = getattr(child, "_worker_interface_selection", None)
+
     visible = set(getattr(child, "valid_tool_names", set()) or set())
     current = set(getattr(child, "_executable_tool_names", visible) or set())
     ancestor = (
@@ -174,10 +177,15 @@ def _apply_exact_tool_policy(
         current.intersection_update(profile_names)
     allowed = getattr(policy, "allowed_tools", None) if policy is not None else None
     allowed_mcp = getattr(policy, "allowed_mcp_tools", None) if policy is not None else None
-    blocked = set(getattr(policy, "blocked_tools", ()) or ()) if policy is not None else set()
-    blocked.update(request_blocked_tools or ())
+    blocked = {
+        canonical_worker_capability(selection, name)
+        for name in (getattr(policy, "blocked_tools", ()) or ())
+    } if policy is not None else set()
+    blocked.update(
+        canonical_worker_capability(selection, name) for name in (request_blocked_tools or ())
+    )
     if allowed is not None:
-        current.intersection_update(allowed)
+        current.intersection_update(canonical_worker_capability(selection, name) for name in allowed)
     if allowed_mcp is not None:
         allowed_mcp_names = set(allowed_mcp)
         for name in tuple(current):
@@ -197,7 +205,10 @@ def _apply_exact_tool_policy(
             bridge_names = set(_ts.BRIDGE_TOOL_NAMES)
     except Exception:
         pass
-    visible_authorized = visible.intersection(current).union(visible.intersection(bridge_names))
+    visible_authorized = {
+        name for name in visible
+        if canonical_worker_capability(selection, name) in current or name in bridge_names
+    }
     child.tools = [
         item for item in (getattr(child, "tools", None) or [])
         if item.get("function", {}).get("name") in visible_authorized

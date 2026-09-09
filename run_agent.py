@@ -1142,17 +1142,21 @@ class AIAgent(
     _drop_thinking_only_and_merge_users = _forward_static("agent.agent_runtime_helpers", "drop_thinking_only_and_merge_users")
 
     @staticmethod
-    def _cap_delegate_task_calls(tool_calls: list) -> list:
+    def _cap_delegate_task_calls(tool_calls: list, *, selection=None) -> list:
         """Cap delegate_task calls in one turn at max_concurrent_children (non-delegate calls all kept);
         returns the original list when nothing was truncated."""
         from tools.delegate_tool import _get_max_concurrent_children
         max_children = _get_max_concurrent_children()
-        delegate_count = sum(1 for tc in tool_calls if tc.function.name == "delegate_task")
+        from agent.worker_interfaces import is_worker_spawn_tool
+
+        delegate_count = sum(
+            1 for tc in tool_calls if is_worker_spawn_tool(selection, tc.function.name)
+        )
         if delegate_count <= max_children:
             return tool_calls
         kept_delegates, truncated = 0, []
         for tc in tool_calls:
-            if tc.function.name == "delegate_task":
+            if is_worker_spawn_tool(selection, tc.function.name):
                 if kept_delegates >= max_children:
                     continue
                 kept_delegates += 1
@@ -1307,6 +1311,14 @@ class AIAgent(
             model_profile=function_args.get("model_profile"), provider=function_args.get("provider"),
             model=function_args.get("model"), reasoning_effort=function_args.get("reasoning_effort"),
             parent_agent=self,
+        )
+
+    def _dispatch_worker_interface(self, function_name: str, function_args: dict) -> str:
+        """Translate one session-advertised worker call without changing transcript names."""
+        from agent.worker_interfaces import dispatch_worker_interface_call
+
+        return dispatch_worker_interface_call(
+            self, function_name, function_args, self._dispatch_delegate_task
         )
 
     _invoke_tool = _forward("agent.agent_runtime_helpers", "invoke_tool")

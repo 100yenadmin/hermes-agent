@@ -122,7 +122,12 @@ def refresh_agent_mcp_tools(
         skip_tool_search_assembly=True,
     ) or [])
     executable_names = {_def_name(t) for t in raw_defs if _def_name(t)}
+    from agent.worker_interfaces import canonical_worker_capability, project_worker_tool_definitions
+
+    selection = getattr(agent, "_worker_interface_selection", None)
     new_defs = list(get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=quiet_mode) or [])
+    if selection is not None:
+        new_defs = project_worker_tool_definitions(new_defs, selection)
     new_names = {_def_name(t) for t in new_defs}
     worker_ceiling = getattr(agent, "_worker_effective_tool_names", None)
     if isinstance(worker_ceiling, (set, frozenset, list, tuple)):
@@ -138,8 +143,12 @@ def refresh_agent_mcp_tools(
                 presentation_names.update(BRIDGE_TOOL_NAMES)
         except Exception:  # noqa: BLE001
             pass
-        new_defs = [item for item in new_defs if _def_name(item) in presentation_names]
-        new_names.intersection_update(presentation_names)
+        new_defs = [
+            item for item in new_defs
+            if canonical_worker_capability(selection, _def_name(item)) in presentation_names
+            or _def_name(item) in presentation_names
+        ]
+        new_names = {_def_name(item) for item in new_defs if _def_name(item)}
     # Post-build families re-appended on LOCALS only; live attributes untouched until publish.
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
     _reinject_authorized_dynamic_tools(agent, new_defs, new_names)

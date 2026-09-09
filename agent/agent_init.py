@@ -1062,6 +1062,17 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     except Exception:
         agent._tool_snapshot_generation = 0
     import model_tools
+    from agent.worker_interfaces import (
+        bind_worker_interface, project_worker_tool_definitions, resolve_worker_interface,
+    )
+    from hermes_cli.config import load_config
+
+    # Resolve once per agent/session. A later config or qualification change is
+    # intentionally deferred to the next session so the tool schema/history
+    # vocabulary remains byte-stable for prompt caching and provider replay.
+    unresolved_worker_interface = resolve_worker_interface(
+        load_config() or {}, provider=agent.provider, model=agent.model
+    )
     raw_tool_defs = model_tools.get_tool_definitions(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode, skip_tool_search_assembly=True,
@@ -1072,9 +1083,15 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     agent._executable_tool_names = {
         tool["function"]["name"] for tool in raw_tool_defs if tool.get("function", {}).get("name")
     }
-    agent.tools = model_tools.get_tool_definitions(
-        enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
+    agent._worker_interface_selection = bind_worker_interface(
+        unresolved_worker_interface, raw_tool_defs
+    )
+    agent.tools = project_worker_tool_definitions(
+        model_tools.get_tool_definitions(
+            enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        ),
+        agent._worker_interface_selection,
     )
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()

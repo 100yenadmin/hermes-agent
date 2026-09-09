@@ -1275,6 +1275,13 @@ DEFAULT_CONFIG = {
         # deliverable). Async-delegation results are NEVER suppressed.
         "surface_child_process_notifications": False,
     },
+    # Model-facing worker vocabulary. "auto" uses only provider/model pairs
+    # qualified by recorded live evidence; otherwise it preserves Hermes's
+    # canonical delegate_task surface. Explicit codex/claude styles are
+    # experimental presentation adapters and never alter model routing.
+    "orchestration": {
+        "interface": "auto",  # auto | hermes | codex | claude
+    },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.
     "prefill_messages_file": "",

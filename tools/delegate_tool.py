@@ -701,7 +701,7 @@ def delegate_task(
             }
         return json.dumps({"success": True, **catalog}, ensure_ascii=False)
     if normalized_action in {
-        "status", "inspect", "completions", "message", "wait", "cancel", "reconcile", "resume", "ack",
+        "status", "inspect", "completions", "message", "wait", "interrupt", "cancel", "reconcile", "resume", "ack",
     }:
         from agent.subagent_lifecycle import SubagentLifecycleError, SubagentLifecycleService
         if normalized_action == "message" and not worker_id:
@@ -735,7 +735,7 @@ def delegate_task(
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
     if normalized_action and normalized_action != "spawn":
         return tool_error(
-            f"Unknown action '{action}'. Use spawn, discover, status, inspect, completions, message, wait, cancel, "
+            f"Unknown action '{action}'. Use spawn, discover, status, inspect, completions, message, wait, interrupt, cancel, "
             "reconcile, resume, ack, list, steer, or stop.")
 
     top_role = _normalize_role(role)
@@ -1025,7 +1025,7 @@ DELEGATE_TASK_SCHEMA = {
                 "string",
                 "Default 'spawn'. 'discover' returns configured worker profiles. Durable worker actions are "
                 "'status', 'inspect' (explicit visible conversation plus receipt metadata), 'completions', "
-                "'message', 'wait', 'cancel', 'reconcile', 'resume', and 'ack'. "
+                "'message', 'wait', 'interrupt' (one run), 'cancel' (worker tree), 'reconcile', 'resume', and 'ack'. "
                 "Legacy live controls are "
                 "'list' = ids/goals/status/transcripts; 'steer' = queue "
                 "course-correction text into one child (subagent_id + "
@@ -1034,7 +1034,7 @@ DELEGATE_TASK_SCHEMA = {
                 "Control actions return immediately; goal/tasks are ignored unless spawning.",
                 enum=[
                     "spawn", "discover", "status", "inspect", "completions", "message", "wait",
-                    "cancel", "reconcile", "resume", "ack", "list", "steer", "stop",
+                    "interrupt", "cancel", "reconcile", "resume", "ack", "list", "steer", "stop",
                 ],
             ),
             "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),

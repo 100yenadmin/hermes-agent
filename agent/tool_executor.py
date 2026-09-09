@@ -446,12 +446,15 @@ def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _Parse
         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
         exact = getattr(agent, "_worker_effective_tool_names", None)
         if scope_block is None and isinstance(exact, (set, frozenset, list, tuple)):
+            from agent.worker_interfaces import canonical_worker_capability
+
             try:
                 from tools import tool_search as _ts
                 bridge = _ts.is_bridge_tool(name)
             except Exception:
                 bridge = False
-            if not bridge and name not in exact:
+            selection = getattr(agent, "_worker_interface_selection", None)
+            if not bridge and canonical_worker_capability(selection, name) not in exact:
                 scope_block = f"'{name}' is not permitted by this worker's effective tool policy."
     return _ParsedCall(tool_call, name, args, [], parse_error, scope_block)
 
@@ -853,7 +856,14 @@ def _run_sequential_tool_execution_middleware(
     """Run one sequential call on a worker thread under the concurrent executor's deadline.
     Interactive tools (``clarify``) own their wait via ``agent.clarify_timeout``; the
     generic deadline would report ``tool_timeout`` while the prompt is still live."""
-    timeout_s = None if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS else _resolve_sequential_tool_timeout()
+    from agent.worker_interfaces import is_worker_interface_tool
+
+    timeout_s = None if (
+        function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS
+        or is_worker_interface_tool(
+            getattr(agent, "_worker_interface_selection", None), function_name
+        )
+    ) else _resolve_sequential_tool_timeout()
     ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, middleware_trace)
     kwargs = dict(ref.middleware_kwargs(), execute=execute, scope_block=scope_block, display_index=display_index)
     if function_name in _NEVER_PARALLEL_TOOLS:
@@ -1537,15 +1547,22 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     function_name, function_args, effective_task_id, tool_call_id, middleware_trace = (
         ref.name, ref.args, ref.task_id, ref.call_id, ref.trace,
     )
-    if function_name != "delegate_task" and function_name in INLINE_TOOL_EXECUTORS:
+    from agent.worker_interfaces import is_worker_interface_tool
+
+    selection = getattr(agent, "_worker_interface_selection", None)
+    if not is_worker_interface_tool(selection, function_name) and function_name in INLINE_TOOL_EXECUTORS:
         # Agent-level tools that need live AIAgent state; table shared with invoke_tool.
         inline_executor = INLINE_TOOL_EXECUTORS[function_name]
         inline_ctx = InlineToolContext(effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages)
         return _SequentialDispatch(lambda next_args: inline_executor(agent, next_args, inline_ctx), finish_in_finally=False)
-    if function_name == "delegate_task":
+    if is_worker_interface_tool(selection, function_name):
         spinner = _start_quiet_tool_spinner(agent, function_name, function_args, label=_delegate_spinner_label(function_args))
         agent._delegate_spinner = spinner
-        return _SequentialDispatch(agent._dispatch_delegate_task, spinner=spinner, is_delegate=True)
+        return _SequentialDispatch(
+            lambda next_args: agent._dispatch_worker_interface(function_name, next_args),
+            spinner=spinner,
+            is_delegate=True,
+        )
     if agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
         return _SequentialDispatch(
             execute=lambda next_args: agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages),

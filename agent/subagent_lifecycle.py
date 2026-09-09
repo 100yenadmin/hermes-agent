@@ -522,7 +522,13 @@ def dispatch_worker_nested_tool(tool_name: str, tool_args: dict, *, task_id: str
         admitted = before_worker_nested_tool(agent, tool_call_id)
     except Exception as exc:
         return tool_error(str(exc))
-    result = handle_function_call(tool_name, tool_args, task_id=task_id)
+    from agent.worker_interfaces import is_worker_interface_tool
+
+    selection = getattr(agent, "_worker_interface_selection", None)
+    if is_worker_interface_tool(selection, tool_name):
+        result = agent._dispatch_worker_interface(tool_name, tool_args)
+    else:
+        result = handle_function_call(tool_name, tool_args, task_id=task_id)
     if admitted:
         checkpoint_worker_nested_tool_result(agent, tool_call_id)
     return result
@@ -1118,6 +1124,68 @@ class SubagentLifecycleService:
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
                 selected = store.get_run(selected["run_id"], owner)
             return self._safe_run_snapshot(selected)
+        if normalized == "interrupt":
+            if selected["status"] in {"SUCCEEDED", "FAILED", "INTERRUPTED", "CANCELLED"}:
+                return {
+                    **self._safe_run_snapshot(selected),
+                    "interrupt_requested": False,
+                    "already_terminal": True,
+                }
+            with _REGISTRY.lock:
+                live_record = next((
+                    item for item in _REGISTRY.records.values()
+                    if item.owner_session_id == owner and item.worker_id == worker_id
+                    and item.run_id == selected["run_id"] and item.agent is not None
+                    and item.state not in {
+                        SubagentState.SUCCEEDED, SubagentState.FAILED,
+                        SubagentState.INTERRUPTED, SubagentState.CANCELLED,
+                    }
+                ), None)
+            if selected["status"] == "PENDING":
+                cancelled = store.cancel_pending_run(selected["run_id"], owner)
+                if live_record is not None:
+                    with _REGISTRY.lock:
+                        live_record.state = SubagentState.CANCELLED
+                        live_record.result = SubagentResult(
+                            live_record.handle,
+                            SubagentState.CANCELLED,
+                            True,
+                            completed_at=time.time(),
+                            error_classification="CANCELLED",
+                            error_message="Worker run interrupted before it started.",
+                        )
+                        live_record.updated_at = time.time()
+                    with contextlib.suppress(Exception):
+                        live_record.agent.close()
+                    live_record.agent = None
+                current = cancelled or store.get_run(selected["run_id"], owner)
+                return {
+                    **self._safe_run_snapshot(current),
+                    "interrupt_requested": bool(cancelled),
+                    "scope": "run",
+                }
+            if live_record is None:
+                return {
+                    **self._safe_run_snapshot(selected),
+                    "interrupt_requested": False,
+                    "unsupported": True,
+                    "reason": "The running worker is not attached to this process; tree cancellation remains separate.",
+                }
+            accepted = request_hard_interrupt(
+                live_record.agent,
+                "Worker run interruption requested by its owner.",
+                tool_reason="worker run interruption requested",
+            )
+            if accepted:
+                with _REGISTRY.lock:
+                    live_record.state = SubagentState.CANCEL_REQUESTED
+                    live_record.updated_at = time.time()
+            return {
+                **self._safe_run_snapshot(selected),
+                "interrupt_requested": bool(accepted),
+                "unsupported": not accepted,
+                "scope": "run",
+            }
         if normalized == "cancel":
             subtree = self._subtree_ids(store, owner, worker_id)
             cancelled_pending = store.cancel_pending_runs(subtree, owner)
@@ -1187,6 +1255,10 @@ class SubagentLifecycleService:
                 raise SubagentLifecycleError("action='resume' requires message as the next worker turn.")
             if selected["run_id"] != runs[-1]["run_id"]:
                 raise SubagentLifecycleError("Resume must link from the worker's latest run.")
+            if selected["status"] == "CANCELLED":
+                raise SubagentLifecycleError(
+                    "Cancelled workers stay cancelled and cannot accept another turn."
+                )
             route = dict((worker.get("policy") or {}).get("route") or {})
             prior = SubagentHandle(
                 PUBLIC_CONTRACT_VERSION, "durable-snapshot", owner, None, worker["created_at"],
