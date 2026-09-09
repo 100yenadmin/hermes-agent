@@ -89,7 +89,7 @@ Do not infer an exactly-once guarantee from any checkmark. Hermes worker leases,
 Imagine asking: “Compare these proposals, have a second participant check the result, then revise it if needed.” In the planned integrated workflow:
 
 1. The parent discovers the user-created profiles and their permitted actions.
-2. It creates a comparison task and a dependent review task in Kanban.
+2. It creates the comparison task and any dependent tasks in Kanban. Review is a separate phase of a task's lifecycle.
 3. It assigns the comparison to an eligible worker or Bot. The participant's own route and tool restrictions still apply.
 4. While the participant works, the parent sends guidance. The result identifies whether that guidance is queued or consumed.
 5. The participant supplies a result. Kanban makes review available; it does not equate that result with final acceptance.
@@ -99,6 +99,14 @@ Imagine asking: “Compare these proposals, have a second participant check the 
 <img src="/img/worker-orchestration/team-sequence.svg" width="1100" alt="Planned team sequence: parent creates dependent tasks, a worker supplies a result, a reviewer requests changes, the worker follows up with retained context, and Kanban records acceptance." />
 
 If Hermes restarts, each service restores its own records. A known completed step is collected, not executed again. If a tool may already have performed an external action, the workflow pauses for reconciliation. A saved workflow adds repeatability to these steps, not permission to bypass them.
+
+The planned task-to-worker connection records the assignment before scheduling
+execution. That ordering matters: if Hermes stops between creating a worker and
+remembering which task it belongs to, a retry must find that worker rather than
+launch a second copy. The task claim, worker assignment and execution reference
+keep their own identities and permission checks.
+
+<img src="/img/worker-orchestration/task-run-link.svg" width="1100" alt="Planned restart-safe assignment: claim task, prepare pending worker, attach its reference, schedule that recorded run, and separately review the result. Each restart point reuses records or pauses for reconciliation." />
 
 ## Model-facing interface is not execution backend
 

@@ -17,7 +17,7 @@
 <rect x="949" y="110" width="210" height="65" rx="12" fill="#0f172a" stroke="#fb923c" stroke-width="2"/>
 <text x="1054.0" y="140" class="label" text-anchor="middle">Reviewer</text>
 <path d="M145 220L448 220" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
-<text x="296.5" y="208" class="sub" text-anchor="middle">1. Create task + review dependency</text>
+<text x="296.5" y="208" class="sub" text-anchor="middle">1. Create dependent tasks</text>
 <path d="M145 285L751 285" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
 <text x="448.0" y="273" class="sub" text-anchor="middle">2. Start permitted assignment</text>
 <path d="M145 350L751 350" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
