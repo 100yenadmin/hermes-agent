@@ -79,15 +79,16 @@ def _observation(secret: str) -> dict:
 
 
 def _common(fixture: dict) -> dict:
+    policy = fixture["execution_policy"]
     return {
         "candidate_sha": "a" * 40,
         "requested_interface": "codex",
         "limits": {
-            "max_parent_iterations": 24,
-            "max_child_iterations": 3,
-            "max_children": 2,
-            "max_seconds": 360,
-            "max_child_seconds": 90,
+            "max_parent_iterations": policy["max_parent_iterations"],
+            "max_child_iterations": policy["max_child_iterations"],
+            "max_children": policy["max_children"],
+            "max_seconds": policy["max_seconds"],
+            "max_child_seconds": policy["max_child_seconds"],
             "max_parent_tokens": 4096,
         },
     }
@@ -104,7 +105,7 @@ def test_synthetic_success_builds_allowlisted_passing_report():
     assert [item["id"] for item in report["assertions"]] == [f"TQ-{index}" for index in range(1, 9)]
     assert all(item["passed"] for item in report["assertions"])
     assert set(fixture["required_receipt_fields"]).issubset(report)
-    assert report["limits"]["max_parent_iterations"] == 24
+    assert report["limits"]["max_parent_iterations"] == 32
     assert secret not in json.dumps(report)
 
 
@@ -169,3 +170,18 @@ def test_parent_uses_team_toolset_and_reports_only_observed_wire_identity():
         "transmitted_model": "unknown",
         "transmitted_reasoning_effort": "unknown",
     }
+
+
+def test_v2_preserves_v1_assertions_and_applies_only_the_bounded_source_correction():
+    v1_path = runner.FIXTURE_PATH.with_name("team-qualification-v1.json")
+    v1 = runner.load_fixture(v1_path)
+    v2 = runner.load_fixture()
+
+    assert v1["execution_policy"]["max_parent_iterations"] == 24
+    assert v2["execution_policy"]["max_parent_iterations"] == 32
+    assert v2["execution_policy"]["minimum_expected_tool_operations"] == (
+        1 + 2 + 4 + 1 + (5 * 3) + 2 + 1 + 1
+    )
+    assert v2["scenario"]["assertions"] == v1["scenario"]["assertions"]
+    assert "targets set to a nonempty array" in v2["scenario"]["prompt_template"]
+    assert v2["change_control"]["supersedes_fixture"] == "team-qualification-v1"

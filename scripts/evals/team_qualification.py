@@ -28,7 +28,7 @@ from typing import Any, Iterable, Mapping
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _root = str(REPO_ROOT)
 sys.path[:] = [_root, *(item for item in sys.path if item != _root)]
-FIXTURE_PATH = REPO_ROOT / "tests/fixtures/orchestration/team-qualification-v1.json"
+FIXTURE_PATH = REPO_ROOT / "tests/fixtures/orchestration/team-qualification-v2.json"
 UNKNOWN = "unknown"
 EXPECTED_TOOLS = {"worker_capabilities", "team_task", "wait_agent", "inspect_agent", "worker_control"}
 PARENT_TOOLSETS = ("delegation", "kanban")
