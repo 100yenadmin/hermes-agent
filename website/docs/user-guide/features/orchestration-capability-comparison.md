@@ -9,7 +9,7 @@ An agent **harness** supplies the model's tools, permissions, conversations and 
 
 Hermes already has four useful building blocks: delegated workers, full-profile Bots, Bot rooms and Kanban tasks. The worker changes in [PR #106268](https://github.com/NousResearch/hermes-agent/pull/106268) add retained worker conversations, configurable routes and durable receipts. The follow-up work described below connects these capabilities without replacing their separate ownership and recovery rules.
 
-**Evidence date: September 9, 2026.** The comparison uses official vendor documentation and inspected Hermes source. It is not a benchmark or a claim that a draft PR is installed. A checkmark means the named capability exists within its stated limits; it does not mean identical behavior across products.
+**Competitor evidence date: September 9, 2026. Hermes delivery status refreshed September 10.** The comparison uses official vendor documentation and inspected Hermes source. It is not a benchmark or a claim that a draft PR is installed. A checkmark means the named capability exists within its stated limits; it does not mean identical behavior across products.
 
 ## The big picture
 
@@ -36,41 +36,41 @@ The Codex reference is its documented custom-agent controls plus the exposed har
 
 ### Selecting and controlling workers
 
-| Capability | Codex | Claude Code | OpenClaw | Hermes main | Worker PR | Planned follow-up |
-| --- | --- | --- | --- | --- | --- | --- |
-| User-defined worker profiles | ✓ | ✓ | ✓ | ◐ Bots and delegation defaults | ✓ | Preserve user choice |
-| Per-worker model | ✓ | ✓ | ✓ | ◐ Execution-path dependent | ✓ | Preserve route across interfaces |
-| Per-worker thinking level | ✓ | ✓ Subagents; ◐ teams inherit | ✓ | ◐ Execution-path dependent | ✓ Where supported | Qualify model/interface combinations |
-| Parallel delegation | ✓ | ✓ | ✓ | ✓ | ✓ | Expose through selected interface |
-| Running-worker guidance | ✓ | ✓ | ✓ Parent controls | ◐ Steer/Bot paths | ✓ | Explicit delivery and wake semantics |
-| Follow-up with retained context | ✓ | ✓ | ✓ Retained sessions | ◐ Bots/Kanban | ✓ Workers | Same controls across eligible objects |
-| Nested delegation | ✓ Policy-dependent | ✓ Subagents; ✗ nested teams | ✓ | ◐ Path-dependent | ✓ Tree limits | Preserve limits in every adapter |
-| Tool and permission restrictions | ✓ | ✓ | ◐ Native/ACP differ | ✓ Path-dependent | ✓ Native/MCP/code ceilings | Recheck at the owning executor |
+| Capability | Codex | Claude Code | OpenClaw | Hermes main | Worker PR | Implemented follow-ups (draft) | Remaining / limits |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| User-defined worker profiles | ✓ | ✓ | ✓ | ◐ Bots and delegation defaults | ✓ | ✓ Preserved | User-selected profiles remain the default |
+| Per-worker model | ✓ | ✓ | ✓ | ◐ Execution-path dependent | ✓ | ✓ Route preserved by adapters | No compulsory model family |
+| Per-worker thinking level | ✓ | ✓ Subagents; ◐ teams inherit | ✓ | ◐ Execution-path dependent | ✓ Where supported | ✓ Supported profile effort preserved | Automatic interface qualification disabled |
+| Parallel delegation | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ Shared worker service | Saved parallel workflow acceptance pending |
+| Running-worker guidance | ✓ | ✓ | ✓ Parent controls | ◐ Steer/Bot paths | ✓ | ✓ Worker controls and team guidance | Live Bot/room delivery not established |
+| Follow-up with retained context | ✓ | ✓ | ✓ Retained sessions | ◐ Bots/Kanban | ✓ Workers | ✓ Retained team corrections exercised | Saved workflow restart acceptance pending |
+| Nested delegation | ✓ Policy-dependent | ✓ Subagents; ✗ nested teams | ✓ | ◐ Path-dependent | ✓ Tree limits | ✓ Existing tree limits preserved | No broader native-harness parity claim |
+| Tool and permission restrictions | ✓ | ✓ | ◐ Native/ACP differ | ✓ Path-dependent | ✓ Native/MCP/code ceilings | ✓ Adapter and service authorization tests | Recheck final cumulative candidate |
 
 Sources: [Codex subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents), [Claude subagents](https://code.claude.com/docs/en/sub-agents), [Claude teams](https://code.claude.com/docs/en/agent-teams), [OpenClaw subagents](https://docs.openclaw.ai/tools/subagents), [OpenClaw ACP](https://docs.openclaw.ai/tools/acp-agents), [worker configuration](worker-profiles.md).
 
 ### Collaboration and repeatable work
 
-| Capability | Codex | Claude Code | OpenClaw | Hermes main | Worker PR | Planned follow-up |
-| --- | --- | --- | --- | --- | --- | --- |
-| Peer messages | ✓ Inspected harness | ✓ Named subagents/teams | ◐ Native children restricted | ✓ Authorized Bots | ✓ Policy-controlled siblings | Typed targets and per-recipient outcomes |
-| Shared task dependencies and claims | ? Dedicated team protocol | ✓ Teams | ? Shared claim protocol | ✓ Kanban | ✓ Existing Kanban | Connect tasks to workers and rooms |
-| Grouped collaboration | ◐ Parent coordinates | ✓ Experimental teams | ✓ Experimental Swarm | ✓ Rooms/Kanban | ✓ Existing systems plus workers | One coherent parent workflow |
-| Repeatable scripted orchestration | ? Dedicated runtime | ✓ Dynamic workflows | ✓ Swarm/TaskFlow | ◐ Task automation | ◐ Unified interface missing | Saved bounded workflow definitions |
-| Independent-session communication | ✓ App controls inspected; deployment-dependent | ✓ Local and remote sessions | ✓ Authorized session routes | ✓ Eligible Bot/peer routes | Preserved | Discover only eligible targets |
-| One discovery surface for workers, Bots, rooms and tasks | Not applicable | ◐ Multiple modes | ◐ Multiple runtimes | ✗ | ✗ | Typed, permission-filtered references |
-| Model-appropriate interfaces over one Hermes core | Not applicable | Not applicable | Not assessed | ✗ | ✗ | Canonical, Codex-style and Claude-style adapters |
+| Capability | Codex | Claude Code | OpenClaw | Hermes main | Worker PR | Implemented follow-ups (draft) | Remaining / limits |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Peer messages | ✓ Inspected harness | ✓ Named subagents/teams | ◐ Native children restricted | ✓ Authorized Bots | ✓ Policy-controlled siblings | ✓ Typed targets; individual team guidance outcomes | Live Bot/room recipients not tested |
+| Shared task dependencies and claims | ? Dedicated team protocol | ✓ Teams | ? Shared claim protocol | ✓ Kanban | ✓ Existing Kanban | ◐ Team connection implemented and tested | Integrated process restart pending |
+| Grouped collaboration | ◐ Parent coordinates | ✓ Experimental teams | ✓ Experimental Swarm | ✓ Rooms/Kanban | ✓ Existing systems plus workers | ◐ Team review/correction live pilot passed | Final team delivery gates pending |
+| Repeatable scripted orchestration | ? Dedicated runtime | ✓ Dynamic workflows | ✓ Swarm/TaskFlow | ◐ Task automation | ◐ Unified interface missing | ✗ Saved workflow runtime unfinished | Versioned bounded definitions, branches and joins |
+| Independent-session communication | ✓ App controls inspected; deployment-dependent | ✓ Local and remote sessions | ✓ Authorized session routes | ✓ Eligible Bot/peer routes | Preserved | ✓ Eligible targets discoverable | Existing recipient authority remains required |
+| One discovery surface for workers, Bots, rooms and tasks | Not applicable | ◐ Multiple modes | ◐ Multiple runtimes | ✗ | ✗ | ✓ #106647: read-only typed references | No discovery-triggered recovery |
+| Model-appropriate interfaces over one Hermes core | Not applicable | Not applicable | Not assessed | ✗ | ✗ | ✓ #106463: three interface styles | Automatic registry empty |
 
 Sources: [Claude teams](https://code.claude.com/docs/en/agent-teams), [Claude cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging), [Claude dynamic workflows](https://code.claude.com/docs/en/workflows), [OpenClaw Swarm](https://docs.openclaw.ai/tools/swarm), [OpenClaw session tools](https://docs.openclaw.ai/concepts/session-tool), [OpenClaw TaskFlow](https://docs.openclaw.ai/automation/taskflow), [Kanban](kanban.md).
 
 ### Persistence and evidence
 
-| Capability | Codex | Claude Code | OpenClaw | Hermes main | Worker PR | Planned follow-up |
-| --- | --- | --- | --- | --- | --- | --- |
-| Restart-safe worker continuation | ? Full contract | ◐ Mode-dependent | ◐ Mode-dependent | ◐ Bots/Kanban contracts | ✓ Tested checkpoints; uncertainty pauses | Preserve each owner's recovery rules |
-| Durable communication evidence | ? Full contract | ◐ Mailbox/transcript contracts | ◐ Path-specific receipts | ✓ Bot ingress, with limits | ✓ Worker queues and ACKs | Cross-link distinct receipts |
-| Requested vs transmitted route evidence | ◐ Configured metadata | ◐ Configured metadata | ◐ Audit/runtime dependent | ◐ Path-dependent | ✓ Separate fields | Include selected interface/version |
-| Cross-host shared task board | Not assessed | Not established by team docs | Not established by reviewed docs | ✗ Single-host Kanban | ✗ | Outside this follow-up |
+| Capability | Codex | Claude Code | OpenClaw | Hermes main | Worker PR | Implemented follow-ups (draft) | Remaining / limits |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Restart-safe worker continuation | ? Full contract | ◐ Mode-dependent | ◐ Mode-dependent | ◐ Bots/Kanban contracts | ✓ Tested checkpoints; uncertainty pauses | ✓ Worker process fixtures; ◐ integrated teams | Team and saved-workflow process proof pending |
+| Durable communication evidence | ? Full contract | ◐ Mailbox/transcript contracts | ◐ Path-specific receipts | ✓ Bot ingress, with limits | ✓ Worker queues and ACKs | ✓ Distinct task/run/message references | No external exactly-once guarantee |
+| Requested vs transmitted route evidence | ◐ Configured metadata | ◐ Configured metadata | ◐ Audit/runtime dependent | ◐ Path-dependent | ✓ Separate fields | ✓ Interface/version plus live team wire receipts | Actual provider identity and cost may remain unknown |
+| Cross-host shared task board | Not assessed | Not established by team docs | Not established by reviewed docs | ✗ Single-host Kanban | ✗ | ✗ | Outside this plan |
 
 Do not infer an exactly-once guarantee from any checkmark. Hermes worker leases, Bot claims and hosted-room fencing are different contracts. A Bot ingress consumer's crashed claim must not be recycled by applying the worker lease-expiry rule. Hosted-room authority must not be transferred merely because a host is temporarily unreachable. See the [worker recovery explanation](worker-orchestration-tour.md#what-happens-if-hermes-stops-halfway-through), [Kanban](kanban.md) and [Claude session storage](https://code.claude.com/docs/en/agent-sdk/session-storage).
 
@@ -86,7 +86,7 @@ Do not infer an exactly-once guarantee from any checkmark. Hermes worker leases,
 
 ## A team workflow in ordinary language
 
-Imagine asking: “Compare these proposals, have a second participant check the result, then revise it if needed.” In the planned integrated workflow:
+Imagine asking: “Compare these proposals, have a second participant check the result, then revise it if needed.” In the draft integrated team workflow:
 
 1. The parent discovers the user-created profiles and their permitted actions.
 2. It creates the comparison task and any dependent tasks in Kanban. Review is a separate phase of a task's lifecycle.
@@ -100,7 +100,7 @@ Imagine asking: “Compare these proposals, have a second participant check the 
 
 If Hermes restarts, each service restores its own records. A known completed step is collected, not executed again. If a tool may already have performed an external action, the workflow pauses for reconciliation. A saved workflow adds repeatability to these steps, not permission to bypass them.
 
-The planned task-to-worker connection records the assignment before scheduling
+The implemented draft task-to-worker connection records the assignment before scheduling
 execution. That ordering matters: if Hermes stops between creating a worker and
 remembering which task it belongs to, a retry must find that worker rather than
 launch a second copy. The task claim, worker assignment and execution reference
@@ -123,15 +123,35 @@ These are the planned increment-four contracts. They add control records to the 
 | Choice | What changes | What does not follow from it |
 | --- | --- | --- |
 | Provider/model selection | Which configured model receives requests | It does not install the vendor's harness |
-| Planned Codex-style/Claude-style interface | The tool vocabulary and documented request semantics presented to the model | It does not grant extra tools, change the model, or imply native runtime parity |
+| Draft Codex-style/Claude-style interface | The tool vocabulary and documented request semantics presented to the model | It does not grant extra tools, change the model, or imply native runtime parity |
 | Hermes native worker | Hermes owns the loop, tool enforcement, conversation and receipts | A provider-side session is not required for the Hermes-owned checkpoint |
 | Existing optional Codex app-server runtime | Codex owns its execution loop and sandbox; Hermes projects events and offers supported callbacks | Stateless callbacks currently do not expose `delegate_task`; this worker PR does not remove that boundary |
 
 The [Codex app-server runtime guide](codex-app-server-runtime.md) documents the existing backend and its Kanban callback path. Extending that integration is separate from this interface work.
 
-The proposed automatic selection policy is explicit user setting, then a qualified model/profile match, then the canonical Hermes interface. Unknown models retain their chosen provider/model. A qualified entry needs live evidence; a matching model-family name is not enough. Interface schemas stay fixed within a conversation to preserve prompt caching.
+The implemented automatic selection policy is explicit user setting, then a qualified model/profile match, then the canonical Hermes interface. Unknown models retain their chosen provider/model. A qualified entry needs live evidence; a matching model-family name is not enough. Interface schemas stay fixed within a conversation to preserve prompt caching.
 
 ## Implementation and proof boundaries
+
+The corrected team runtime is `c7fb32110494054fe0ed06bb8267b7794dce8c34`.
+Its revised two-provider pilot passed 8/8 checks; the earlier 5/8 sample is retained.
+The dependent worker succeeded, but its task was not separately accepted. The
+pilot used temporary profiles, synthetic assignments and no worker tools or live
+Bot/room recipients. It does not enable automatic interface qualification.
+
+[Exact-target hosted validation](https://github.com/100yenadmin/hermes-agent-for-upstream-PR-only/actions/runs/34378493480)
+passed every mapped orchestration test file, Windows and Nix, but the complete
+Python job failed two quickstart assertions (46,503 passed; 449 skipped).
+[Baseline comparison](https://github.com/100yenadmin/hermes-agent-for-upstream-PR-only/actions/runs/34385960828)
+reproduced the same failures on upstream main's recorded baseline and the team
+candidate. A focused fixture correction is being validated. The upstream team
+PR still advertises its older head; fork candidate evidence is identified separately.
+
+Existing team recovery tests rebuild a service inside one process. Real worker
+process-kill tests do not establish integrated-team process restart. That proof
+and saved-workflow execution remain open; the planned labels in the diagrams
+must be read with this table's implementation and evidence status.
+
 
 The interface follow-up is now published as [draft PR #106463](https://github.com/NousResearch/hermes-agent/pull/106463).
 Its [controlled live pilot](orchestration-interface-pilot.md) includes passing and
@@ -152,14 +172,14 @@ main/worker baselines above:
 | --- | --- | --- |
 | One selected worker interface per conversation | ✓ #106463 | Deterministic conformance and independent review passed; live pilot has both passes and failures; automatic qualification registry remains empty |
 | Discover permitted workers, runs, Bots, rooms and tasks | ✓ #106647 | Read-only discovery, typed references and action-time checks exercised; room grants permit inspection only |
-| Coordinate dependency tasks, review and retained corrections | ✓ Draft #106696, tested scope | Nine focused cases and independent review passed; the [controlled team pilot](orchestration-team-pilot.md) passed8/8 on its revised bounded scenario; hosted validation remains separately tracked |
+| Coordinate dependency tasks, review and retained corrections | ◐ Draft #106696 | Corrected runtime passed 9 focused tests, targeted independent review and an 8/8 two-provider pilot; two actual-process recovery tests and the quickstart fixture correction passed hosted CI. Final cumulative validation remains pending |
 | Repeat a saved bounded workflow after restart | Planned | Workflow execution acceptance is not yet established |
 
 Discovery answers “what can this parent see and use?” It does not create a room,
 assign a task, wake a Bot, or recover a worker. A discovered run points back to
 its owning worker. Every later control request still has to pass the owning
-service's permission checks. Integrated teams and saved workflows still need
-their own implementation and acceptance evidence.
+service's permission checks. Integrated teams have their own focused and live evidence; saved workflows are
+partially implemented. Their remaining recovery and delivery gates are separate.
 
 | Stage | Deliverable | Required observable proof |
 | --- | --- | --- |
