@@ -1,49 +1,56 @@
-name: Fork exact-head validation (quickstart comparison)
+name: Fork exact-head validation (focused files)
 permissions:
   contents: read
 concurrency:
   group: quickstart-comparison-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  quickstart-comparison:
-    name: Quickstart ${{ matrix.label }}
+  focused-contracts:
+    name: Focused Python contracts
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      EXPECTED_SHA: ${{ matrix.sha }}
+      EXPECTED_SHA: ${{ inputs.target_sha }}
       OPENROUTER_API_KEY: ''
       OPENAI_API_KEY: ''
       NOUS_API_KEY: ''
       HERMES_TEST_WORKERS: '1'
       HERMES_TEST_FILE_RETRIES: '0'
+      TEST_PATHS: ${{ inputs.test_paths }}
     steps:
     - name: Checkout exact candidate
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       with:
-        ref: ${{ matrix.sha }}
+        ref: ${{ inputs.target_sha }}
     - name: Verify exact candidate
       shell: bash
-      run: "if [[ ! \"$EXPECTED_SHA\" =~ ^[0-9a-f]{40}$ ]]; then\n  exit 2\nfi\ntest\
-        \ \"$(git rev-parse HEAD)\" = \"$EXPECTED_SHA\"\n"
+      run: |
+        if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+          exit 2
+        fi
+        test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
     - name: Install ripgrep (prebuilt binary)
       shell: bash
-      run: "set -euo pipefail\nRG_VERSION=15.1.0\nRG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599\n\
-        RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz\ncurl -sSfL\
-        \ --retry 3 --retry-delay 5 -o \"$RG_TARBALL\" \\\n  \"https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}\"\
-        \necho \"${RG_SHA256}  ${RG_TARBALL}\" | sha256sum -c -\ntar -xzf \"$RG_TARBALL\"\
-        \nsudo mv \"ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg\" /usr/local/bin/rg\n\
-        rm -rf \"$RG_TARBALL\" \"ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl\"\
-        \nrg --version\n"
+      run: |
+        set -euo pipefail
+        RG_VERSION=15.1.0
+        RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+        RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+        curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+          "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+        echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+        tar -xzf "$RG_TARBALL"
+        sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+        rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+        rg --version
     - name: Install uv
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
       with:
         version: 0.9.28
         enable-cache: true
-        cache-dependency-glob: 'pyproject.toml
-
+        cache-dependency-glob: |
+          pyproject.toml
           uv.lock
-
-          '
     - name: Set up Python 3.11
       uses: ./.github/actions/retry
       with:
@@ -54,41 +61,18 @@ jobs:
         command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic
           --extra mistral --extra fal --extra modal --extra daytona --extra hindsight
           --extra parallel-web
-    - name: Read hardware budget without credentials
+    - name: Run selected contract files
       shell: bash
-      run: 'probe_home=$(mktemp -d)
-
-        env -i HOME="$probe_home" HERMES_HOME="$probe_home" PATH="$PATH" .venv/bin/python
-        - <<''PYCODE''
-
-        from dataclasses import asdict
-
-        import json
-
-        from hermes_cli.local_runtime.hardware import probe_budget
-
-        print(json.dumps({''planning_budget'': asdict(probe_budget(planning=True))},
-        sort_keys=True))
-
-        PYCODE'
-    - name: Run unchanged quickstart contract file
-      shell: bash
-      run: 'uv lock --check
-
+      run: |
+        uv lock --check
         source .venv/bin/activate
-
-        scripts/run_tests.sh tests/hermes_cli/test_local_quickstart.py -j 1 --file-retries
-        0 --tb=short
-
-        '
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-        - label: candidate
-          sha: ${{ inputs.target_sha }}
-        - label: baseline
-          sha: ${{ inputs.baseline_sha }}
+        read -r -a selected_paths <<< "$TEST_PATHS"
+        [[ ${#selected_paths[@]} -gt 0 && ${#selected_paths[@]} -le 12 ]]
+        for selected_path in "${selected_paths[@]}"; do
+          [[ "$selected_path" =~ ^tests/[a-zA-Z0-9_./-]+\.py$ ]]
+          [[ "$selected_path" != *..* && -f "$selected_path" ]]
+        done
+        scripts/run_tests.sh "${selected_paths[@]}" -j 1 --file-retries 0 --tb=short
 'on':
   workflow_dispatch:
     inputs:
@@ -96,8 +80,8 @@ jobs:
         description: Exact 40-character commit SHA to validate
         required: true
         type: string
-      baseline_sha:
-        description: Exact baseline SHA for the same quickstart file on the same runner
-          class
+      test_paths:
+        description: Space-separated repository Python test files
         required: true
         type: string
+        default: tests/hermes_cli/test_local_quickstart.py
