@@ -201,6 +201,7 @@ def run_registered_runtime(agent: Any, runtime_registration: Any, context: Any) 
         tool_inventory=build_runtime_tool_inventory(runtime_tool_schemas),
         session_state=runtime_session_state,
         correlation_id=turn_id,
+        generation_settings={"reasoning": getattr(agent, "reasoning_config", None) or {}},
     )
     runtime_session = get_runtime_session(
         agent,
@@ -219,11 +220,11 @@ def run_registered_runtime(agent: Any, runtime_registration: Any, context: Any) 
         _merge_external_runtime_messages(
             messages, runtime_response.get("messages")
         )
-        runtime_api_calls = runtime_response.get("api_calls", 0)
-        if not isinstance(runtime_api_calls, int) or isinstance(
-            runtime_api_calls, bool
-        ):
-            runtime_api_calls = 0
+        # Finalizer arithmetic counts admitted host work, never hidden native
+        # generations or HTTP calls. The public request count remains nullable.
+        runtime_host_steps = runtime_response.get("host_steps", 1)
+        if type(runtime_host_steps) is not int or runtime_host_steps < 0:
+            raise RuntimeExecutionError("runtime host step count is invalid")
         runtime_failure = dispatched.failure
         runtime_cancelled = dispatched.cancelled
         runtime_final_response = (
@@ -236,7 +237,7 @@ def run_registered_runtime(agent: Any, runtime_registration: Any, context: Any) 
         result = finalize_turn(
             agent,
             final_response=runtime_final_response,
-            api_call_count=max(0, runtime_api_calls),
+            api_call_count=runtime_host_steps,
             interrupted=runtime_cancelled,
             failed=runtime_failure is not None,
             messages=messages,
@@ -255,6 +256,11 @@ def run_registered_runtime(agent: Any, runtime_registration: Any, context: Any) 
             ),
         )
         result["agent_persisted"] = _runtime_persistence_succeeded(agent, result)
+        usage = getattr(agent, "_runtime_last_usage", None)
+        result.update(host_steps=runtime_host_steps,
+            api_calls=getattr(usage, "request_count", None),
+            runtime_turn_count=getattr(usage, "runtime_turn_count", None),
+            request_count_exact=getattr(usage, "request_count", None) is not None)
         if runtime_failure is not None:
             result.update(
                 {

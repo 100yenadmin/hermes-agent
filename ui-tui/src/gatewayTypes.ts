@@ -280,7 +280,7 @@ export interface SessionUsageResponse {
   cache_hit_pct?: number
   cache_read?: number
   cache_write?: number
-  calls?: number
+  calls?: number | null
   compressions?: number
   context_max?: number
   context_percent?: number

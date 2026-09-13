@@ -1896,7 +1896,9 @@ def _get_usage(agent) -> dict:
         "output": g("session_output_tokens", "session_completion_tokens"),
         "reasoning": g("session_reasoning_tokens"), "prompt": g("session_prompt_tokens"),
         "completion": g("session_completion_tokens"), "total": g("session_total_tokens"),
-        "calls": g("session_api_calls"),
+        "calls": None if getattr(agent, "_runtime_request_count_unknown", False) else g("session_api_calls"),
+        "known_calls": g("session_api_calls"),
+        "calls_exact": not bool(getattr(agent, "_runtime_request_count_unknown", False)),
     }
     comp = getattr(agent, "context_compressor", None)
     if comp:

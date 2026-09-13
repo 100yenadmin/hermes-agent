@@ -572,13 +572,13 @@ export function renderRpcResult(response: unknown, name: string): string {
 
   // session.usage — { calls, input, output, total, credits_lines? }
   if ('total' in r || 'input' in r || 'output' in r || 'calls' in r) {
-    const calls = Number(r.calls ?? 0)
+    const calls = r.calls === null || r.calls_exact === false ? null : Number(r.calls ?? 0)
     const input = Number(r.input ?? 0)
     const output = Number(r.output ?? 0)
     const total = Number(r.total ?? 0)
 
     const lines: string[] = [
-      `Usage: ${calls.toLocaleString()} calls · ${input.toLocaleString()} in / ${output.toLocaleString()} out · ${total.toLocaleString()} total`
+      `Usage: ${calls === null ? 'unknown' : calls.toLocaleString()} calls · ${input.toLocaleString()} in / ${output.toLocaleString()} out · ${total.toLocaleString()} total`
     ]
 
     if (Array.isArray(r.credits_lines)) {

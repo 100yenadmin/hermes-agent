@@ -134,7 +134,8 @@ def _context_compressor_lines(agent, ctx, used: int) -> list[str]:
         lines.append(t("gateway.context.last_savings", savings=f"{savings:.0f}"))
     lines += [
         "",
-        t("gateway.context.totals_header", calls=_n(agent, "session_api_calls")),
+        t("gateway.context.totals_header", calls=("unknown" if getattr(agent,
+            "_runtime_request_count_unknown", False) else _n(agent, "session_api_calls"))),
         t("gateway.context.totals_line",
           input=_fmt(_n(agent, "session_input_tokens")),
           output=_fmt(_n(agent, "session_output_tokens")),
