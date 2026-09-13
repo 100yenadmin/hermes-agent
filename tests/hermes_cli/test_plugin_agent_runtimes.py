@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -239,7 +240,8 @@ def test_host_manifest_exports_only_versioned_concrete_capabilities():
     assert "runtime_model_provenance_v1" in manifest["host_capabilities"]
     assert "runtime_tool_inventory_v1" in manifest["host_capabilities"]
     assert "host_tool_request_id_v1" in manifest["host_capabilities"]
-    assert all(capability.endswith("_v1") for capability in manifest["host_capabilities"])
+    assert all(re.fullmatch(r"[a-z][a-z0-9_]*_v[1-9][0-9]*", capability)
+               for capability in manifest["host_capabilities"])
 
 
 def test_machine_readable_runtime_capabilities_match_public_host_contract():

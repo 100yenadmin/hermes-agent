@@ -10,6 +10,11 @@
     "cancellation_v1": {},
     "compaction_events_v1": {},
     "host_approval_v1": {},
+    "host_assistant_updates_v1": {
+      "consumer": "RuntimeHostServices.persist_assistant",
+      "result_type": "RuntimeAssistantUpdate",
+      "ordering": "durable acknowledgment before related tool execution"
+    },
     "host_content_stream_v1": {
       "consumer": "RuntimeHostServices.emit_content",
       "delivery_owner": "host"
@@ -26,6 +31,13 @@
       "consumer": "PluginContext.register_provider_profile",
       "lifecycle": "plugin_owned"
     },
+    "runtime_generation_settings_v1": {
+      "consumer": "RuntimeTurnRequest.generation_settings"
+    },
+    "runtime_history_checkpoint_v1": {
+      "consumer": "RuntimeHostServices.history_checkpoint",
+      "authority": "canonical visible host history"
+    },
     "runtime_model_provenance_v1": {
       "consumer": "RuntimeUsageReceipt",
       "fields": [
@@ -41,6 +53,11 @@
       "consumer": "RuntimeTurnRequest.tool_inventory",
       "surface": "delivered_request"
     },
-    "usage_receipts_v1": {}
+    "usage_receipts_v1": {},
+    "usage_receipts_v2": {
+      "consumer": "RuntimeHostServices.persist_usage",
+      "fields": ["attempt_id", "request_count", "runtime_turn_count", "usage_observed"],
+      "accounting": "idempotent cumulative attempt receipt; unknown requests remain null"
+    }
   }
 }
