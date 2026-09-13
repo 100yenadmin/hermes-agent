@@ -93,3 +93,20 @@ def test_runtime_prefix_is_identical_after_normal_resume(bound):
     # A whitespace-only user edit is content, not dispensable metadata.
     resumed[0]["content"] += " "
     assert build_effective_prompt_messages(resumed) != before
+
+
+def test_runtime_status_reaches_existing_visible_lifecycle_callback(bound):
+    from agent.status_output import StatusOutputMixin
+
+    host, _, _ = bound
+    notices, activity = [], []
+    output = StatusOutputMixin()
+    output.log_prefix = ""
+    output._vprint = lambda *args, **kwargs: None
+    output.status_callback = lambda kind, text: notices.append((kind, text))
+    host._agent._emit_status = output._emit_status
+    host._agent._touch_activity = activity.append
+    text = "CONTEXT HANDOFF: reduced-fidelity historical excerpt."
+    asyncio.run(host.emit_status(text))
+    assert notices == [("lifecycle", text)]
+    assert activity == [text]

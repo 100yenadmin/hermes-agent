@@ -703,6 +703,11 @@ class HermesRuntimeHostServices:
         touch = getattr(self._agent, "_touch_activity", None)
         if callable(touch):
             touch(message)
+        # Activity bookkeeping is not a user-visible notice. Route runtime
+        # lifecycle disclosures through the existing CLI/Gateway status path.
+        emit = getattr(self._agent, "_emit_status", None)
+        if callable(emit):
+            emit(message)
 
     def refresh_turn(
         self,
