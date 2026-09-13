@@ -80,4 +80,8 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # Each check owns its own worker pool. Fork runners must not multiply
+        # several full-size pools on the same small machine.
+        env:
+          CHECK_CONCURRENCY: ${{ github.repository_owner == 'NousResearch' && 32 || 1 }}
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency "$CHECK_CONCURRENCY"
