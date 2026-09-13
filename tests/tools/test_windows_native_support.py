@@ -1028,7 +1028,8 @@ class TestGatewayRunRestartWatcherOuterPopenFallback:
         # Popen below targets watcher admission, not lazy Git-version probes
         # from subprocess environment construction. Keep the real scrub path.
         monkeypatch.setattr("tools.environments.local.build_subprocess_env",
-                            lambda **kwargs: {"_HERMES_GATEWAY": "1"})
+                            lambda **kwargs: {"_HERMES_GATEWAY": "1",
+                                              "HERMES_TEST_SECRET": "maxwell-do-not-log-this-secret-42993"})
 
     @staticmethod
     def _fake_self():

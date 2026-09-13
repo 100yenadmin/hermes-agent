@@ -401,6 +401,29 @@ def test_hosted_room_marker_is_left_to_the_driver(schedule_env, marker_home):
     assert read_turn_marker(marker_home, "session-key") is not None
 
 
+@pytest.mark.parametrize("deferred", [False, True])
+def test_external_runtime_crash_requires_explicit_continuation(
+    emits, schedule_env, marker_home, monkeypatch, deferred
+):
+    record_turn_start(marker_home, "session-key", "potentially completed tool action")
+    original = read_turn_marker(marker_home, "session-key")
+    runtime_agent = types.SimpleNamespace(api_mode="agent_runtime")
+    session = _session(agent=None if deferred else runtime_agent)
+    if deferred:
+        monkeypatch.setattr(server, "_start_agent_build",
+                            lambda sid, current: current.update(agent=runtime_agent))
+
+    server._maybe_schedule_auto_continue("sid", session, "session-key")
+
+    assert not schedule_env, "uncertain external-runtime effects must not be automatically retried"
+    assert session["running"] is False
+    assert session["_auto_continue_scheduled"] is False
+    assert read_turn_marker(marker_home, "session-key") == original
+    assert not any(kind == "message.start" for kind, _, _ in emits)
+    assert any(kind == "status.update" and "explicit" in payload.get("text", "")
+               for kind, _, payload in emits)
+
+
 def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkeypatch):
     record_turn_start(marker_home, "session-key", "old prompt")
     monkeypatch.setattr(
@@ -510,4 +533,3 @@ def test_failed_agent_build_leaves_marker_for_retry(
 
 
 # ── End to end: continuation runs a real turn and clears the marker ────
-
