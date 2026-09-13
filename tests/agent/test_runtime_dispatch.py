@@ -562,8 +562,10 @@ class _RuntimeDatabase:
     def update_runtime_state(self, session_id, state):
         self.states.append((session_id, state))
 
-    def record_runtime_usage_receipt(self, session_id, receipt):
+    def record_runtime_usage_receipt(self, session_id, receipt, *, project_usage=False):
         self.receipts.append((session_id, receipt))
+        if self.inserted and project_usage:
+            self.aggregate_receipts.append((session_id, {"model": receipt.model}))
         return self.inserted
 
     def queue_token_counts(self, session_id, **kwargs):

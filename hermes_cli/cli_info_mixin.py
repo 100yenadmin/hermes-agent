@@ -685,7 +685,8 @@ class CLIInfoMixin:
             return
         agent = self.agent
         calls = agent.session_api_calls
-        if calls == 0:
+        calls_unknown = bool(getattr(agent, "_runtime_request_count_unknown", False))
+        if calls == 0 and not calls_unknown:
             _credits_or("(._.) No API calls made yet in this session.")
             return
 
@@ -715,7 +716,8 @@ class CLIInfoMixin:
         print(f"  Prompt tokens (total):     {agent.session_prompt_tokens:>10,}")
         print(f"  Completion tokens:         {agent.session_completion_tokens:>10,}")
         print(f"  Total tokens:              {agent.session_total_tokens:>10,}")
-        print(f"  API calls:                 {calls:>10,}")
+        print("  API calls:                    unknown" if calls_unknown
+              else f"  API calls:                 {calls:>10,}")
         print(f"  Session duration:          {elapsed:>10}")
         print(f"  {'─' * 40}")
         print(f"  Current context:  {last_prompt:,} / {ctx_len:,} ({pct:.0f}%)")

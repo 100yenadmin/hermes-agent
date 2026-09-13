@@ -86,6 +86,16 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
         if err:  # leave the marker: the next resume retries (bounded by attempts)
             session["_auto_continue_scheduled"] = False
             return
+        if getattr(session.get("agent"), "api_mode", None) == "agent_runtime":
+            # External whole-turn runtimes cannot prove which effects survived
+            # a crash. A context handoff is not permission to replay them.
+            # Preserve the marker/history; an explicit user prompt owns recovery.
+            with session["history_lock"]:
+                session["_auto_continue_scheduled"] = False
+            _emit("status.update", sid, {"kind": "lifecycle", "text": (
+                "Previous runtime turn was interrupted; tool completion may be uncertain. "
+                "Review saved history and send an explicit continuation to resume.")})
+            return
         with session["history_lock"]:
             if session.get("running") or session.get("_turn_cancel_requested") or session.get("_finalized"):
                 session["_auto_continue_scheduled"] = False  # a real user prompt beat us; it clears the marker

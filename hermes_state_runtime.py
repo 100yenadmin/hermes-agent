@@ -191,6 +191,16 @@ def _validate_runtime_usage_receipt(receipt: RuntimeUsageReceipt) -> None:
         if value is not None:
             _validate_runtime_text(value, field)
     _validate_runtime_text(receipt.model_resolution, "model_resolution")
+    if receipt.attempt_id is not None:
+        attempt = _validate_runtime_text(receipt.attempt_id, "attempt_id")
+        if not _RUNTIME_CORRELATION_ID_RE.fullmatch(attempt):
+            raise ValueError("attempt_id contains unsupported characters")
+    for name in ("request_count", "runtime_turn_count"):
+        value = getattr(receipt, name)
+        if value is not None and (type(value) is not int or not 0 <= value <= _RUNTIME_USAGE_MAX_TOKENS):
+            raise ValueError(f"{name} must be unknown or non-negative")
+    if type(receipt.usage_observed) is not bool:
+        raise ValueError("usage_observed must be boolean")
     _validate_runtime_text(receipt.billing_mode, "billing_mode", allow_empty=True)
     _validate_runtime_text(receipt.cost_status, "cost_status", allow_empty=True)
     for field in (
@@ -420,7 +430,7 @@ class SessionRuntimeMixin:
         return self._runtime_state_from_row(row)
 
     def record_runtime_usage_receipt(
-        self, session_id: str, receipt: RuntimeUsageReceipt
+        self, session_id: str, receipt: RuntimeUsageReceipt, *, project_usage: bool = False
     ) -> bool:
         """Append one usage receipt and return whether it was newly inserted.
 
@@ -435,6 +445,18 @@ class SessionRuntimeMixin:
         _validate_runtime_usage_receipt(receipt)
 
         def _do(conn):
+            if receipt.attempt_id is not None:
+                from dataclasses import asdict
+                prior = conn.execute(
+                    "SELECT * FROM runtime_usage_receipts WHERE session_id = ? AND runtime_id = ? AND attempt_id = ?",
+                    (session_id, receipt.runtime_id, receipt.attempt_id),
+                ).fetchone()
+                if prior is not None:
+                    expected = asdict(receipt)
+                    expected["failure_phase"] = receipt.failure_phase.value if receipt.failure_phase else None
+                    if any(prior[key] != value for key, value in expected.items()):
+                        raise ValueError("conflicting cumulative runtime attempt receipt")
+                    return False
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO runtime_usage_receipts (
                        session_id, runtime_id, provider, model, selected_model,
@@ -442,8 +464,8 @@ class SessionRuntimeMixin:
                        billing_mode, cost_status, input_tokens, output_tokens,
                        cache_read_tokens, cache_write_tokens, reasoning_tokens,
                        replay_safe, correlation_id, fallback_used, failure_phase,
-                       recorded_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       recorded_at, attempt_id, request_count, runtime_turn_count, usage_observed
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     receipt.runtime_id,
@@ -467,9 +489,30 @@ class SessionRuntimeMixin:
                     if receipt.failure_phase is not None
                     else None,
                     time.time(),
+                    receipt.attempt_id,
+                    receipt.request_count,
+                    receipt.runtime_turn_count,
+                    int(receipt.usage_observed),
                 ),
             )
-            return cursor.rowcount == 1
+            inserted = cursor.rowcount == 1
+            if inserted and project_usage:
+                from hermes_state_usage import _TOKEN_UPDATE_DELTA_SQL
+                # A numeric aggregate is the KNOWN subtotal, not evidence that
+                # unknown generations were zero. Receipt readers expose that
+                # distinction through runtime_request_accounting().
+                known = receipt.request_count if receipt.request_count is not None else 0
+                counts = {name: getattr(receipt, name) for name in (
+                    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")}
+                conn.execute(_TOKEN_UPDATE_DELTA_SQL, (
+                    *counts.values(), None, None, None, receipt.cost_status,
+                    "runtime_receipt", None, receipt.provider, None,
+                    receipt.billing_mode, receipt.model, known, session_id,
+                ))
+                self._record_model_usage(conn, session_id, **counts, model=receipt.model,
+                    billing_provider=receipt.provider, billing_mode=receipt.billing_mode,
+                    cost_status=receipt.cost_status, cost_source="runtime_receipt", api_call_count=known)
+            return inserted
 
         return bool(self._execute_write(_do))
 
@@ -492,7 +535,8 @@ class SessionRuntimeMixin:
                               billing_mode, cost_status, input_tokens, output_tokens,
                               cache_read_tokens, cache_write_tokens,
                               reasoning_tokens, replay_safe, correlation_id,
-                              fallback_used, failure_phase
+                              fallback_used, failure_phase, attempt_id, request_count,
+                              runtime_turn_count, usage_observed
                          FROM runtime_usage_receipts
                         WHERE session_id = ?"""
                 + runtime_clause
@@ -518,6 +562,10 @@ class SessionRuntimeMixin:
                 reasoning_tokens=row["reasoning_tokens"],
                 replay_safe=bool(row["replay_safe"]),
                 correlation_id=row["correlation_id"],
+                attempt_id=row["attempt_id"],
+                request_count=row["request_count"],
+                runtime_turn_count=row["runtime_turn_count"],
+                usage_observed=bool(row["usage_observed"]),
                 fallback_used=bool(row["fallback_used"]),
                 failure_phase=(
                     RuntimeFailurePhase(row["failure_phase"])
@@ -528,3 +576,15 @@ class SessionRuntimeMixin:
             _validate_runtime_usage_receipt(receipt)
             receipts.append(receipt)
         return receipts
+
+    def runtime_request_accounting(self, session_id):
+        """Return unknown explicitly; aggregate integers are only known subtotals."""
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS attempts, SUM(request_count) AS known, "
+                "SUM(request_count IS NULL) AS unknown FROM runtime_usage_receipts WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        unknown = bool(row["unknown"])
+        return {"attempts": row["attempts"], "request_count": None if unknown else (row["known"] or 0),
+            "known_requests": row["known"] or 0, "request_count_exact": not unknown}

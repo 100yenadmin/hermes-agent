@@ -314,6 +314,73 @@ class SessionMessagesMixin:
             return inserted
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
 
+    def apply_runtime_assistant_update(self, session_id, *, identity, update,
+        compression_lock_holder=None, turn_lease_holder=None, turn_lease_ttl_seconds=300.0):
+        """Atomically append/update one runtime-owned visible assistant row.
+
+        Reuses normal transcript guards, counters, content encoding and FTS
+        triggers. Only an exact namespaced message is mutable; no text search,
+        transcript replacement or native history import is involved.
+        """
+        import hashlib
+        from agent.runtime_api import RuntimeAssistantUpdate
+
+        if not isinstance(update, RuntimeAssistantUpdate):
+            raise TypeError("invalid runtime assistant update")
+        fingerprint = hashlib.sha256(json.dumps(
+            [update.mode, update.text], ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
+
+        def _do(conn):
+            self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
+                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+            row = conn.execute(
+                "SELECT id, content, display_metadata FROM messages "
+                "WHERE session_id = ? AND platform_message_id = ? AND role = 'assistant'",
+                (session_id, identity),
+            ).fetchone()
+            previous = ""
+            if row is not None:
+                previous = self._decode_content(row["content"]) or ""
+                metadata = json.loads(row["display_metadata"] or "{}").get("runtime_message", {})
+                sequence = metadata.get("sequence", -1)
+                if update.sequence == sequence and fingerprint == metadata.get("fingerprint"):
+                    return {"id": row["id"], "content": previous, "changed": False}
+                if metadata.get("final"):
+                    if update.mode == "final" and update.text in ("", previous):
+                        return {"id": row["id"], "content": previous, "changed": False}
+                    raise ValueError("runtime assistant message is already final")
+                if update.sequence != sequence + 1:
+                    raise ValueError("runtime assistant update sequence conflict")
+                latest = conn.execute(
+                    "SELECT MAX(id) FROM messages WHERE session_id = ?", (session_id,),
+                ).fetchone()[0]
+                if latest != row["id"]:
+                    raise ValueError("runtime assistant update crosses a saved message boundary")
+            elif update.sequence != 0:
+                raise ValueError("runtime assistant first sequence must be zero")
+            content = (previous + update.text if update.mode == "delta" else
+                previous if update.mode == "final" and not update.text else update.text)
+            metadata = {"runtime_message": {
+                "sequence": update.sequence, "fingerprint": fingerprint,
+                "final": update.mode == "final",
+            }}
+            if row is None:
+                message = {"content": content, "platform_message_id": identity,
+                    "display_metadata": metadata}
+                params = self._message_row_params(
+                    session_id, "assistant", message, None, time.time(), keep_reasoning=False)
+                row_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+                self._bump_session_counters(conn, session_id, 1, 0, unit=True)
+            else:
+                row_id = row["id"]
+                conn.execute(
+                    "UPDATE messages SET content = ?, display_metadata = ? WHERE id = ?",
+                    (self._encode_content(content), self._encode_display_metadata(metadata), row_id),
+                )
+            return {"id": row_id, "content": content, "changed": True}
+        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
     def set_latest_matching_message_display_kind(self, session_id: str, *, role: str, content: str,
                                                  display_kind: str,
                                                  display_metadata: Optional[Dict[str, Any]] = None) -> bool:
@@ -784,7 +851,12 @@ class SessionMessagesMixin:
         for row in rows:
             content = self._decode_content(row["content"])
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
-                content = sanitize_context(content).strip()
+                content = sanitize_context(content)
+                metadata = self._decode_display_metadata(row["display_metadata"]) if row["display_metadata"] else None
+                # Acknowledged runtime commentary is already a saved message
+                # boundary. Retain its whitespace, without bypassing sanitation.
+                if not (isinstance(metadata, dict) and isinstance(metadata.get("runtime_message"), dict)):
+                    content = content.strip()
             # Underscore-prefixed like ``_row_id``: transports strip it before the wire; compression's
             # assembly copies strip it so rotated child handoffs still flush (_fresh_compaction_message_copy).
             msg = {"role": row["role"], "content": content, _DB_PERSISTED_MARKER_KEY: True}

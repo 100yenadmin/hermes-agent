@@ -139,8 +139,13 @@ def build_effective_prompt_messages(
         sidecar = message.pop("api_content", None)
         # These fields are host bookkeeping and are not part of provider or
         # runtime prompt content.
-        for key in ("display_kind", "display_metadata", "_row_id", "_db_persisted"):
+        for key in ("display_kind", "display_metadata", "_row_id", "_db_persisted",
+                    "platform_message_id", "message_id", "timestamp", "_tool_output_risk"):
             message.pop(key, None)
+        # SessionDB stores the host tool name once; live tool results also
+        # carry the OpenAI wire alias. Restore that alias after a cold load.
+        if role == "tool" and message.get("tool_name"):
+            message.setdefault("name", message["tool_name"])
         if (
             isinstance(sidecar, str)
             and sidecar

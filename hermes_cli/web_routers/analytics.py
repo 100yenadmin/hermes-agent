@@ -124,6 +124,7 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
             FROM sessions WHERE started_at > ?
         """, cutoff)[0]
         usage = InsightsEngine(db).get_usage_breakdown(days=days)
+        _mark_unknown_runtime_requests(db, cutoff, totals, by_model, daily)
 
         return {
             "daily": daily,
@@ -294,6 +295,7 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
             FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
         """, cutoff)[0]
 
+        _mark_unknown_runtime_requests(db, cutoff, totals, models)
         return {"models": models, "totals": totals, "period_days": days}
     finally:
         db.close()
@@ -306,3 +308,25 @@ async def get_models_analytics(
 ):
     """Return model analytics without blocking the serving event loop."""
     return await asyncio.to_thread(_get_models_analytics, days, profile)
+
+
+def _mark_unknown_runtime_requests(db, cutoff, totals, models, daily=()):
+    """Do not display integer known subtotals as exact counts of native work."""
+    unknown = _rows(db, """
+        SELECT DISTINCT s.model, date(s.started_at, 'unixepoch') AS day
+        FROM sessions s JOIN runtime_usage_receipts r ON r.session_id = s.id
+        WHERE s.started_at > ? AND r.request_count IS NULL
+    """, cutoff)
+    if not unknown:
+        return
+    totals["known_api_calls"] = totals.get("total_api_calls")
+    totals["total_api_calls"] = None
+    totals["api_calls_exact"] = False
+    model_names = {row["model"] for row in unknown}
+    days = {row["day"] for row in unknown}
+    for rows, key, affected in ((models, "model", model_names), (daily, "day", days)):
+        for row in rows:
+            if row.get(key) in affected:
+                row["known_api_calls"] = row.get("api_calls")
+                row["api_calls"] = None
+                row["api_calls_exact"] = False

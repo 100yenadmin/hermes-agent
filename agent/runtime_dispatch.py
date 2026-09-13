@@ -300,6 +300,7 @@ def build_runtime_turn_request(
     session_state: RuntimeStateEnvelope | None = None,
     attachments: Sequence[Mapping[str, Any]] = (),
     correlation_id: str | None = None,
+    generation_settings: Mapping[str, Any] | None = None,
 ) -> RuntimeTurnRequest:
     try:
         from agent.turn_context import effective_prompt_sha256
@@ -349,6 +350,7 @@ def build_runtime_turn_request(
         session_state=frozen_session_state,
         attachments=tuple(_freeze_mapping(item) for item in attachments),
         correlation_id=correlation_id,
+        generation_settings=_freeze_mapping(generation_settings or {}),
     )
 
 
@@ -661,6 +663,11 @@ class HermesRuntimeHostServices:
         self._tool_calls_in_flight: set[str] = set()
         self._tool_call_count = 0
         self._side_effect_count = 0
+        database = getattr(agent, "_session_db", None)
+        accounting = getattr(database, "runtime_request_accounting", None)
+        if callable(accounting) and self._parent_session_id:
+            self._agent._runtime_request_count_unknown = not accounting(
+                self._parent_session_id)["request_count_exact"]
         self._compaction_events: list[dict[str, Any]] = []
         from agent.agent_runtime_helpers import StreamingToolCallMarkupScrubber
 
@@ -696,6 +703,11 @@ class HermesRuntimeHostServices:
         touch = getattr(self._agent, "_touch_activity", None)
         if callable(touch):
             touch(message)
+        # Activity bookkeeping is not a user-visible notice. Route runtime
+        # lifecycle disclosures through the existing CLI/Gateway status path.
+        emit = getattr(self._agent, "_emit_status", None)
+        if callable(emit):
+            emit(message)
 
     def refresh_turn(
         self,
@@ -728,6 +740,7 @@ class HermesRuntimeHostServices:
             self._tool_call_ids_seen = set()
             self._tool_calls_in_flight = set()
             self._tool_call_count = 0
+            self._agent._runtime_last_usage = None
             self._content_scrubber.reset()
             try:
                 from gateway.session_context import get_session_env
@@ -999,6 +1012,23 @@ class HermesRuntimeHostServices:
             return
         self._deliver_content(text)
 
+    async def persist_assistant(self, update) -> None:
+        """Durable acknowledgment before the plugin may release a tool call."""
+        from agent.runtime_messages import persist_assistant
+
+        with self._delivery_lock:
+            self._ensure_open_parent_locked()
+            persist_assistant(self, update)
+
+    async def history_checkpoint(self) -> Mapping[str, Any]:
+        """Bind opaque provider continuity to the host's canonical visible prefix."""
+        from agent.turn_context import build_effective_prompt_messages
+
+        with self._delivery_lock:
+            self._ensure_open_parent_locked()
+            projected = build_effective_prompt_messages(self._turn_messages or ())
+            return {"count": len(projected), "sha256": _canonical_sha256(projected)}
+
     def _deliver_content(self, text: str) -> None:
         """Send already-sanitized content through the existing callback seam."""
         if not text:
@@ -1054,22 +1084,21 @@ class HermesRuntimeHostServices:
         inserted = database.record_runtime_usage_receipt(
             self._parent_session_id,
             receipt,
+            project_usage=True,
         )
         if not inserted:
             return
-        database.queue_token_counts(
-            self._parent_session_id,
-            input_tokens=receipt.input_tokens,
-            output_tokens=receipt.output_tokens,
-            cache_read_tokens=receipt.cache_read_tokens,
-            cache_write_tokens=receipt.cache_write_tokens,
-            reasoning_tokens=receipt.reasoning_tokens,
-            billing_provider=receipt.provider,
-            billing_mode=receipt.billing_mode,
-            cost_status=receipt.cost_status,
-            model=receipt.model,
-            api_call_count=1,
-        )
+        for field in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens"):
+            attr = "session_" + field
+            setattr(self._agent, attr, (getattr(self._agent, attr, 0) or 0) + getattr(receipt, field))
+        self._agent.session_prompt_tokens = getattr(self._agent, "session_prompt_tokens", 0) + receipt.input_tokens
+        self._agent.session_completion_tokens = getattr(self._agent, "session_completion_tokens", 0) + receipt.output_tokens
+        self._agent.session_total_tokens = getattr(self._agent, "session_total_tokens", 0) + receipt.input_tokens + receipt.output_tokens
+        if receipt.request_count is not None:
+            self._agent.session_api_calls = getattr(self._agent, "session_api_calls", 0) + receipt.request_count
+        else:
+            self._agent._runtime_request_count_unknown = True
+        self._agent._runtime_last_usage = receipt
 
     async def emit_compaction(self, event: RuntimeCompactionEvent) -> None:
         """Project runtime-native compaction into the host lifecycle stream.

@@ -739,7 +739,7 @@ export interface UsageStats {
   avg_tps?: number
   /** Session prompt-cache hit rate, 0–100. Omitted (not 0) when the provider reports no cache reads. */
   cache_hit_pct?: number
-  calls: number
+  calls: number | null
   context_max?: number
   context_percent?: number
   context_used?: number
@@ -808,7 +808,7 @@ export interface ContextBreakdown {
 
 export interface AnalyticsDailyEntry {
   actual_cost: number
-  api_calls: number
+  api_calls: number | null
   cache_read_tokens: number
   day: string
   estimated_cost: number
@@ -819,7 +819,7 @@ export interface AnalyticsDailyEntry {
 }
 
 export interface AnalyticsModelEntry {
-  api_calls: number
+  api_calls: number | null
   estimated_cost: number
   input_tokens: number
   model: string

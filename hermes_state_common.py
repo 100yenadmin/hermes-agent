@@ -430,6 +430,10 @@ CREATE TABLE IF NOT EXISTS runtime_usage_receipts (
     reasoning_tokens INTEGER NOT NULL DEFAULT 0,
     replay_safe INTEGER NOT NULL DEFAULT 0,
     correlation_id TEXT,
+    attempt_id TEXT,
+    request_count INTEGER,
+    runtime_turn_count INTEGER,
+    usage_observed INTEGER NOT NULL DEFAULT 1,
     fallback_used INTEGER NOT NULL DEFAULT 0,
     failure_phase TEXT,
     recorded_at REAL NOT NULL
@@ -553,13 +557,17 @@ CREATE INDEX IF NOT EXISTS idx_runtime_session_state_runtime
     ON runtime_session_state(runtime_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runtime_usage_receipts_session
     ON runtime_usage_receipts(session_id, runtime_id, id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_usage_receipts_correlation
-    ON runtime_usage_receipts(session_id, runtime_id, correlation_id)
-    WHERE correlation_id IS NOT NULL;
 """
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
 DEFERRED_INDEX_SQL = """
+DROP INDEX IF EXISTS idx_runtime_usage_receipts_correlation;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_usage_receipts_legacy_correlation
+    ON runtime_usage_receipts(session_id, runtime_id, correlation_id)
+    WHERE correlation_id IS NOT NULL AND attempt_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_usage_receipts_attempt
+    ON runtime_usage_receipts(session_id, runtime_id, attempt_id)
+    WHERE attempt_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_active_null

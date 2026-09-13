@@ -35,6 +35,9 @@ HOST_RUNTIME_CAPABILITIES: FrozenSet[str] = frozenset(
         "compaction_events_v1",
         "host_approval_v1",
         "host_content_stream_v1",
+        "host_assistant_updates_v1",
+        "runtime_history_checkpoint_v1",
+        "runtime_generation_settings_v1",
         "host_status_v1",
         "host_tool_execution_v1",
         "host_tool_request_id_v1",
@@ -43,6 +46,7 @@ HOST_RUNTIME_CAPABILITIES: FrozenSet[str] = frozenset(
         "runtime_state_v1",
         "runtime_tool_inventory_v1",
         "usage_receipts_v1",
+        "usage_receipts_v2",
     }
 )
 
@@ -294,6 +298,10 @@ class RuntimeUsageReceipt:
     effective_model: str | None = None
     canonical_model: str | None = None
     model_resolution: str = "unknown"
+    attempt_id: str | None = None
+    request_count: int | None = None
+    runtime_turn_count: int | None = None
+    usage_observed: bool = True
 
 
 @dataclass(frozen=True)
@@ -325,6 +333,7 @@ class RuntimeTurnRequest:
     correlation_id: str | None = None
     tool_inventory: RuntimeToolInventory | None = None
     prompt_hash: str = ""
+    generation_settings: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def effective_prompt_hash(self) -> str:
@@ -336,6 +345,34 @@ class RuntimeTurnRequest:
 class RuntimeContentEvent:
     kind: RuntimeEventKind = field(default=RuntimeEventKind.CONTENT, init=False)
     text: str = ""
+
+
+@dataclass(frozen=True)
+class RuntimeAssistantUpdate:
+    """A host-persisted visible message, not an instruction to execute a tool.
+
+    Identity is scoped by the host turn plus runtime. Sequence starts at zero;
+    retransmission of a sequence must be identical. Snapshot/final replace the
+    same message, delta appends. Empty final seals existing content. Each update is bounded, but a
+    message may span many updates. The awaited host method is the durable ack.
+    """
+
+    message_id: str
+    sequence: int
+    text: str
+    mode: str = "delta"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.message_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.:-]{1,256}", self.message_id
+        ):
+            raise ValueError("invalid runtime assistant message identity")
+        if type(self.sequence) is not int or self.sequence < 0:
+            raise ValueError("invalid runtime assistant sequence")
+        if self.mode not in {"delta", "snapshot", "final"}:
+            raise ValueError("invalid runtime assistant update mode")
+        if not isinstance(self.text, str) or len(self.text) > 16384:
+            raise ValueError("runtime assistant update exceeds text bound")
 
 
 @dataclass(frozen=True)
@@ -433,6 +470,10 @@ class RuntimeHostServices(Protocol):
     async def emit_status(self, message: str) -> None: ...
 
     async def emit_content(self, text: str) -> None: ...
+
+    async def persist_assistant(self, update: RuntimeAssistantUpdate) -> None: ...
+
+    async def history_checkpoint(self) -> Mapping[str, Any]: ...
 
     async def persist_state(self, state: RuntimeStateEnvelope) -> None: ...
 
