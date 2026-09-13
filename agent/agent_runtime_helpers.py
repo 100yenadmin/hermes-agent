@@ -555,6 +555,12 @@ def _is_codex_interim(m: Dict) -> bool:
     )
 
 
+def _is_acknowledged_runtime_message(m: Dict) -> bool:
+    """Host-persisted commentary has an explicit ordering/message boundary."""
+    metadata = m.get("display_metadata")
+    return isinstance(metadata, dict) and isinstance(metadata.get("runtime_message"), dict)
+
+
 def _merge_assistant_into(prev: Dict, msg: Dict) -> None:
     """Fold a consecutive assistant ``msg`` into ``prev`` (union tool_calls, concat text)."""
     prev_calls = list(prev.get("tool_calls") or [])
@@ -622,6 +628,7 @@ def _merge_consecutive_assistants(messages: List[Dict]) -> Tuple[List[Dict], int
             prev is not None and prev.get("role") == "assistant"
             and isinstance(msg, dict) and msg.get("role") == "assistant"
             and not _is_codex_interim(msg) and not _is_codex_interim(prev)
+            and not _is_acknowledged_runtime_message(msg) and not _is_acknowledged_runtime_message(prev)
         ):
             # A provisional verification candidate is superseded, not unioned.
             if prev.get("finish_reason") in {"verification_required", "verify_hook_continue"}:

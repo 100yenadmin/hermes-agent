@@ -851,7 +851,12 @@ class SessionMessagesMixin:
         for row in rows:
             content = self._decode_content(row["content"])
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
-                content = sanitize_context(content).strip()
+                content = sanitize_context(content)
+                metadata = self._decode_display_metadata(row["display_metadata"]) if row["display_metadata"] else None
+                # Acknowledged runtime commentary is already a saved message
+                # boundary. Retain its whitespace, without bypassing sanitation.
+                if not (isinstance(metadata, dict) and isinstance(metadata.get("runtime_message"), dict)):
+                    content = content.strip()
             # Underscore-prefixed like ``_row_id``: transports strip it before the wire; compression's
             # assembly copies strip it so rotated child handoffs still flush (_fresh_compaction_message_copy).
             msg = {"role": row["role"], "content": content, _DB_PERSISTED_MARKER_KEY: True}

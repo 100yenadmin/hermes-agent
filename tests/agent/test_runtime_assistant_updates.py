@@ -69,3 +69,27 @@ def test_failed_prior_flush_produces_no_ack_or_new_row(bound):
     with pytest.raises(RuntimeToolPersistenceError):
         asyncio.run(host.persist_assistant(RuntimeAssistantUpdate("a", 0, "not saved")))
     assert db.get_messages("synthetic-parent") == []
+
+
+def test_runtime_prefix_is_identical_after_normal_resume(bound):
+    from agent.turn_context import build_effective_prompt_messages
+
+    host, db, messages = bound
+    messages.append({"role": "user", "content": "Synthetic prompt"})
+    asyncio.run(host.persist_assistant(RuntimeAssistantUpdate("comment", 0, "  λ\n    code\n", "final")))
+    call = {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call-1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]}
+    from agent.tool_dispatch_helpers import make_tool_result_message
+    result = make_tool_result_message("terminal", "  multiline\n    result\n", "call-1")
+    for row in (call, result):
+        db.append_message("synthetic-parent", **{k: v for k, v in row.items() if k not in ("name", "_tool_output_risk")})
+        messages.append({**row, "_db_persisted": True})
+    asyncio.run(host.persist_assistant(RuntimeAssistantUpdate("answer", 0, "Final answer", "final")))
+    before = build_effective_prompt_messages(messages)
+    resumed, display = db.get_resume_conversations("synthetic-parent")
+    after = build_effective_prompt_messages(resumed)
+    assert len(resumed) == len(display) == len(messages)
+    assert after == before
+    # A whitespace-only user edit is content, not dispensable metadata.
+    resumed[0]["content"] += " "
+    assert build_effective_prompt_messages(resumed) != before

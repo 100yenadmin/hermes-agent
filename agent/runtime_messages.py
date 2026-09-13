@@ -41,8 +41,8 @@ def persist_assistant(host, update):
     if existing is None:
         existing = {"role": "assistant", "platform_message_id": identity}
         messages.append(existing)
-    existing.update(content=saved["content"], _row_id=saved["id"], _db_persisted=True)
+    existing.update(content=saved["content"], _row_id=saved["id"], _db_persisted=True,
+        display_metadata={"runtime_message": {"final": update.mode == "final"}})
     # Failure classification includes observed durable commentary, even though
     # no duplicate public content event is required to make it persistent.
     host._side_effect_count += int(saved["changed"])
-
